@@ -33,6 +33,7 @@ else:
 
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
+VALIDATION_METRIC = "mean_full_track_sdr_v1"
 
 
 # -----------------------------------------------------------------------------
@@ -1553,13 +1554,14 @@ def checkpoint_sdr_from_path(path: str | Path) -> float | None:
 def find_best_checkpoint(
     folder: str = "best_ckpts",
     config: ModelConfig | None = None,
+    validation_metric: str | None = None,
 ) -> str | None:
     scored: list[tuple[float, Path]] = []
     for path in Path(folder).glob("*.pt"):
         score = checkpoint_sdr_from_path(path)
         if score is None:
             continue
-        if config is not None:
+        if config is not None or validation_metric is not None:
             try:
                 checkpoint_data = torch.load(
                     path, map_location="cpu", weights_only=False
@@ -1567,11 +1569,16 @@ def find_best_checkpoint(
             except Exception as error:
                 print(f"Ignoring unreadable best checkpoint {path}: {error}")
                 continue
-            if (
+            if config is not None and (
                 checkpoint_data.get("checkpoint_format_version", 0) < 3
                 or not model_configs_compatible(
                     checkpoint_data.get("model_config"), config
                 )
+            ):
+                continue
+            if (
+                validation_metric is not None
+                and checkpoint_data.get("validation_metric") != validation_metric
             ):
                 continue
         scored.append((score, path))
@@ -1599,6 +1606,7 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_sdr": best_sdr,
+        "validation_metric": VALIDATION_METRIC,
         "avg_loss": avg_loss,
         "stems": STEMS,
         "model_config": asdict(model.config),
@@ -1774,31 +1782,29 @@ def separate_tensor(
     return [output[index] for index in range(model.config.num_stems)]
 
 
-def calculate_chunk_median_sdr(
+def calculate_track_sdr(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    sample_rate: int,
-    chunk_seconds: float = 1.0,
+    accumulation_samples: int,
     activity_threshold: float = 1e-4,
 ) -> float | None:
-    """Median scale-dependent SDR over active, non-overlapping chunks."""
-    chunk_samples = max(1, int(round(chunk_seconds * sample_rate)))
-    scores: list[torch.Tensor] = []
-    for start in range(0, target.shape[-1], chunk_samples):
-        end = min(start + chunk_samples, target.shape[-1])
-        target_chunk = target[..., start:end].double()
-        if target_chunk.square().mean().sqrt() < activity_threshold:
-            continue
-        prediction_chunk = prediction[..., start:end].double()
-        signal_power = target_chunk.square().sum()
-        error_power = (prediction_chunk - target_chunk).square().sum()
-        scores.append(
-            10.0
-            * torch.log10((signal_power + 1e-12) / (error_power + 1e-12))
-        )
-    if not scores:
+    """Scale-dependent SDR over the entire track."""
+    signal_power = torch.zeros((), device=target.device, dtype=torch.float64)
+    error_power = torch.zeros((), device=target.device, dtype=torch.float64)
+    for start in range(0, target.shape[-1], accumulation_samples):
+        end = min(start + accumulation_samples, target.shape[-1])
+        target_block = target[..., start:end].double()
+        prediction_block = prediction[..., start:end].double()
+        signal_power += target_block.square().sum()
+        error_power += (prediction_block - target_block).square().sum()
+
+    target_rms = (signal_power / target.numel()).sqrt()
+    if target_rms < activity_threshold:
         return None
-    return float(torch.quantile(torch.stack(scores), 0.5))
+    score = float(
+        10.0 * torch.log10((signal_power + 1e-12) / (error_power + 1e-12))
+    )
+    return score if math.isfinite(score) else None
 
 
 @torch.inference_mode()
@@ -1868,10 +1874,10 @@ def validate(
                 show_progress=False,
             )
             scores = [
-                calculate_chunk_median_sdr(
+                calculate_track_sdr(
                     pred,
                     target,
-                    sample_rate=model.config.sample_rate,
+                    accumulation_samples=chunk_size,
                 )
                 for pred, target in zip(predictions, targets)
             ]
@@ -1890,17 +1896,18 @@ def validate(
 
     if valid_tracks == 0 or not any(per_stem_track_scores):
         return [0.0 for _ in STEMS], None
-    medians = [
-        float(torch.quantile(torch.tensor(scores, dtype=torch.float64), 0.5))
-        if scores
-        else float("nan")
+    means = [
+        sum(scores) / len(scores) if scores else float("nan")
         for scores in per_stem_track_scores
     ]
-    finite_medians = [score for score in medians if math.isfinite(score)]
-    combined = (
-        sum(finite_medians) / len(finite_medians) if finite_medians else None
-    )
-    return medians, combined
+    all_scores = [
+        score
+        for scores in per_stem_track_scores
+        for score in scores
+        if math.isfinite(score)
+    ]
+    combined = sum(all_scores) / len(all_scores) if all_scores else None
+    return means, combined
 
 
 # -----------------------------------------------------------------------------
@@ -2000,7 +2007,11 @@ def train(
             rebase_learning_rate(optimizer, scheduler, args.lr)
             if "scaler_state_dict" in checkpoint_data:
                 scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
-            best_checkpoint = find_best_checkpoint("best_ckpts", model.config)
+            best_checkpoint = find_best_checkpoint(
+                "best_ckpts",
+                model.config,
+                validation_metric=VALIDATION_METRIC,
+            )
             best_checkpoint_sdr = (
                 checkpoint_sdr_from_path(best_checkpoint)
                 if best_checkpoint is not None
@@ -2195,7 +2206,7 @@ def train(
                 )
                 print(
                     f"\nValidation step {step} "
-                    "(EMA, median of per-track 1-second median SDR): "
+                    "(EMA, mean full-track SDR): "
                     f"{score_text}, combined: {combined_sdr:.4f} dB"
                 )
                 if improved:
