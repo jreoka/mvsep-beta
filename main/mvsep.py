@@ -34,6 +34,7 @@ else:
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
+CHECKPOINT_FORMAT_VERSION = 4
 
 
 # -----------------------------------------------------------------------------
@@ -50,14 +51,13 @@ class ModelConfig:
     audio_channels: int = 2
     num_stems: int = len(STEMS)
     num_bands: int = 124
-    dim: int = 384
+    dim: int = 256
     depth: int = 12
     heads: int = 8
-    ff_mult: float = 8.0 / 3.0
+    memory_slots: int = 128
     dropout: float = 0.0
-    layer_scale_init: float = 0.1
     use_checkpoint: bool = True
-    architecture: str = "bs_roformer_124"
+    architecture: str = "bs_roformer_124_energy_all_attention"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -80,15 +80,15 @@ class ModelConfig:
             raise ValueError("dim must be divisible by heads.")
         if (self.dim // self.heads) % 2 != 0:
             raise ValueError("The attention head dimension must be even for RoPE.")
-        if self.ff_mult <= 0.0:
-            raise ValueError("ff_mult must be positive.")
+        if self.memory_slots <= 0:
+            raise ValueError("memory_slots must be positive.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
-        if self.layer_scale_init < 0.0:
-            raise ValueError("layer_scale_init must be non-negative.")
-        if self.architecture != "bs_roformer_124":
+        if self.architecture != "bs_roformer_124_energy_all_attention":
             raise ValueError(
-                f"Unsupported architecture {self.architecture!r}; expected bs_roformer_124."
+                "Unsupported architecture "
+                f"{self.architecture!r}; expected "
+                "bs_roformer_124_energy_all_attention."
             )
 
 
@@ -373,53 +373,75 @@ class SwiGLU(nn.Module):
         return self.dropout(self.out_proj(F.silu(gate) * value))
 
 
-class GatedRoPEAttention(nn.Module):
+class PersistentMemoryRoPEAttention(nn.Module):
     def __init__(
         self,
         dim: int,
         heads: int,
+        memory_slots: int,
         dropout: float = 0.0,
-        use_value_residual: bool = True,
     ):
         super().__init__()
         if dim % heads != 0:
             raise ValueError("Model dimension must be divisible by the number of heads.")
+        if memory_slots <= 0:
+            raise ValueError("Persistent memory must contain at least one slot.")
         self.heads = heads
         self.head_dim = dim // heads
+        self.memory_slots = memory_slots
         self.dropout = dropout
-        self.use_value_residual = use_value_residual
         # This is a runtime performance setting, not part of the model or its
         # checkpoint compatibility. ``fused`` prevents an unnoticed fallback
         # to the much slower quadratic-memory math implementation on CUDA.
         self.attention_backend = "fused"
 
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.head_gate = nn.Linear(dim, heads)
-        self.value_mix = nn.Linear(dim, heads) if use_value_residual else None
+        # Each head owns an input-independent key/value memory. Following
+        # Sukhbaatar et al. (2019), these underlying parameters are scaled at
+        # use time so the persistent vectors start with unit variance.
+        self.persistent_keys = nn.Parameter(
+            torch.empty(heads, memory_slots, self.head_dim)
+        )
+        self.persistent_values = nn.Parameter(
+            torch.empty(heads, memory_slots, self.head_dim)
+        )
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.out_dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
+        self.reset_persistent_memory()
+
+    def reset_persistent_memory(self) -> None:
+        nn.init.normal_(self.persistent_keys, std=self.head_dim**-0.5)
+        nn.init.normal_(self.persistent_values, std=self.memory_slots**-0.5)
 
     def forward(
         self,
         x: torch.Tensor,
-        value_residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         batch, length, dim = x.shape
         qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        original_v = v
-
-        if value_residual is not None and self.value_mix is not None:
-            mix = torch.sigmoid(self.value_mix(x)).transpose(1, 2).unsqueeze(-1)
-            v = torch.lerp(v, value_residual, mix)
 
         cos, sin = self.rope(length, x.device, q.dtype)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+
+        # Persistent keys have no positional encoding. Queries attend to the
+        # sequence context and the learned, input-independent memory in one
+        # softmax, which replaces the transformer's feedforward sublayer.
+        memory_k = self.persistent_keys * math.sqrt(self.head_dim)
+        memory_v = self.persistent_values * math.sqrt(self.memory_slots)
+        memory_k = (
+            memory_k.to(dtype=k.dtype).unsqueeze(0).expand(batch, -1, -1, -1)
+        )
+        memory_v = (
+            memory_v.to(dtype=v.dtype).unsqueeze(0).expand(batch, -1, -1, -1)
+        )
+        k = torch.cat((k, memory_k), dim=-2)
+        v = torch.cat((v, memory_v), dim=-2)
 
         attention_dropout = self.dropout if self.training else 0.0
         use_external_flash = (
@@ -465,10 +487,8 @@ class GatedRoPEAttention(nn.Module):
                     dropout_p=attention_dropout,
                     is_causal=False,
                 )
-        gates = torch.sigmoid(self.head_gate(x)).transpose(1, 2).unsqueeze(-1)
-        out = out * gates
         out = out.transpose(1, 2).reshape(batch, length, dim)
-        return self.out_dropout(self.out_proj(out)), original_v
+        return self.out_dropout(self.out_proj(out))
 
 
 class TransformerUnit(nn.Module):
@@ -476,31 +496,20 @@ class TransformerUnit(nn.Module):
         self,
         dim: int,
         heads: int,
-        ff_mult: float,
+        memory_slots: int,
         dropout: float,
-        layer_scale_init: float,
     ):
         super().__init__()
-        # 8/3 gives SwiGLU approximately the parameter count of a standard
-        # 4x GELU FFN. Round the product, then align it for Tensor Cores.
-        hidden_dim = round_up_to_multiple(round(dim * ff_mult), 64)
-
         self.attn_norm = nn.RMSNorm(dim)
-        self.attn = GatedRoPEAttention(dim, heads, dropout=dropout)
-        self.ff_norm = nn.RMSNorm(dim)
-        self.ff = SwiGLU(dim, hidden_dim, dropout=dropout)
-        self.attn_scale = nn.Parameter(torch.full((dim,), layer_scale_init))
-        self.ff_scale = nn.Parameter(torch.full((dim,), layer_scale_init))
+        self.attn = PersistentMemoryRoPEAttention(
+            dim,
+            heads,
+            memory_slots,
+            dropout=dropout,
+        )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        value_residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        attn_out, original_v = self.attn(self.attn_norm(x), value_residual)
-        x = x + attn_out * self.attn_scale
-        x = x + self.ff(self.ff_norm(x)) * self.ff_scale
-        return x, original_v
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.attn(self.attn_norm(x))
 
 
 class DualPathEncoder(nn.Module):
@@ -509,9 +518,8 @@ class DualPathEncoder(nn.Module):
         unit_kwargs = dict(
             dim=config.dim,
             heads=config.heads,
-            ff_mult=config.ff_mult,
+            memory_slots=config.memory_slots,
             dropout=config.dropout,
-            layer_scale_init=config.layer_scale_init,
         )
         self.time_layers = nn.ModuleList(
             TransformerUnit(**unit_kwargs) for _ in range(config.depth)
@@ -532,56 +540,55 @@ class DualPathEncoder(nn.Module):
         """
         if mode != "default":
             raise ValueError("compile_layers currently supports only the default mode.")
+
         for unit in (*self.time_layers, *self.freq_layers):
+            # TransformerUnit.forward is one shared Python frame used with the
+            # different batch/sequence shapes of the time and frequency axes.
+            # Compile it as dynamic from its first invocation so Dynamo never
+            # performs a static-to-dynamic recompile between those axes. Without
+            # this, checkpoint replay can select a graph specialized for a
+            # different query/key sequence geometry.
             # Inductor's comprehensive padding can give saved RMSNorm tensors a
             # padded sequence stride (for example 1056 for 1034 frames). During
             # non-reentrant checkpoint recomputation it may instead produce the
             # ordinary contiguous stride, causing the compiled backward to reject
             # an otherwise identical tensor. Keep compilation enabled, but avoid
             # that checkpoint-incompatible internal layout optimization.
-            unit.compile(options={"comprehensive_padding": False})
+            unit.compile(
+                dynamic=True,
+                options={"comprehensive_padding": False},
+            )
 
     @staticmethod
     def _run_unit(
         unit: TransformerUnit,
         x: torch.Tensor,
-        value_residual: torch.Tensor | None,
         use_checkpoint: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if not use_checkpoint:
-            return unit(x, value_residual)
-        if value_residual is None:
-            return checkpoint(lambda z: unit(z, None), x, use_reentrant=False)
-        return checkpoint(unit, x, value_residual, use_reentrant=False)
+            return unit(x)
+        return checkpoint(unit, x, use_reentrant=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, frames, bands, dim]
         batch, frames, bands, dim = x.shape
-        time_value_residual: torch.Tensor | None = None
-        freq_value_residual: torch.Tensor | None = None
         should_checkpoint = self.use_checkpoint and self.training
 
         for time_layer, freq_layer in zip(self.time_layers, self.freq_layers):
             time_x = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
-            time_x, first_time_values = self._run_unit(
+            time_x = self._run_unit(
                 time_layer,
                 time_x,
-                time_value_residual,
                 should_checkpoint,
             )
-            if time_value_residual is None:
-                time_value_residual = first_time_values
             x = time_x.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
 
             freq_x = x.reshape(batch * frames, bands, dim)
-            freq_x, first_freq_values = self._run_unit(
+            freq_x = self._run_unit(
                 freq_layer,
                 freq_x,
-                freq_value_residual,
                 should_checkpoint,
             )
-            if freq_value_residual is None:
-                freq_value_residual = first_freq_values
             x = freq_x.reshape(batch, frames, bands, dim)
 
         return self.output_norm(x)
@@ -663,7 +670,7 @@ class BandInputGroup(nn.Module):
                 self.weight[band, :fan_in].uniform_(-bound, bound)
             self.gamma.masked_fill_(~self.feature_valid, 0.0)
 
-    def forward(self, real_imag: torch.Tensor) -> torch.Tensor:
+    def forward(self, real_imag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # real_imag: [B, T, F, C, 2]
         gathered = real_imag[:, :, self.freq_indices]
         features = gathered.reshape(
@@ -677,7 +684,8 @@ class BandInputGroup(nn.Module):
         mean_square = mean_square / self.valid_feature_counts[None, None, :, None]
         features = features * torch.rsqrt(mean_square + 1e-5)
         features = features * self.gamma[None, None]
-        return torch.einsum("btni,nid->btnd", features, self.weight) + self.bias
+        tokens = torch.einsum("btni,nid->btnd", features, self.weight) + self.bias
+        return tokens, mean_square.squeeze(-1)
 
 
 class BandSplit(nn.Module):
@@ -695,6 +703,24 @@ class BandSplit(nn.Module):
             BandInputGroup(config, bands, ids, bucket)
             for bucket, ids in sorted(grouped_ids.items())
         )
+        self.register_buffer(
+            "band_feature_counts",
+            torch.tensor(
+                [
+                    (end - start) * config.audio_channels * 2
+                    for start, end in bands
+                ],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        # Per-band RMS normalization stabilizes the complex projection, but by
+        # itself makes tokens invariant to the local mixture level. Reintroduce
+        # gain-invariant spectral and temporal energy cues explicitly.
+        self.energy_weight = nn.Parameter(
+            torch.empty(self.num_bands, 2, config.dim)
+        )
+        nn.init.normal_(self.energy_weight, std=0.02)
 
     def forward_real(self, real_imag: torch.Tensor) -> torch.Tensor:
         """Project an STFT represented by a trailing real/imaginary dimension."""
@@ -705,10 +731,32 @@ class BandSplit(nn.Module):
             self.num_bands,
             self.groups[0].weight.shape[-1],
         )
+        band_power = real_imag.new_zeros(
+            real_imag.shape[0],
+            real_imag.shape[1],
+            self.num_bands,
+        )
         for group in self.groups:
-            group_tokens = group(real_imag)
+            group_tokens, group_power = group(real_imag)
             output = output.index_copy(2, group.band_ids, group_tokens)
-        return output
+            band_power = band_power.index_copy(2, group.band_ids, group_power)
+
+        log_rms = 0.5 * torch.log(band_power + 1e-5)
+        feature_counts = self.band_feature_counts.to(dtype=band_power.dtype)
+        frame_power = (
+            band_power * feature_counts[None, None]
+        ).sum(dim=2, keepdim=True) / feature_counts.sum()
+        frame_log_rms = 0.5 * torch.log(frame_power + 1e-5)
+        spectral_relative = log_rms - frame_log_rms
+        temporal_relative = frame_log_rms - frame_log_rms.mean(dim=1, keepdim=True)
+        energy_features = torch.stack(
+            (spectral_relative, temporal_relative.expand_as(log_rms)),
+            dim=-1,
+        ).clamp_(-8.0, 8.0)
+        energy_tokens = torch.einsum(
+            "btne,ned->btnd", energy_features, self.energy_weight
+        )
+        return output + energy_tokens.to(dtype=output.dtype)
 
     def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
         return self.forward_real(torch.view_as_real(mixture_spec.to(torch.complex64)))
@@ -847,7 +895,6 @@ class BandMaskEstimator(nn.Module):
         self.shared_mlp = SwiGLU(
             config.dim, hidden_dim, dropout=config.dropout
         )
-        self.mask_residual_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
         """Return masks represented by a trailing real/imaginary dimension."""
@@ -875,7 +922,6 @@ class BandMaskEstimator(nn.Module):
             output.scatter_add_(dim=4, index=scatter_index, src=source)
 
         output = output.permute(0, 1, 2, 4, 3, 5).contiguous().float()
-        output = output * self.mask_residual_scale.float()
         mask_bias = output.new_tensor((1.0 / self.num_stems, 0.0))
         return output + mask_bias
 
@@ -1539,7 +1585,8 @@ def find_latest_compatible_checkpoint(
             print(f"Ignoring unreadable checkpoint {path}: {error}")
             continue
         if (
-            checkpoint_data.get("checkpoint_format_version", 0) >= 3
+            checkpoint_data.get("checkpoint_format_version", 0)
+            >= CHECKPOINT_FORMAT_VERSION
             and model_configs_compatible(checkpoint_data.get("model_config"), config)
         ):
             return str(path)
@@ -1570,7 +1617,8 @@ def find_best_checkpoint(
                 print(f"Ignoring unreadable best checkpoint {path}: {error}")
                 continue
             if config is not None and (
-                checkpoint_data.get("checkpoint_format_version", 0) < 3
+                checkpoint_data.get("checkpoint_format_version", 0)
+                < CHECKPOINT_FORMAT_VERSION
                 or not model_configs_compatible(
                     checkpoint_data.get("model_config"), config
                 )
@@ -1610,7 +1658,7 @@ def save_checkpoint(
         "avg_loss": avg_loss,
         "stems": STEMS,
         "model_config": asdict(model.config),
-        "checkpoint_format_version": 3,
+        "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
     }
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1634,7 +1682,8 @@ def prune_old_checkpoints(
             except Exception:
                 continue
             if (
-                checkpoint_data.get("checkpoint_format_version", 0) < 3
+                checkpoint_data.get("checkpoint_format_version", 0)
+                < CHECKPOINT_FORMAT_VERSION
                 or not model_configs_compatible(
                     checkpoint_data.get("model_config"), config
                 )
@@ -2270,9 +2319,8 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         dim=args.model_dim,
         depth=args.depth,
         heads=args.heads,
-        ff_mult=args.ff_mult,
+        memory_slots=args.memory_slots,
         dropout=args.dropout,
-        layer_scale_init=args.layer_scale_init,
         use_checkpoint=args.ckpt,
     )
 
@@ -2330,8 +2378,8 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "124-band, 2048-point STFT, non-overlapping BS-RoFormer "
-            "vocals/accompaniment separator"
+            "124-band, energy-aware STFT, persistent-memory all-attention "
+            "BS-RoFormer vocals/accompaniment separator"
         )
     )
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -2360,9 +2408,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--ff_mult", type=float, default=8.0 / 3.0)
+    parser.add_argument(
+        "--memory_slots",
+        type=int,
+        default=128,
+        help="Persistent key/value slots per all-attention layer and head.",
+    )
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--layer_scale_init", type=float, default=0.1)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
@@ -2486,7 +2538,7 @@ def main() -> None:
 
     model = BSRoFormerSeparator(config)
     for module in model.modules():
-        if isinstance(module, GatedRoPEAttention):
+        if isinstance(module, PersistentMemoryRoPEAttention):
             module.attention_backend = args.attention_backend
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"BS-RoFormer parameters: {parameter_count / 1e6:.2f}M")

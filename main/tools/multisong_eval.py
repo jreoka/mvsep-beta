@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""Run the MVSEP model over the official Multisong evaluation mixtures.
-
-This repository's model predicts two sources: ``vocals`` and ``other`` (the
-non-vocal accompaniment).  For the MVSEP leaderboard the latter must be named
-``instrum``.  This tool processes every mixture once and creates one archive:
-
-    multisong.zip
-
-The archive contains both stems as a flat list of files, such as
-``song_086_vocals.flac`` and ``song_086_instrum.flac``.  No parent directory is
-stored in the ZIP.
-"""
-
 from __future__ import annotations
 
 import argparse
