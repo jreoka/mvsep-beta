@@ -2006,27 +2006,28 @@ def train(
     ema = EMA(model, decay=args.ema_decay)
 
     if checkpoint_data is not None and exact_continuation:
+        if "ema_state_dict" in checkpoint_data:
+            ema_report = ema.load_state_dict(
+                checkpoint_data["ema_state_dict"],
+                updates=int(checkpoint_data.get("ema_updates", 0)),
+            )
+            if not ema_report.is_exact:
+                raise RuntimeError(
+                    "Exact model checkpoint has an incomplete EMA state: "
+                    f"{ema_report.matched}/{ema_report.expected} tensors matched."
+                )
+            print(f"Loaded complete EMA state at update {ema.updates}.")
+
+        step = int(checkpoint_data.get("step", 0))
+        best_sdr = float(checkpoint_data.get("best_sdr", best_sdr))
+        avg_loss = float(checkpoint_data.get("avg_loss", 0.0))
+
         if args.reset_optimizer:
             print(
-                "Loaded exact raw weights, but --reset_optimizer starts fresh "
-                "optimizer, scheduler, EMA, and global-step timelines."
+                "Loaded exact raw weights, but --reset_optimizer starts a fresh "
+                "optimizer while keeping the scheduler, EMA, and step timeline."
             )
         else:
-            if "ema_state_dict" in checkpoint_data:
-                ema_report = ema.load_state_dict(
-                    checkpoint_data["ema_state_dict"],
-                    updates=int(checkpoint_data.get("ema_updates", 0)),
-                )
-                if not ema_report.is_exact:
-                    raise RuntimeError(
-                        "Exact model checkpoint has an incomplete EMA state: "
-                        f"{ema_report.matched}/{ema_report.expected} tensors matched."
-                    )
-                print(f"Loaded complete EMA state at update {ema.updates}.")
-
-            step = int(checkpoint_data.get("step", 0))
-            best_sdr = float(checkpoint_data.get("best_sdr", best_sdr))
-            avg_loss = float(checkpoint_data.get("avg_loss", 0.0))
             if "optimizer_state_dict" in checkpoint_data:
                 saved_optimizer_class = checkpoint_data.get("optimizer_class")
                 current_optimizer_class = optimizer.__class__.__name__
@@ -2049,29 +2050,37 @@ def train(
                     group["weight_decay"] = requested_weight_decay
             else:
                 raise RuntimeError("Continuation checkpoint has no optimizer state.")
-            if "scheduler_state_dict" in checkpoint_data:
-                scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
-            else:
-                raise RuntimeError("Continuation checkpoint has no scheduler state.")
-            rebase_learning_rate(optimizer, scheduler, args.lr)
-            if "scaler_state_dict" in checkpoint_data:
-                scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
-            best_checkpoint = find_best_checkpoint(
-                "best_ckpts",
-                model.config,
-                validation_metric=VALIDATION_METRIC,
+
+        if "scheduler_state_dict" in checkpoint_data:
+            scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
+        else:
+            raise RuntimeError("Continuation checkpoint has no scheduler state.")
+        rebase_learning_rate(optimizer, scheduler, args.lr)
+        if "scaler_state_dict" in checkpoint_data:
+            scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
+        best_checkpoint = find_best_checkpoint(
+            "best_ckpts",
+            model.config,
+            validation_metric=VALIDATION_METRIC,
+        )
+        best_checkpoint_sdr = (
+            checkpoint_sdr_from_path(best_checkpoint)
+            if best_checkpoint is not None
+            else None
+        )
+        if best_checkpoint_sdr is not None and best_checkpoint_sdr > best_sdr:
+            best_sdr = best_checkpoint_sdr
+            print(
+                f"Recovered newer best SDR {best_sdr:.4f} dB from "
+                f"{best_checkpoint}."
             )
-            best_checkpoint_sdr = (
-                checkpoint_sdr_from_path(best_checkpoint)
-                if best_checkpoint is not None
-                else None
+        if args.reset_optimizer:
+            print(
+                f"Fresh optimizer at checkpoint step {step} with --lr={args.lr:.2e} "
+                f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e}) and "
+                f"--weight_decay={args.weight_decay:.2e}."
             )
-            if best_checkpoint_sdr is not None and best_checkpoint_sdr > best_sdr:
-                best_sdr = best_checkpoint_sdr
-                print(
-                    f"Recovered newer best SDR {best_sdr:.4f} dB from "
-                    f"{best_checkpoint}."
-                )
+        else:
             print(
                 f"Resuming at optimizer step {step} with --lr={args.lr:.2e} "
                 f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e}) and "
