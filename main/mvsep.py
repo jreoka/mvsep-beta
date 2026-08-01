@@ -98,7 +98,7 @@ class LossConfig:
     main_stft_weight: float = 0.5
     mrstft_weight: float = 1.0
     mask_weight: float = 0.1
-    sdr_weight: float = 0.05
+    sdr_weight: float = 0.25
     midside_weight: float = 0.1
 
 
@@ -968,9 +968,7 @@ class BSRoFormerSeparator(nn.Module):
         masks = self(mixture_spec)
         estimates = masks * mixture_spec[:, None]
         residual = mixture_spec - estimates.sum(dim=1)
-        power = estimates.abs().square().clamp_min(1e-8)
-        weights = power / power.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        estimates = estimates + weights * residual[:, None]
+        estimates = estimates + residual[:, None] / self.config.num_stems
         return estimates, masks
 
 
@@ -1073,7 +1071,7 @@ def scale_dependent_sdr_loss(
     ratio_db = 10.0 * torch.log10(
         (target_power + 1e-8) / (error_power + 1e-8)
     )
-    ratio_db = ratio_db.clamp(-30.0, 30.0)
+    ratio_db = ratio_db.clamp(-50.0, 50.0)
     if valid.any():
         return -ratio_db[valid].mean()
     return prediction.new_tensor(0.0)
@@ -1107,9 +1105,11 @@ class SeparationLoss(nn.Module):
         masks = model(mixture_spec)
         estimates = masks * mixture_spec[:, None]
         residual = mixture_spec - estimates.sum(dim=1)
-        power = estimates.abs().square().clamp_min(1e-8)
-        weights = power / power.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        estimates = estimates + weights * residual[:, None]
+        # Distribute the leftover mixture energy equally among stems. Power-
+        # proportional weights let the loud stem absorb the quiet stem's error,
+        # diluting the quiet stem's gradients. An equal share keeps every stem's
+        # own error visible to its own mask head.
+        estimates = estimates + residual[:, None] / self.model_config.num_stems
 
         pred_audio = make_istft(
             estimates,
@@ -1150,9 +1150,16 @@ class SeparationLoss(nn.Module):
         ideal_masks = torch.polar(ideal_mag, ideal_phase)
         tf_weight = mixture_spec.abs()
         tf_weight = tf_weight / tf_weight.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-4)
-        tf_weight = tf_weight.clamp(max=10.0)
+        tf_weight = tf_weight.clamp(max=5.0)
+        # Supervise the mask the model actually applies. The raw mask is
+        # modified by the mixture-consistency redistribution before it reaches
+        # the audio losses, so comparing the raw mask to the Wiener target would
+        # push the head toward a transfer function it never uses.
+        effective_masks = (
+            estimates * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
+        )
         mask_loss = (
-            (masks - ideal_masks).abs() * tf_weight[:, None]
+            (effective_masks - ideal_masks).abs() * tf_weight[:, None]
         ).mean()
 
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
@@ -1517,13 +1524,25 @@ def build_optimizer(
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     warmup_steps: int,
+    decay_steps: int = 1_000_000,
+    min_lr_ratio: float = 0.1,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Warm up once, then hold the learning rate for an unbounded run."""
+    """Warm up once, then cosine-decay the learning rate to a floor.
+
+    The decay never reaches zero: after ``decay_steps`` the rate holds at
+    ``min_lr_ratio`` forever, so multi-million-step runs keep a usable learning
+    rate instead of being choked off.
+    """
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return max(1e-8, (step + 1) / max(1, warmup_steps))
-        return 1.0
+        if decay_steps <= 0:
+            return 1.0
+        elapsed = min(max(step - warmup_steps, 0), decay_steps)
+        progress = elapsed / decay_steps
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -1825,9 +1844,7 @@ def separate_tensor(
     # Enforce exact waveform mixture consistency after overlap-add. Do not
     # clamp; clipping predictions changes SDR and belongs only at export.
     residual = mixture - output.sum(dim=0)
-    power = output.abs().square().clamp_min(1e-8)
-    weights = power / power.sum(dim=0, keepdim=True).clamp_min(1e-8)
-    output = output + weights * residual.unsqueeze(0)
+    output = output + residual.unsqueeze(0) / model.config.num_stems
     return [output[index] for index in range(model.config.num_stems)]
 
 
@@ -2443,10 +2460,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--remix_probability", type=float, default=0.5)
     parser.add_argument("--checkpoint_steps", type=int, default=4_000)
     parser.add_argument("--warmup_steps", type=int, default=4_000)
+    parser.add_argument(
+        "--lr_decay_steps",
+        type=int,
+        default=1_000_000,
+        help=(
+            "Cosine LR decay horizon after warmup; the rate then holds at "
+            "--lr_min_ratio forever. Use 0 for a constant LR after warmup."
+        ),
+    )
+    parser.add_argument(
+        "--lr_min_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of --lr the cosine decay floors at (never reaches zero).",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--seed", type=int, default=1337)
     return parser
@@ -2466,6 +2498,10 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_workers cannot be negative.")
     if args.warmup_steps < 0:
         raise ValueError("--warmup_steps cannot be negative.")
+    if args.lr_decay_steps < 0:
+        raise ValueError("--lr_decay_steps cannot be negative.")
+    if not 0.0 < args.lr_min_ratio <= 1.0:
+        raise ValueError("--lr_min_ratio must be in (0, 1].")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad_clip must be positive.")
     if args.lr <= 0.0:
@@ -2620,6 +2656,8 @@ def main() -> None:
         scheduler = build_scheduler(
             optimizer,
             warmup_steps=args.warmup_steps,
+            decay_steps=args.lr_decay_steps,
+            min_lr_ratio=args.lr_min_ratio,
         )
         loss_module = SeparationLoss(config, LossConfig())
         train(
