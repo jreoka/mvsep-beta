@@ -2463,7 +2463,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr_decay_steps",
         type=int,
-        default=1_000_000,
+        default=2_000_000,
         help=(
             "Cosine LR decay horizon after warmup; the rate then holds at "
             "--lr_min_ratio forever. Use 0 for a constant LR after warmup."
@@ -2472,7 +2472,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr_min_ratio",
         type=float,
-        default=0.1,
+        default=0.4,
         help="Fraction of --lr the cosine decay floors at (never reaches zero).",
     )
     parser.add_argument("--lr", type=float, default=1e-4)
