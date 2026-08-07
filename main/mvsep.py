@@ -34,7 +34,7 @@ else:
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 6
+CHECKPOINT_FORMAT_VERSION = 7
 
 
 # -----------------------------------------------------------------------------
@@ -57,7 +57,7 @@ class ModelConfig:
     memory_slots: int = 128
     dropout: float = 0.0
     use_checkpoint: bool = True
-    architecture: str = "bs124_hybrid_roformer_residual_v4"
+    architecture: str = "bs124_hybrid_roformer_residual_v5_balanced"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -86,11 +86,11 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture != "bs124_hybrid_roformer_residual_v4":
+        if self.architecture != "bs124_hybrid_roformer_residual_v5_balanced":
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_hybrid_roformer_residual_v4."
+                "bs124_hybrid_roformer_residual_v5_balanced."
             )
 
 
@@ -102,7 +102,7 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
-    silence_weight: float = 0.30
+    silence_weight: float = 0.05
 
 
 # -----------------------------------------------------------------------------
@@ -1075,9 +1075,25 @@ class MultiResolutionSTFTLoss(nn.Module):
 
 
 def normalized_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Relative L1 without letting fully silent stems dominate the batch.
+
+    A fixed 1e-4 denominator makes a deliberately zeroed vocal target hundreds of
+    times more important than an ordinary active source.  That creates a strong
+    collapse incentive for a foreground/residual separator: predicting no vocals
+    anywhere cheaply solves those rare examples.  Floor each source denominator
+    at 5% of the strongest target level in the same example instead.  Active
+    sources keep their normal relative scaling while silent sources remain
+    supervised, just not catastrophically overweighted.
+    """
     error = (prediction - target).abs().mean(dim=-1)
-    scale = target.abs().mean(dim=-1).clamp_min(1e-4)
-    return (error / scale).mean()
+    scale = target.abs().mean(dim=-1)
+    if scale.ndim > 1:
+        reduce_dims = tuple(range(1, scale.ndim))
+        reference = scale.amax(dim=reduce_dims, keepdim=True)
+    else:
+        reference = scale
+    scale_floor = (0.05 * reference).clamp_min(1e-4)
+    return (error / torch.maximum(scale, scale_floor)).mean()
 
 
 def scale_dependent_sdr_loss(
@@ -1223,6 +1239,22 @@ class SeparationLoss(nn.Module):
             + cfg.midside_weight * midside_loss
             + cfg.silence_weight * silence_loss
         )
+        with torch.no_grad():
+            pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
+            true_vocal_rms = target_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
+            active_segments = true_vocal_rms >= self.activity_threshold
+            if active_segments.any():
+                vocal_level_db = (
+                    20.0
+                    * torch.log10(
+                        (pred_vocal_rms[active_segments] + 1e-8)
+                        / (true_vocal_rms[active_segments] + 1e-8)
+                    )
+                ).mean()
+            else:
+                vocal_level_db = pred_audio.new_tensor(0.0)
+            vocal_mask_mag = masks[:, 0].abs().mean()
+
         metrics = {
             "wave": wave_loss.detach(),
             "main_stft": main_stft_loss.detach(),
@@ -1231,6 +1263,8 @@ class SeparationLoss(nn.Module):
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
             "silence": silence_loss.detach(),
+            "vocal_level_db": vocal_level_db.detach(),
+            "vocal_mask_mag": vocal_mask_mag.detach(),
         }
         return total, metrics
 
@@ -1418,17 +1452,16 @@ class StemDataset(Dataset):
             targets[stem_index, 0] = mid + side
             targets[stem_index, 1] = mid - side
 
-        # Explicitly expose the model to exact zero-vocal targets. Real datasets
-        # contain silent gaps, but they are too sparse and too easy for segment-
-        # averaged losses to underweight.
+        # Add occasional *local* vocal gaps, but never manufacture an entire
+        # six-second no-vocal example.  Whole-segment erasure combined with
+        # relative source losses strongly rewards the degenerate solution
+        # "vocals = 0, other = mixture".  Natural fully silent crops are still
+        # preserved by the dataset, while these short gaps teach low leakage.
         vocal = targets[0]
-        silence_draw = random.random()
-        if silence_draw < 0.10:
-            vocal.zero_()
-        elif silence_draw < 0.45:
+        if random.random() < 0.15:
             samples = vocal.shape[-1]
-            for _ in range(random.randint(1, 3)):
-                span = random.randint(max(64, samples // 40), max(65, samples // 5))
+            for _ in range(random.randint(1, 2)):
+                span = random.randint(max(64, samples // 50), max(65, samples // 10))
                 start = random.randint(0, max(0, samples - span))
                 end = min(samples, start + span)
                 ramp = min(512, max(0, (end - start) // 8))
@@ -2059,6 +2092,7 @@ REGULAR_BS124_TRANSFER_ARCHITECTURES = frozenset(
         "bs_roformer_124_energy_all_attention",
         "bs124_hybrid_roformer_vad_residual_v2",
         "bs124_hybrid_roformer_residual_v3",
+        "bs124_hybrid_roformer_residual_v4",
     }
 )
 
@@ -2397,12 +2431,14 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, silence = torch.stack(
+            wave, main_stft, mrstft, silence, vocal_db, mask_mag = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
                     latest_metrics["silence"],
+                    latest_metrics["vocal_level_db"],
+                    latest_metrics["vocal_mask_mag"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
@@ -2410,6 +2446,8 @@ def train(
                 stft=f"{main_stft:.3f}",
                 mr=f"{mrstft:.3f}",
                 sil=f"{silence:.3f}",
+                vdb=f"{vocal_db:+.1f}",
+                vmask=f"{mask_mag:.3f}",
                 refresh=False,
             )
         progress.update(1)
@@ -2646,7 +2684,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
     parser.add_argument("--checkpoint_steps", type=int, default=4_000)
-    parser.add_argument("--warmup_steps", type=int, default=4_000)
+    parser.add_argument("--warmup_steps", type=int, default=2_000)
     parser.add_argument(
         "--lr_decay_steps",
         type=int,
