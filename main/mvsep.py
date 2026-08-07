@@ -432,7 +432,7 @@ class PersistentMemoryRoPEAttention(nn.Module):
 
         # Persistent keys have no positional encoding. Queries attend to the
         # sequence context and the learned, input-independent memory in one
-        # softmax, which replaces the transformer's feedforward sublayer.
+        # softmax.
         memory_k = self.persistent_keys * math.sqrt(self.head_dim)
         memory_v = self.persistent_values * math.sqrt(self.memory_slots)
         memory_k = (
@@ -493,13 +493,6 @@ class PersistentMemoryRoPEAttention(nn.Module):
 
 
 class TransformerUnit(nn.Module):
-    """Attention + SwiGLU block.
-
-    Persistent memory remains available to attention, but it no longer replaces
-    the feed-forward path.  The extra nonlinear channel mixing is inexpensive
-    relative to axial attention and substantially increases model capacity.
-    """
-
     def __init__(
         self,
         dim: int,
