@@ -99,30 +99,97 @@ def validate_archive(
             raise RuntimeError(f"Corrupt ZIP entry: {bad_entry}")
 
 
+
+def load_mvsep_module() -> tuple[Any, Path, Path]:
+    """Import the sibling/parent ``mvsep.py`` training module.
+
+    The evaluator first looks next to itself, then one directory above it. This
+    supports both a flat project layout and a ``tools/`` subdirectory layout
+    without requiring a separate model-script CLI option.
+    """
+    evaluator_dir = Path(__file__).resolve().parent
+    candidates = (evaluator_dir / "mvsep.py", evaluator_dir.parent / "mvsep.py")
+    model_script = next((path for path in candidates if path.is_file()), None)
+    if model_script is None:
+        searched = ", ".join(str(path) for path in candidates)
+        raise FileNotFoundError(f"Could not locate mvsep.py. Searched: {searched}")
+
+    model_script = model_script.resolve()
+    main_dir = model_script.parent
+    if str(main_dir) not in sys.path:
+        sys.path.insert(0, str(main_dir))
+
+    import mvsep  # pylint: disable=import-outside-toplevel
+
+    return mvsep, main_dir, model_script
+
+
+def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
+    """Accept checkpoints from this architecture without assuming default width/depth."""
+    try:
+        data = mvsep.torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        print(f"Ignoring unreadable checkpoint {path}: {error}")
+        return False
+
+    config = data.get("model_config")
+    if not isinstance(config, dict):
+        return False
+    expected = mvsep.ModelConfig(use_checkpoint=False)
+    if config.get("architecture") != expected.architecture:
+        return False
+    if config.get("num_bands", expected.num_bands) != 124:
+        return False
+    if tuple(data.get("stems", ())) != tuple(mvsep.STEMS):
+        return False
+
+    expected_metric = getattr(mvsep, "VALIDATION_METRIC", None)
+    saved_metric = data.get("validation_metric")
+    if expected_metric is not None and saved_metric not in (None, expected_metric):
+        return False
+    return True
+
+
+def compatible_checkpoints(folder: Path, mvsep: Any, pattern: str) -> list[Path]:
+    return [
+        path
+        for path in folder.glob(pattern)
+        if path.is_file() and checkpoint_matches_current_architecture(path, mvsep)
+    ]
+
+
 def resolve_checkpoint(args: argparse.Namespace, main_dir: Path, mvsep: Any) -> Path:
     if args.checkpoint is not None:
         checkpoint = args.checkpoint.expanduser().resolve()
     elif args.latest:
-        found = mvsep.find_latest_checkpoint(str(main_dir / "ckpts"))
-        checkpoint = Path(found).resolve() if found else Path()
+        candidates = compatible_checkpoints(main_dir / "ckpts", mvsep, "checkpoint_step_*.pt")
+        if candidates:
+            def step(path: Path) -> int:
+                match = re.search(r"step_(\d+)", path.name)
+                return int(match.group(1)) if match else -1
+            checkpoint = max(candidates, key=lambda path: (step(path), path.stat().st_mtime)).resolve()
+        else:
+            checkpoint = Path()
     else:
-        found = mvsep.find_best_checkpoint(str(main_dir / "best_ckpts"))
-        checkpoint = Path(found).resolve() if found else Path()
+        candidates = compatible_checkpoints(main_dir / "best_ckpts", mvsep, "*.pt")
+        scored: list[tuple[float, Path]] = []
+        for path in candidates:
+            score = mvsep.checkpoint_sdr_from_path(path)
+            if score is not None:
+                scored.append((float(score), path))
+        checkpoint = max(scored, key=lambda item: item[0])[1].resolve() if scored else Path()
 
     if not checkpoint.is_file():
-        selection = "latest ckpts checkpoint" if args.latest else "best checkpoint"
+        selection = "latest compatible ckpts checkpoint" if args.latest else "best compatible checkpoint"
         raise FileNotFoundError(
             f"Could not find the {selection}. Pass its path with --checkpoint."
         )
     return checkpoint
 
 
-def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path]:
-    """Import the sibling training module and load its inference checkpoint."""
-    main_dir = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(main_dir))
-    import mvsep  # pylint: disable=import-outside-toplevel
-
+def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
+    """Load the reviewed separator module and its inference checkpoint."""
+    mvsep, main_dir, model_script = load_mvsep_module()
     checkpoint = resolve_checkpoint(args, main_dir, mvsep)
     fallback = mvsep.ModelConfig(use_checkpoint=False)
     config = mvsep.inspect_checkpoint_config(str(checkpoint), fallback)
@@ -157,7 +224,7 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path]:
             module.attention_backend = args.attention_backend
     mvsep.load_inference_weights(model, str(checkpoint))
     model.to(device).eval()
-    return mvsep, model, device, checkpoint
+    return mvsep, model, device, checkpoint, model_script
 
 
 def temporary_archive_path(output_dir: Path) -> Path:
@@ -213,7 +280,7 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
             "Pass --overwrite to replace it."
         )
 
-    mvsep, model, device, checkpoint = load_model(args)
+    mvsep, model, device, checkpoint, model_script = load_model(args)
     config = model.config
     chunk_size = int(round(args.segment_seconds * config.sample_rate))
     overlap = int(round(args.overlap_seconds * config.sample_rate))
@@ -223,6 +290,7 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
         raise ValueError("--overlap-seconds must be non-negative and shorter than the segment.")
 
     print(f"Dataset: {len(mixtures)} mixtures from {args.dataset_dir.resolve()}")
+    print(f"Model script: {model_script}")
     print(f"Checkpoint: {checkpoint}")
     print(f"Output stems: {', '.join(args.stems)}")
 
@@ -324,7 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--segment-seconds", type=float, default=6.0)
-    parser.add_argument("--overlap-seconds", type=float, default=2.0)
+    parser.add_argument("--overlap-seconds", type=float, default=3.0)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--device", default=None, help="Torch device, for example cuda or cpu.")
     parser.add_argument(
