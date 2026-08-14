@@ -5,3 +5,4 @@ triton # triton-windows for windows
 soundfile
 tqdm
 ffmpeg
+prodigyopt

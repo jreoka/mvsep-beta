@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+from prodigyopt import Prodigy
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
@@ -628,8 +629,6 @@ class BandInputGroup(nn.Module):
         bucket_width: int,
     ):
         super().__init__()
-        self.audio_channels = config.audio_channels
-        self.bucket_width = bucket_width
         self.feature_width = bucket_width * config.audio_channels * 2
         self.num_group_bands = len(band_ids)
 
@@ -898,13 +897,10 @@ class BandMaskEstimator(nn.Module):
         self,
         config: ModelConfig,
         bands: Sequence[tuple[int, int]],
-        band_split: BandSplit,
     ):
         super().__init__()
-        del band_split
         self.audio_channels = config.audio_channels
         self.freq_bins = config.n_fft // 2 + 1
-        self.num_bands = len(bands)
 
         grouped_ids: dict[int, list[int]] = {}
         for band_id, (start, end) in enumerate(bands):
@@ -920,7 +916,6 @@ class BandMaskEstimator(nn.Module):
             coverage[start:end] += 1.0
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
-        self.register_buffer("coverage", coverage, persistent=False)
 
         hidden_dim = round_up_to_multiple(config.dim * 2.0, 64)
         self.norm = nn.RMSNorm(config.dim)
@@ -959,7 +954,7 @@ class BSRoFormerSeparator(nn.Module):
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
         self.encoder = DualPathEncoder(config)
-        self.mask_estimator = BandMaskEstimator(config, self.bands, self.band_split)
+        self.mask_estimator = BandMaskEstimator(config, self.bands)
 
     def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
         tokens = self.band_split.forward_real(mixture_real_imag)
@@ -1353,7 +1348,6 @@ class StemDataset(Dataset):
             if os.path.isdir(os.path.join(root_dir, name))
         ]
         print("Scanning track metadata...")
-        musdb_tracks = 0
         for track_dir in tqdm(track_dirs, desc="Caching tracks"):
             resolved = resolve_target_paths(track_dir)
             if resolved is None:
@@ -1366,7 +1360,6 @@ class StemDataset(Dataset):
                     for path, info in zip(paths, infos)
                 )
             self.tracks.append(track)
-            musdb_tracks += int(len(track["other"]) == 3)
 
         if not self.tracks:
             raise RuntimeError(f"No complete {STEMS} tracks found under {root_dir!r}.")
@@ -1507,7 +1500,7 @@ class StemDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
-# EMA, optimizer, scheduler, checkpointing
+# EMA, optimizer, checkpointing
 # -----------------------------------------------------------------------------
 
 
@@ -1598,87 +1591,15 @@ class _EMAStateView(nn.Module):
 
 def build_optimizer(
     model: nn.Module,
-    lr: float,
     weight_decay: float,
-) -> torch.optim.Optimizer:
-    decay_params: list[nn.Parameter] = []
-    no_decay_params: list[nn.Parameter] = []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        lowered = name.lower()
-        use_no_decay = (
-            parameter.ndim < 2
-            or name.endswith(".bias")
-            or "norm" in lowered
-            or name.endswith(".gamma")
-            or name.endswith("_scale")
-        )
-        (no_decay_params if use_no_decay else decay_params).append(parameter)
-
-    parameter_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    return torch.optim.AdamW(
-        parameter_groups,
-        lr=lr,
-        betas=(0.9, 0.95),
+    slice_p: int,
+) -> Prodigy:
+    return Prodigy(
+        model.parameters(),
+        lr=1.0,
+        weight_decay=weight_decay,
+        slice_p=slice_p,
     )
-
-
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    decay_steps: int = 1_000_000,
-    min_lr_ratio: float = 0.1,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Warm up once, then cosine-decay the learning rate to a floor.
-
-    The decay never reaches zero: after ``decay_steps`` the rate holds at
-    ``min_lr_ratio`` forever, so multi-million-step runs keep a usable learning
-    rate instead of being choked off.
-    """
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return max(1e-8, (step + 1) / max(1, warmup_steps))
-        if decay_steps <= 0:
-            return 1.0
-        elapsed = min(max(step - warmup_steps, 0), decay_steps)
-        progress = elapsed / decay_steps
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-def rebase_learning_rate(
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    lr: float,
-) -> None:
-    """Apply a new base LR without resetting the scheduler's resumed position."""
-    if len(optimizer.param_groups) != len(scheduler.lr_lambdas):
-        raise RuntimeError(
-            "Optimizer parameter groups do not match the learning-rate scheduler."
-        )
-
-    scheduler.base_lrs = [lr for _ in optimizer.param_groups]
-    if scheduler.last_epoch < 0:
-        scheduled_lrs = scheduler.base_lrs.copy()
-    else:
-        scheduled_lrs = [
-            lr * lr_lambda(scheduler.last_epoch)
-            for lr_lambda in scheduler.lr_lambdas
-        ]
-
-    for parameter_group, scheduled_lr in zip(
-        optimizer.param_groups, scheduled_lrs
-    ):
-        parameter_group["initial_lr"] = lr
-        parameter_group["lr"] = scheduled_lr
-    scheduler._last_lr = scheduled_lrs  # Keep its serialized/public state consistent.
 
 
 def find_latest_checkpoint(folder: str = "ckpts") -> str | None:
@@ -1762,8 +1683,7 @@ def save_checkpoint(
     path: str,
     model: BSRoFormerSeparator,
     ema: EMA,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    optimizer: Prodigy,
     scaler: torch.amp.GradScaler,
     step: int,
     best_sdr: float,
@@ -1776,7 +1696,6 @@ def save_checkpoint(
         "ema_updates": ema.updates,
         "optimizer_state_dict": optimizer.state_dict(),
         "optimizer_class": optimizer.__class__.__name__,
-        "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_sdr": best_sdr,
         "validation_metric": VALIDATION_METRIC,
@@ -2160,8 +2079,7 @@ def prepare_transfer_state_dict(
 def train(
     model: BSRoFormerSeparator,
     dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    optimizer: Prodigy,
     loss_module: SeparationLoss,
     device: torch.device,
     args: argparse.Namespace,
@@ -2190,7 +2108,7 @@ def train(
         exact_config_candidate = model_configs_compatible(saved_config, model.config)
         if exact_config_candidate:
             # A true continuation must resume the raw trainable weights alongside
-            # optimizer/scheduler/EMA state, not replace them with averaged weights.
+            # optimizer/EMA state, not replace them with averaged weights.
             model_state = checkpoint_data.get("model_state_dict", checkpoint_data)
         else:
             # For transfer learning, initialize from the weights that actually
@@ -2253,37 +2171,29 @@ def train(
         if args.reset_optimizer:
             print(
                 "Loaded exact raw weights, but --reset_optimizer starts a fresh "
-                "optimizer while keeping the scheduler, EMA, and step timeline."
+                "Prodigy optimizer while keeping the EMA and step timeline."
             )
         else:
-            if "optimizer_state_dict" in checkpoint_data:
-                saved_optimizer_class = checkpoint_data.get("optimizer_class")
-                current_optimizer_class = optimizer.__class__.__name__
-                if (
-                    saved_optimizer_class is not None
-                    and saved_optimizer_class != current_optimizer_class
-                ):
-                    raise RuntimeError(
-                        f"Checkpoint optimizer is {saved_optimizer_class}, but the "
-                        f"requested optimizer is {current_optimizer_class}. Use "
-                        "--reset_optimizer when changing optimizer types."
-                    )
-                requested_weight_decays = [
-                    float(group["weight_decay"]) for group in optimizer.param_groups
-                ]
-                optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
-                for group, requested_weight_decay in zip(
-                    optimizer.param_groups, requested_weight_decays
-                ):
-                    group["weight_decay"] = requested_weight_decay
-            else:
+            saved_optimizer_class = checkpoint_data.get("optimizer_class")
+            if saved_optimizer_class != "Prodigy":
+                raise RuntimeError(
+                    "Continuation checkpoint must contain a Prodigy optimizer; "
+                    f"found {saved_optimizer_class or 'no optimizer class metadata'}. "
+                    "Use --reset_optimizer to discard its optimizer state explicitly."
+                )
+            if "optimizer_state_dict" not in checkpoint_data:
                 raise RuntimeError("Continuation checkpoint has no optimizer state.")
+            optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+            resumed_slice_p = int(optimizer.param_groups[0]["slice_p"])
+            if resumed_slice_p != args.slice_p:
+                print(
+                    f"Preserving checkpoint slice_p={resumed_slice_p}; changing "
+                    "it would be incompatible with the saved Prodigy state."
+                )
+            for group in optimizer.param_groups:
+                group["lr"] = 1.0
+                group["weight_decay"] = args.weight_decay
 
-        if "scheduler_state_dict" in checkpoint_data:
-            scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
-        else:
-            raise RuntimeError("Continuation checkpoint has no scheduler state.")
-        rebase_learning_rate(optimizer, scheduler, args.lr)
         if "scaler_state_dict" in checkpoint_data:
             scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
         best_checkpoint = find_best_checkpoint(
@@ -2302,23 +2212,18 @@ def train(
                 f"Recovered newer best SDR {best_sdr:.4f} dB from "
                 f"{best_checkpoint}."
             )
-        if args.reset_optimizer:
-            print(
-                f"Fresh optimizer at checkpoint step {step} with --lr={args.lr:.2e} "
-                f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e}) and "
-                f"--weight_decay={args.weight_decay:.2e}."
-            )
-        else:
-            print(
-                f"Resuming at optimizer step {step} with --lr={args.lr:.2e} "
-                f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e}) and "
-                f"--weight_decay={args.weight_decay:.2e}."
-            )
+        optimizer_status = "Fresh" if args.reset_optimizer else "Resuming"
+        active_slice_p = int(optimizer.param_groups[0]["slice_p"])
+        print(
+            f"{optimizer_status} Prodigy optimizer at checkpoint step {step} "
+            f"with lr=1.0, weight_decay={args.weight_decay:.2e}, and "
+            f"slice_p={active_slice_p}."
+        )
     elif checkpoint_data is not None:
         print(
             "Checkpoint is not an exact continuation. Using shape-matched weights "
-            "as a transfer initialization with a fresh optimizer, scheduler, EMA "
-            "timeline, and global step."
+            "as a transfer initialization with a fresh optimizer, EMA timeline, "
+            "and global step."
         )
 
     if args.compile:
@@ -2327,8 +2232,6 @@ def train(
             f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
             "transformer units; activation checkpoint boundaries remain eager."
         )
-
-    train_model = model
 
     stft_window = torch.hann_window(model.config.win_length, device=device)
     optimizer.zero_grad(set_to_none=True)
@@ -2379,7 +2282,7 @@ def train(
 
             with autocast_context(device, args.precision):
                 loss, latest_metrics = loss_module(
-                    train_model,  # type: ignore[arg-type]
+                    model,
                     mixture_spec,
                     target_audio,
                 )
@@ -2411,7 +2314,6 @@ def train(
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
         ema.update()
 
         step += 1
@@ -2459,7 +2361,6 @@ def train(
                 model,
                 ema,
                 optimizer,
-                scheduler,
                 scaler,
                 step,
                 best_sdr,
@@ -2513,7 +2414,6 @@ def train(
                     model,
                     ema,
                     optimizer,
-                    scheduler,
                     scaler,
                     step,
                     best_sdr,
@@ -2535,7 +2435,6 @@ def train(
             model,
             ema,
             optimizer,
-            scheduler,
             scaler,
             step,
             best_sdr,
@@ -2684,24 +2583,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
     parser.add_argument("--checkpoint_steps", type=int, default=4_000)
-    parser.add_argument("--warmup_steps", type=int, default=2_000)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument(
-        "--lr_decay_steps",
+        "--slice_p",
         type=int,
-        default=2_000_000,
-        help=(
-            "Cosine LR decay horizon after warmup; the rate then holds at "
-            "--lr_min_ratio forever. Use 0 for a constant LR after warmup."
-        ),
+        default=1,
+        help="Prodigy memory-saving update slicing; use 11 when memory is limited.",
     )
-    parser.add_argument(
-        "--lr_min_ratio",
-        type=float,
-        default=0.4,
-        help="Fraction of --lr the cosine decay floors at (never reaches zero).",
-    )
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
@@ -2721,18 +2609,12 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{field} must be positive.")
     if args.num_workers < 0:
         raise ValueError("--num_workers cannot be negative.")
-    if args.warmup_steps < 0:
-        raise ValueError("--warmup_steps cannot be negative.")
-    if args.lr_decay_steps < 0:
-        raise ValueError("--lr_decay_steps cannot be negative.")
-    if not 0.0 < args.lr_min_ratio <= 1.0:
-        raise ValueError("--lr_min_ratio must be in (0, 1].")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad_clip must be positive.")
-    if args.lr <= 0.0:
-        raise ValueError("--lr must be positive.")
     if args.weight_decay < 0.0:
         raise ValueError("--weight_decay cannot be negative.")
+    if args.slice_p <= 0:
+        raise ValueError("--slice_p must be positive.")
     if not 0.0 <= args.remix_probability <= 1.0:
         raise ValueError("--remix_probability must be in [0, 1].")
     if not 0.0 <= args.ema_decay < 1.0:
@@ -2875,21 +2757,14 @@ def main() -> None:
         )
         optimizer = build_optimizer(
             model,
-            lr=args.lr,
             weight_decay=args.weight_decay,
-        )
-        scheduler = build_scheduler(
-            optimizer,
-            warmup_steps=args.warmup_steps,
-            decay_steps=args.lr_decay_steps,
-            min_lr_ratio=args.lr_min_ratio,
+            slice_p=args.slice_p,
         )
         loss_module = SeparationLoss(config, LossConfig())
         train(
             model,
             dataloader,
             optimizer,
-            scheduler,
             loss_module,
             device,
             args,
