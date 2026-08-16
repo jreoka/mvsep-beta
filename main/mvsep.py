@@ -176,8 +176,8 @@ def load_matching_state_dict(
 ) -> StateLoadReport:
     """Load keys whose names and shapes match and report exact coverage.
 
-    Partial loading is useful for transfer learning, but it must never be
-    mistaken for an exact continuation checkpoint.
+    Callers must check ``is_exact``: a partial load means the checkpoint does
+    not match this architecture and must be rejected.
     """
     current = module.state_dict()
     incoming = clean_state_dict(state_dict)
@@ -513,8 +513,8 @@ class TransformerUnit(nn.Module):
         self.ff_norm = nn.RMSNorm(dim)
         self.ff = SwiGLU(dim, hidden_dim, dropout=dropout)
         # This residual branch is new relative to the original all-attention model.
-        # Zero-init its output projection so transfer learning starts from the
-        # pretrained attention function and gradually learns to use the FF path.
+        # Zero-init its output projection so the FF path starts neutral and is
+        # learned on top of the attention function.
         nn.init.zeros_(self.ff.out_proj.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -747,8 +747,8 @@ class BandSplit(nn.Module):
             nn.SiLU(),
             nn.Linear(config.dim, config.dim, bias=False),
         )
-        # Keep the new constant band metadata path neutral at initialization.
-        # This preserves the behavior of transferred BS-124 input projections.
+        # Keep the new constant band metadata path neutral at initialization so
+        # the learned band projections stay dominant at the start of training.
         nn.init.zeros_(self.metadata_proj[-1].weight)
 
         self.energy_weight = nn.Parameter(torch.empty(self.num_bands, 2, config.dim))
@@ -936,9 +936,9 @@ class BandMaskEstimator(nn.Module):
             output.scatter_add_(dim=4, index=scatter_index, src=source)
 
         output = output.permute(0, 1, 2, 4, 3, 5).contiguous().float()
-        # Keep the original neutral two-source prior. It does not force leakage:
-        # the learned raw mask can move all the way to zero, while retaining 0.5
-        # makes old regular-BS vocal mask heads transferable without a 0.25 offset.
+        # Keep a neutral two-source prior. It does not force leakage: the learned
+        # raw mask can move all the way to zero, while retaining 0.5 keeps the
+        # vocal head centered at the outset of training.
         mask_bias = output.new_tensor((0.5, 0.0))
         return output + mask_bias
 
@@ -2006,76 +2006,6 @@ def validate(
 # -----------------------------------------------------------------------------
 
 
-REGULAR_BS124_TRANSFER_ARCHITECTURES = frozenset(
-    {
-        "bs_roformer_124_energy_all_attention",
-        "bs124_hybrid_roformer_vad_residual_v2",
-        "bs124_hybrid_roformer_residual_v3",
-        "bs124_hybrid_roformer_residual_v4",
-    }
-)
-
-
-def prepare_transfer_state_dict(
-    model: BSRoFormerSeparator,
-    state_dict: dict[str, torch.Tensor],
-    saved_architecture: str | None,
-) -> tuple[dict[str, torch.Tensor], int]:
-    """Prepare a safe shape-matched transfer state.
-
-    Regular BS-124 predecessors share the exact input-band geometry, so their
-    trained band projections should not be discarded. The original model also
-    predicted two mask heads; for that architecture we extract the vocal half of
-    each GLU output projection into this foreground-only head. Unknown band
-    geometries remain conservatively restricted to generic encoder tensors.
-    """
-    incoming = clean_state_dict(state_dict)
-    if saved_architecture not in REGULAR_BS124_TRANSFER_ARCHITECTURES:
-        blocked_prefixes = ("band_split.", "mask_estimator.")
-        return (
-            {
-                key: value
-                for key, value in incoming.items()
-                if not key.startswith(blocked_prefixes)
-            },
-            0,
-        )
-
-    current = model.state_dict()
-    prepared: dict[str, torch.Tensor] = {}
-    adapted = 0
-    for key, value in incoming.items():
-        target = current.get(key)
-        if target is None:
-            continue
-        if value.shape == target.shape:
-            prepared[key] = value
-            continue
-
-        # Old two-stem BandMaskGroup GLU layout:
-        # [a_vocal, a_other, b_vocal, b_other]. The new foreground-only GLU
-        # expects [a_vocal, b_vocal]. Preserve the pretrained vocal function.
-        if (
-            saved_architecture == "bs_roformer_124_energy_all_attention"
-            and key.startswith("mask_estimator.groups.")
-            and key.endswith((".output_weight", ".output_bias"))
-            and value.shape[:-1] == target.shape[:-1]
-            and value.shape[-1] == target.shape[-1] * 2
-            and target.shape[-1] % 2 == 0
-        ):
-            feature_width = target.shape[-1] // 2
-            prepared[key] = torch.cat(
-                (
-                    value[..., :feature_width],
-                    value[..., 2 * feature_width : 3 * feature_width],
-                ),
-                dim=-1,
-            )
-            adapted += 1
-
-    return prepared, adapted
-
-
 def train(
     model: BSRoFormerSeparator,
     dataloader: DataLoader,
@@ -2095,63 +2025,35 @@ def train(
     best_sdr = -float("inf")
     avg_loss = 0.0
     checkpoint_data: dict | None = None
-    exact_continuation = False
 
     if checkpoint_path:
         checkpoint_data = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
         )
         saved_config = checkpoint_data.get("model_config")
-        saved_architecture = (
-            saved_config.get("architecture") if isinstance(saved_config, dict) else None
-        )
-        exact_config_candidate = model_configs_compatible(saved_config, model.config)
-        if exact_config_candidate:
-            # A true continuation must resume the raw trainable weights alongside
-            # optimizer/EMA state, not replace them with averaged weights.
-            model_state = checkpoint_data.get("model_state_dict", checkpoint_data)
-        else:
-            # For transfer learning, initialize from the weights that actually
-            # produced validation scores whenever the checkpoint contains EMA.
-            model_state = checkpoint_data.get(
-                "ema_state_dict", checkpoint_data.get("model_state_dict", checkpoint_data)
+        if not model_configs_compatible(saved_config, model.config):
+            raise RuntimeError(
+                "Checkpoint architecture mismatch: the saved model_config does not "
+                "match the current ModelConfig. Only exact-continuation checkpoints "
+                "of the current architecture are supported."
             )
-            if "ema_state_dict" in checkpoint_data:
-                print("Transfer initialization is using the checkpoint EMA weights.")
-        if saved_architecture != model.config.architecture:
-            model_state, adapted_outputs = prepare_transfer_state_dict(
-                model, model_state, saved_architecture
-            )
-            if saved_architecture in REGULAR_BS124_TRANSFER_ARCHITECTURES:
-                detail = (
-                    f" and adapted {adapted_outputs} old two-stem mask tensors"
-                    if adapted_outputs
-                    else ""
-                )
-                print(
-                    "Regular BS-124 predecessor detected; preserving compatible "
-                    f"band, encoder, and mask-feature weights{detail}. New FF/local/"
-                    "metadata paths start neutral and learn on top."
-                )
-            else:
-                print(
-                    "Unknown/different band geometry; transfer-loading only generic "
-                    "encoder weights and reinitializing band-sensitive modules."
-                )
+        # A true continuation must resume the raw trainable weights alongside
+        # optimizer/EMA state, not replace them with averaged weights.
+        model_state = checkpoint_data.get("model_state_dict", checkpoint_data)
         report = load_matching_state_dict(model, model_state)
-        print(
-            f"Loaded {report.matched}/{report.expected} model tensors from "
-            f"{checkpoint_path} ({len(report.skipped)} skipped, "
-            f"{len(report.missing)} missing)."
-        )
-        exact_continuation = (
-            model_configs_compatible(saved_config, model.config) and report.is_exact
-        )
+        if not report.is_exact:
+            raise RuntimeError(
+                "Checkpoint does not exactly match the model: "
+                f"matched {report.matched}/{report.expected} tensors, "
+                f"{len(report.skipped)} incoming tensors incompatible, "
+                f"{len(report.missing)} required tensors missing."
+            )
+        print(f"Loaded all {report.matched} model tensors from {checkpoint_path}.")
 
-    # Initialize after model loading so a transfer checkpoint also seeds EMA.
+    # Initialize after model loading so any loaded checkpoint also seeds EMA.
     ema = EMA(model, decay=args.ema_decay)
 
-    if checkpoint_data is not None and exact_continuation:
+    if checkpoint_data is not None:
         if "ema_state_dict" in checkpoint_data:
             ema_report = ema.load_state_dict(
                 checkpoint_data["ema_state_dict"],
@@ -2218,12 +2120,6 @@ def train(
             f"{optimizer_status} Prodigy optimizer at checkpoint step {step} "
             f"with lr=1.0, weight_decay={args.weight_decay:.2e}, and "
             f"slice_p={active_slice_p}."
-        )
-    elif checkpoint_data is not None:
-        print(
-            "Checkpoint is not an exact continuation. Using shape-matched weights "
-            "as a transfer initialization with a fresh optimizer, EMA timeline, "
-            "and global step."
         )
 
     if args.compile:
@@ -2660,7 +2556,7 @@ def main() -> None:
             if checkpoint_path is None and find_latest_checkpoint("ckpts") is not None:
                 print(
                     "No compatible auto-resume checkpoint was found. Starting fresh; "
-                    "use --checkpoint_path explicitly for shape-matched transfer."
+                    "use --checkpoint_path to resume an exact checkpoint."
                 )
         elif args.infer:
             checkpoint_path = (
