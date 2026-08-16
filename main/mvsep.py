@@ -2578,7 +2578,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accumulation", type=int, default=2)
+    parser.add_argument("--grad_accumulation", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
