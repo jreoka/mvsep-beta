@@ -2446,8 +2446,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=3,
         help=(
-            "Chunk overlap in seconds. Default is 50%% for the 6 s preset; "
-            "for maximum-SDR inference, 5.25 s gives 87.5%% overlap at higher cost."
+            "Chunk overlap in seconds."
         ),
     )
 
