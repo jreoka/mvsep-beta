@@ -2440,11 +2440,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=2048)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=2048)
-    parser.add_argument("--segment_seconds", type=float, default=6.0)
+    parser.add_argument("--segment_seconds", type=float, default=6)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
-        default=3.0,
+        default=3,
         help=(
             "Chunk overlap in seconds. Default is 50%% for the 6 s preset; "
             "for maximum-SDR inference, 5.25 s gives 87.5%% overlap at higher cost."
