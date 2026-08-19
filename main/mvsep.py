@@ -35,7 +35,7 @@ else:
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 7
+CHECKPOINT_FORMAT_VERSION = 8
 
 
 # -----------------------------------------------------------------------------
@@ -55,10 +55,9 @@ class ModelConfig:
     dim: int = 256
     depth: int = 12
     heads: int = 8
-    memory_slots: int = 128
     dropout: float = 0.0
     use_checkpoint: bool = True
-    architecture: str = "bs124_hybrid_roformer_residual_v5_balanced"
+    architecture: str = "bs124_roformer_axial_v6_direct_mask"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -81,17 +80,15 @@ class ModelConfig:
             raise ValueError("dim must be divisible by heads.")
         if (self.dim // self.heads) % 2 != 0:
             raise ValueError("The attention head dimension must be even for RoPE.")
-        if self.memory_slots <= 0:
-            raise ValueError("memory_slots must be positive.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture != "bs124_hybrid_roformer_residual_v5_balanced":
+        if self.architecture != "bs124_roformer_axial_v6_direct_mask":
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_hybrid_roformer_residual_v5_balanced."
+                "bs124_roformer_axial_v6_direct_mask."
             )
 
 
@@ -375,22 +372,18 @@ class SwiGLU(nn.Module):
         return self.dropout(self.out_proj(F.silu(gate) * value))
 
 
-class PersistentMemoryRoPEAttention(nn.Module):
+class RoPEAttention(nn.Module):
     def __init__(
         self,
         dim: int,
         heads: int,
-        memory_slots: int,
         dropout: float = 0.0,
     ):
         super().__init__()
         if dim % heads != 0:
             raise ValueError("Model dimension must be divisible by the number of heads.")
-        if memory_slots <= 0:
-            raise ValueError("Persistent memory must contain at least one slot.")
         self.heads = heads
         self.head_dim = dim // heads
-        self.memory_slots = memory_slots
         self.dropout = dropout
         # This is a runtime performance setting, not part of the model or its
         # checkpoint compatibility. ``fused`` prevents an unnoticed fallback
@@ -398,23 +391,9 @@ class PersistentMemoryRoPEAttention(nn.Module):
         self.attention_backend = "fused"
 
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        # Each head owns an input-independent key/value memory. Following
-        # Sukhbaatar et al. (2019), these underlying parameters are scaled at
-        # use time so the persistent vectors start with unit variance.
-        self.persistent_keys = nn.Parameter(
-            torch.empty(heads, memory_slots, self.head_dim)
-        )
-        self.persistent_values = nn.Parameter(
-            torch.empty(heads, memory_slots, self.head_dim)
-        )
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.out_dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
-        self.reset_persistent_memory()
-
-    def reset_persistent_memory(self) -> None:
-        nn.init.normal_(self.persistent_keys, std=self.head_dim**-0.5)
-        nn.init.normal_(self.persistent_values, std=self.memory_slots**-0.5)
 
     def forward(
         self,
@@ -430,20 +409,6 @@ class PersistentMemoryRoPEAttention(nn.Module):
         cos, sin = self.rope(length, x.device, q.dtype)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-
-        # Persistent keys have no positional encoding. Queries attend to the
-        # sequence context and the learned, input-independent memory in one
-        # softmax.
-        memory_k = self.persistent_keys * math.sqrt(self.head_dim)
-        memory_v = self.persistent_values * math.sqrt(self.memory_slots)
-        memory_k = (
-            memory_k.to(dtype=k.dtype).unsqueeze(0).expand(batch, -1, -1, -1)
-        )
-        memory_v = (
-            memory_v.to(dtype=v.dtype).unsqueeze(0).expand(batch, -1, -1, -1)
-        )
-        k = torch.cat((k, memory_k), dim=-2)
-        v = torch.cat((v, memory_v), dim=-2)
 
         attention_dropout = self.dropout if self.training else 0.0
         use_external_flash = (
@@ -498,53 +463,25 @@ class TransformerUnit(nn.Module):
         self,
         dim: int,
         heads: int,
-        memory_slots: int,
         dropout: float,
     ):
         super().__init__()
         self.attn_norm = nn.RMSNorm(dim)
-        self.attn = PersistentMemoryRoPEAttention(
+        self.attn = RoPEAttention(
             dim,
             heads,
-            memory_slots,
             dropout=dropout,
         )
         hidden_dim = int(math.ceil((dim * 2.5) / 64.0) * 64)
         self.ff_norm = nn.RMSNorm(dim)
         self.ff = SwiGLU(dim, hidden_dim, dropout=dropout)
-        # This residual branch is new relative to the original all-attention model.
-        # Zero-init its output projection so the FF path starts neutral and is
-        # learned on top of the attention function.
+        # Zero-init the FF output projection so the feed-forward residual path
+        # starts neutral and is learned on top of the attention function.
         nn.init.zeros_(self.ff.out_proj.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x))
         return x + self.ff(self.ff_norm(x))
-
-
-class LocalTFMixer(nn.Module):
-    """Cheap local 3x3 time-frequency branch between axial-attention stages."""
-
-    def __init__(self, dim: int, dropout: float):
-        super().__init__()
-        self.norm = nn.RMSNorm(dim)
-        self.depthwise = nn.Conv2d(
-            dim, dim, kernel_size=3, padding=1, groups=dim, bias=True
-        )
-        self.in_proj = nn.Linear(dim, dim * 2, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        # Start close to the original network and let training turn the local
-        # branch on gradually.
-        nn.init.zeros_(self.out_proj.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        y = self.norm(x).permute(0, 3, 1, 2)
-        y = self.depthwise(y).permute(0, 2, 3, 1)
-        gate, value = self.in_proj(y).chunk(2, dim=-1)
-        y = self.out_proj(F.silu(gate) * value)
-        return residual + self.dropout(y)
 
 
 class DualPathEncoder(nn.Module):
@@ -553,7 +490,6 @@ class DualPathEncoder(nn.Module):
         unit_kwargs = dict(
             dim=config.dim,
             heads=config.heads,
-            memory_slots=config.memory_slots,
             dropout=config.dropout,
         )
         self.time_layers = nn.ModuleList(
@@ -561,9 +497,6 @@ class DualPathEncoder(nn.Module):
         )
         self.freq_layers = nn.ModuleList(
             TransformerUnit(**unit_kwargs) for _ in range(config.depth)
-        )
-        self.local_layers = nn.ModuleList(
-            LocalTFMixer(config.dim, config.dropout) for _ in range(config.depth)
         )
         self.output_norm = nn.RMSNorm(config.dim)
         self.use_checkpoint = config.use_checkpoint
@@ -592,9 +525,7 @@ class DualPathEncoder(nn.Module):
         batch, frames, bands, dim = x.shape
         should_checkpoint = self.use_checkpoint and self.training
 
-        for time_layer, freq_layer, local_layer in zip(
-            self.time_layers, self.freq_layers, self.local_layers
-        ):
+        for time_layer, freq_layer in zip(self.time_layers, self.freq_layers):
             time_x = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
             time_x = self._run_module(time_layer, time_x, should_checkpoint)
             x = time_x.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
@@ -603,19 +534,11 @@ class DualPathEncoder(nn.Module):
             freq_x = self._run_module(freq_layer, freq_x, should_checkpoint)
             x = freq_x.reshape(batch, frames, bands, dim)
 
-            x = self._run_module(local_layer, x, should_checkpoint)
-
         return self.output_norm(x)
 
 
 def next_power_of_two(value: int) -> int:
     return 1 if value <= 1 else 1 << (value - 1).bit_length()
-
-
-def round_up_to_multiple(value: float, multiple: int) -> int:
-    if multiple <= 0:
-        raise ValueError("multiple must be positive.")
-    return int(math.ceil(value / multiple) * multiple)
 
 
 class BandInputGroup(nn.Module):
@@ -831,26 +754,17 @@ class BandMaskGroup(nn.Module):
         self.register_buffer("freq_indices", freq_indices, persistent=False)
         self.register_buffer("feature_valid", feature_valid, persistent=False)
 
-        # A band-specific nonlinear mask head is materially more expressive than
-        # projecting every band directly from the shared encoder representation.
-        # Keeping the hidden width at ``dim`` controls the parameter cost of the
-        # 124-band layout while still giving every band its own two-layer MLP.
-        hidden_width = config.dim
+        # Each band token is decoded to its complex stereo mask by a single
+        # band-specific gated linear projection. There is no shared predictor
+        # network on top of the transformer; the encoder representation is
+        # mapped straight to mask coefficients.
         output_width = self.num_predicted_stems * self.feature_width
-        self.hidden_weight = nn.Parameter(
-            torch.empty(self.num_group_bands, config.dim, hidden_width)
-        )
-        self.hidden_bias = nn.Parameter(
-            torch.zeros(self.num_group_bands, hidden_width)
-        )
         self.output_weight = nn.Parameter(
-            torch.empty(self.num_group_bands, hidden_width, output_width * 2)
+            torch.empty(self.num_group_bands, config.dim, output_width * 2)
         )
         self.output_bias = nn.Parameter(
             torch.zeros(self.num_group_bands, output_width * 2)
         )
-        for band in range(self.num_group_bands):
-            nn.init.xavier_uniform_(self.hidden_weight[band])
         nn.init.normal_(self.output_weight, std=1e-3)
 
     def forward(
@@ -858,9 +772,7 @@ class BandMaskGroup(nn.Module):
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # x: [B, T, group_bands, D]
-        hidden = torch.einsum("btnd,ndh->btnh", x, self.hidden_weight)
-        hidden = torch.tanh(hidden + self.hidden_bias[None, None])
-        raw = torch.einsum("btnh,nhq->btnq", hidden, self.output_weight)
+        raw = torch.einsum("btnd,ndq->btnq", x, self.output_weight)
         raw = F.glu(raw + self.output_bias[None, None], dim=-1)
         raw = raw.reshape(
             x.shape[0],
@@ -890,8 +802,14 @@ class BandMaskGroup(nn.Module):
         return source, self.freq_indices.reshape(-1)
 
 
-class BandMaskEstimator(nn.Module):
-    """Estimate one complex foreground vocal mask for every disjoint BS bin."""
+class MaskHead(nn.Module):
+    """Decode final transformer tokens into the foreground vocal mask.
+
+    Mask prediction happens entirely inside the transformer's output stage:
+    each normalized band token is mapped to its band's complex stereo mask by
+    a per-band gated linear projection, with no dedicated predictor network
+    between the encoder and the mask output.
+    """
 
     def __init__(
         self,
@@ -917,13 +835,8 @@ class BandMaskEstimator(nn.Module):
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
-        hidden_dim = round_up_to_multiple(config.dim * 2.0, 64)
-        self.norm = nn.RMSNorm(config.dim)
-        self.shared_mlp = SwiGLU(config.dim, hidden_dim, dropout=config.dropout)
-
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, bands, D]
-        x = x + self.shared_mlp(self.norm(x))
         output = x.new_zeros(
             x.shape[0], 1, self.audio_channels, x.shape[1], self.freq_bins, 2
         )
@@ -954,12 +867,12 @@ class BSRoFormerSeparator(nn.Module):
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
         self.encoder = DualPathEncoder(config)
-        self.mask_estimator = BandMaskEstimator(config, self.bands)
+        self.mask_head = MaskHead(config, self.bands)
 
     def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
         tokens = self.band_split.forward_real(mixture_real_imag)
         tokens = self.encoder(tokens)
-        vocal_mask = self.mask_estimator.forward_real(tokens)
+        vocal_mask = self.mask_head.forward_real(tokens)
 
         # No vocal activity gate: the separator's foreground mask is used directly.
         # The accompaniment remains the exact residual complement, so reconstruction
@@ -2357,7 +2270,6 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         dim=args.model_dim,
         depth=args.depth,
         heads=args.heads,
-        memory_slots=args.memory_slots,
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
     )
@@ -2416,7 +2328,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "124-band regular BS-RoFormer hybrid with local TF mixing, "
+            "124-band regular BS-RoFormer with axial attention, "
             "foreground-residual separation, and silence-focused training"
         )
     )
@@ -2446,19 +2358,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=3,
         help=(
-            "Chunk overlap in seconds."
+            "Chunk overlap in seconds. Default is 50%% for the 6 s preset; "
+            "for maximum-SDR inference, 5.25 s gives 87.5%% overlap at higher cost."
         ),
     )
 
-    parser.add_argument("--model_dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--model_dim", type=int, default=384)
+    parser.add_argument("--depth", type=int, default=14)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument(
-        "--memory_slots",
-        type=int,
-        default=128,
-        help="Persistent key/value slots per all-attention layer and head.",
-    )
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
@@ -2585,10 +2492,10 @@ def main() -> None:
 
     model = BSRoFormerSeparator(config)
     for module in model.modules():
-        if isinstance(module, PersistentMemoryRoPEAttention):
+        if isinstance(module, RoPEAttention):
             module.attention_backend = args.attention_backend
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    print(f"124-band hybrid RoFormer parameters: {parameter_count / 1e6:.2f}M")
+    print(f"124-band axial RoFormer parameters: {parameter_count / 1e6:.2f}M")
     if device.type == "cuda":
         flash_available = getattr(
             torch.backends.cuda, "is_flash_attention_available", lambda: True
