@@ -18,18 +18,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from prodigyopt import Prodigy
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
-try:
-    from flash_attn import flash_attn_func as external_flash_attn_func
-except (ImportError, OSError) as error:
-    external_flash_attn_func = None
-    FLASH_ATTN_IMPORT_ERROR: Exception | None = error
-else:
-    FLASH_ATTN_IMPORT_ERROR = None
 
 
 STEMS = ("vocals", "other")
@@ -385,10 +376,6 @@ class RoPEAttention(nn.Module):
         self.heads = heads
         self.head_dim = dim // heads
         self.dropout = dropout
-        # This is a runtime performance setting, not part of the model or its
-        # checkpoint compatibility. ``fused`` prevents an unnoticed fallback
-        # to the much slower quadratic-memory math implementation on CUDA.
-        self.attention_backend = "fused"
 
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
@@ -411,49 +398,15 @@ class RoPEAttention(nn.Module):
         k = apply_rope(k, cos, sin)
 
         attention_dropout = self.dropout if self.training else 0.0
-        use_external_flash = (
-            external_flash_attn_func is not None
-            and q.device.type == "cuda"
-            and q.dtype in (torch.float16, torch.bfloat16)
-            and self.attention_backend in ("fused", "flash")
+        # PyTorch SDPA selects the best available kernel per call (flash,
+        # cuDNN, memory-efficient, or math fallback) with no manual tuning.
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=attention_dropout,
+            is_causal=False,
         )
-        if use_external_flash:
-            # flash-attn uses [batch, sequence, heads, head_dim], whereas
-            # PyTorch SDPA below uses [batch, heads, sequence, head_dim].
-            out = external_flash_attn_func(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                dropout_p=attention_dropout,
-                causal=False,
-            )
-            out = out.transpose(1, 2)
-        else:
-            if q.device.type != "cuda" or self.attention_backend == "auto":
-                attention_context = contextlib.nullcontext()
-            elif self.attention_backend == "fused":
-                # Prefer built-in Flash when available, then cuDNN and
-                # memory-efficient SDPA. Deliberately omit the math fallback.
-                attention_context = sdpa_kernel(
-                    [
-                        SDPBackend.FLASH_ATTENTION,
-                        SDPBackend.CUDNN_ATTENTION,
-                        SDPBackend.EFFICIENT_ATTENTION,
-                    ],
-                    set_priority=True,
-                )
-            elif self.attention_backend == "flash":
-                attention_context = sdpa_kernel(SDPBackend.FLASH_ATTENTION)
-            else:
-                attention_context = sdpa_kernel(SDPBackend.MATH)
-            with attention_context:
-                out = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    dropout_p=attention_dropout,
-                    is_causal=False,
-                )
         out = out.transpose(1, 2).reshape(batch, length, dim)
         return self.out_dropout(self.out_proj(out))
 
@@ -2352,14 +2305,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=2048)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=2048)
-    parser.add_argument("--segment_seconds", type=float, default=6)
+    parser.add_argument("--segment_seconds", type=float, default=8)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
         default=3,
         help=(
-            "Chunk overlap in seconds. Default is 50%% for the 6 s preset; "
-            "for maximum-SDR inference, 5.25 s gives 87.5%% overlap at higher cost."
+            "Chunk overlap in seconds."
         ),
     )
 
@@ -2369,16 +2321,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument(
-        "--attention_backend",
-        choices=("fused", "flash", "auto", "math"),
-        default="fused",
-        help=(
-            "CUDA attention backend. 'fused' tries the external flash-attn package, "
-            "PyTorch Flash, cuDNN, then memory-efficient attention with no math "
-            "fallback; 'flash' requires external or PyTorch Flash Attention."
-        ),
-    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accumulation", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
@@ -2491,48 +2433,8 @@ def main() -> None:
             args.precision = "fp16"
 
     model = BSRoFormerSeparator(config)
-    for module in model.modules():
-        if isinstance(module, RoPEAttention):
-            module.attention_backend = args.attention_backend
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"124-band axial RoFormer parameters: {parameter_count / 1e6:.2f}M")
-    if device.type == "cuda":
-        flash_available = getattr(
-            torch.backends.cuda, "is_flash_attention_available", lambda: True
-        )()
-        if args.attention_backend == "flash":
-            if external_flash_attn_func is not None:
-                print("CUDA attention backend: external flash-attn package (required).")
-            elif not flash_available:
-                import_detail = (
-                    f" Import error: {FLASH_ATTN_IMPORT_ERROR}"
-                    if FLASH_ATTN_IMPORT_ERROR is not None
-                    else ""
-                )
-                raise RuntimeError(
-                    "Neither the external flash-attn package nor this PyTorch build "
-                    f"provides Flash Attention.{import_detail}"
-                )
-            else:
-                print("CUDA attention backend: built-in PyTorch Flash Attention.")
-        elif args.attention_backend == "fused":
-            if external_flash_attn_func is not None:
-                print(
-                    "CUDA attention backend: external flash-attn package "
-                    "(cuDNN/memory-efficient fallback available)."
-                )
-            elif flash_available:
-                print(
-                    "CUDA attention backend: fused (PyTorch Flash, cuDNN, then "
-                    "memory-efficient; math disabled)."
-                )
-            else:
-                print(
-                    "Flash Attention is unavailable in this PyTorch build; using "
-                    "fused cuDNN/memory-efficient attention with math disabled."
-                )
-        else:
-            print(f"CUDA attention backend: {args.attention_backend}.")
 
     if args.train:
         if checkpoint_path:
