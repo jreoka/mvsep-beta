@@ -43,8 +43,8 @@ class ModelConfig:
     audio_channels: int = 2
     num_stems: int = len(STEMS)
     num_bands: int = 124
-    dim: int = 256
-    depth: int = 12
+    dim: int = 384
+    depth: int = 14
     heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
