@@ -92,6 +92,13 @@ class LossConfig:
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
     silence_weight: float = 0.05
+    # True dB-domain supervision on vocal-occupied bins.  The log1p() terms
+    # are nearly linear near zero, so quiet vocal content (reverb tails,
+    # reversed pre-echoes, airy highs) is otherwise almost weightless.
+    log_db_weight: float = 0.12
+    # Temporal stability of the vocal mask: sustained notes should not
+    # flicker voiced/unvoiced or dip under the accompaniment.
+    mask_tv_weight: float = 0.02
 
 
 # -----------------------------------------------------------------------------
@@ -986,11 +993,14 @@ def frame_mean_square(
 ) -> torch.Tensor:
     """Frame-local mean-square envelope aligned to center=True STFT frames.
 
+    ``audio`` is [..., samples] and the result is [..., n_frames]; leading
+    dimensions are preserved so a batch of mixes is pooled independently (the
+    previous mean over dim -2 merged batch entries together).
+
     Keeping this in the power domain avoids the singular derivative of sqrt(0),
     which matters because silence augmentation intentionally creates exact zeros.
     """
-    power = audio.square().mean(dim=-2)
-    flat = power.reshape(-1, power.shape[-1]).unsqueeze(1)
+    flat = audio.square().reshape(-1, audio.shape[-1]).unsqueeze(1)
     pooled = F.avg_pool1d(
         flat,
         kernel_size=win_length,
@@ -998,7 +1008,7 @@ def frame_mean_square(
         padding=win_length // 2,
         count_include_pad=False,
     )
-    return pooled.squeeze(1).reshape(*power.shape[:-1], -1)
+    return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
 
 
 class SeparationLoss(nn.Module):
@@ -1062,6 +1072,29 @@ class SeparationLoss(nn.Module):
         )
         mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
 
+        # True log-domain supervision on vocal-occupied bins only.  log1p() is
+        # nearly linear near zero, so quiet vocal content (reverb tails,
+        # reversed pre-echoes, airy highs) is nearly weightless in the other
+        # spectral terms; a real dB-domain error weights those bins by their
+        # audible level.  The bin gate keeps this from forcing vocal energy
+        # into bins the target leaves silent.
+        est_vocal_mag = estimates[:, 0].abs()
+        target_vocal_mag = target_specs[:, 0].abs()
+        vocal_bins = target_vocal_mag > self.activity_threshold
+        if vocal_bins.any():
+            log_db_error = 20.0 * (
+                torch.log10(est_vocal_mag.clamp_min(1e-7))
+                - torch.log10(target_vocal_mag.clamp_min(1e-7))
+            ).abs()
+            log_db_loss = log_db_error[vocal_bins].clamp_max(60.0).mean()
+        else:
+            log_db_loss = pred_audio.new_tensor(0.0)
+
+        # Temporal stability of the vocal mask: a sustained note should not
+        # flicker between voiced and unvoiced or dip under the accompaniment.
+        vocal_mask_mag = masks[:, 0].abs()
+        mask_tv = (vocal_mask_mag[..., 1:] - vocal_mask_mag[..., :-1]).abs().mean()
+
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
         true_mid, true_side = mid_side(target_audio)
@@ -1069,11 +1102,18 @@ class SeparationLoss(nn.Module):
             normalized_l1(pred_mid, true_mid) + normalized_l1(pred_side, true_side)
         )
 
+        # Any-channel frame power of the vocal stem: a widely panned or
+        # side-only vocal must still count as active; a single channel would
+        # misread it as silence.
         target_vocal_power = frame_mean_square(
-            target_audio[:, 0], self.model_config.win_length, self.model_config.hop_length
+            target_audio[:, 0].square().amax(dim=1),
+            self.model_config.win_length,
+            self.model_config.hop_length,
         )
         pred_vocal_power = frame_mean_square(
-            pred_audio[:, 0], self.model_config.win_length, self.model_config.hop_length
+            pred_audio[:, 0].square().amax(dim=1),
+            self.model_config.win_length,
+            self.model_config.hop_length,
         )
         frames = min(target_vocal_power.shape[-1], pred_vocal_power.shape[-1])
         target_vocal_power = target_vocal_power[..., :frames]
@@ -1099,6 +1139,8 @@ class SeparationLoss(nn.Module):
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
             + cfg.silence_weight * silence_loss
+            + cfg.log_db_weight * log_db_loss
+            + cfg.mask_tv_weight * mask_tv
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1126,6 +1168,8 @@ class SeparationLoss(nn.Module):
             "silence": silence_loss.detach(),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
+            "log_db": log_db_loss.detach(),
+            "mask_tv": mask_tv.detach(),
         }
         return total, metrics
 
@@ -1187,6 +1231,253 @@ def resolve_target_paths(directory: str) -> dict[str, tuple[str, ...]] | None:
             return None
         accompaniment = (accompaniment_path,)
     return {"vocals": (vocals,), "other": accompaniment}
+
+
+# -----------------------------------------------------------------------------
+# Wet / backwards / wide vocal augmentation
+# -----------------------------------------------------------------------------
+
+
+def fft_convolve(signal: torch.Tensor, impulse: torch.Tensor) -> torch.Tensor:
+    """Convolve [channels, samples] signal with a 1-D impulse via FFT."""
+    total = signal.shape[-1] + impulse.shape[-1] - 1
+    fft_size = 1
+    while fft_size < total:
+        fft_size <<= 1
+    signal_spec = torch.fft.rfft(signal, fft_size, dim=-1)
+    impulse_spec = torch.fft.rfft(impulse.to(signal.dtype), fft_size, dim=-1)
+    convolved = torch.fft.irfft(
+        signal_spec * impulse_spec.unsqueeze(0), fft_size, dim=-1
+    )
+    return convolved[..., : signal.shape[-1]]
+
+
+def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
+    """Random exponentially decaying noise IR with a short pre-delay."""
+    length = min(int(random.uniform(0.4, 2.0) * sample_rate), max_length)
+    pre_delay = int(random.uniform(0.0, 0.12) * sample_rate)
+    tail = max(1, length - pre_delay)
+    time = torch.arange(tail, dtype=torch.float32)
+    tau = random.uniform(0.08, 0.4) * sample_rate
+    impulse = torch.randn(tail, dtype=torch.float32) * torch.exp(-time / tau)
+    if pre_delay > 0:
+        impulse = torch.cat((torch.zeros(pre_delay, dtype=torch.float32), impulse))
+    return impulse / impulse.square().sum().sqrt().clamp_min(1e-8)
+
+
+def apply_reverb(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Mix a synthetic reverb tail into a stem so wet vocals stay extractable."""
+    impulse = make_reverb_impulse(sample_rate, audio.shape[-1])
+    wet = fft_convolve(audio, impulse)
+    mix = random.uniform(0.15, 0.5)
+    return (1.0 - mix) * audio + mix * wet
+
+
+def apply_reverse_echo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Add a reversed, swelling vocal window that flows into the following voice.
+
+    This mimics the production trick where a reversed reverb of the upcoming
+    phrase swells up right before the downbeat.  The reversed copy is part of
+    the generated vocal target, so the model learns to attribute backwards-
+    smeared vocal energy to the vocals instead of leaking it to accompaniment.
+    """
+    samples = audio.shape[-1]
+    window = min(int(random.uniform(0.4, 1.6) * sample_rate), samples // 2)
+    if random.random() < 0.75:
+        # Bias the window end toward a frame with vocal energy so the swell
+        # flows into the voice, like a reverse-reverb pre-echo.
+        energy = audio.square().mean(dim=0)
+        weight = energy.clamp_min(1e-6).sqrt()
+        weight = weight * 0.7 + weight.mean() * 0.3
+        candidates = weight[window:]
+        total_weight = candidates.sum()
+        if total_weight > 0:
+            end = (
+                int(torch.multinomial(candidates.double() / total_weight, 1).item())
+                + window
+            )
+        else:
+            end = random.randint(window, samples)
+    else:
+        end = random.randint(window, samples)
+    start = end - window
+
+    echo = audio[:, start:end].flip(dims=(-1,))
+    if random.random() < 0.6:
+        impulse = make_reverb_impulse(sample_rate, window)
+        echo = fft_convolve(echo, impulse)
+    swell = torch.linspace(0.05, 1.0, window) ** random.uniform(1.0, 2.5)
+    gain = random.uniform(0.12, 0.4)
+    augmented = audio.clone()
+    augmented[:, start:end] += gain * swell[None] * echo
+    return augmented
+
+
+def apply_air_boost(audio: torch.Tensor) -> torch.Tensor:
+    """Random first-order pre-emphasis: a cheap high-frequency "air" lift."""
+    coefficient = random.uniform(0.5, 0.95)
+    boosted = audio.clone()
+    boosted[:, 1:] = audio[:, 1:] - coefficient * audio[:, :-1]
+    return boosted
+
+
+def make_synth_lead(sample_rate: int, duration: int) -> torch.Tensor:
+    """A vocal-ish sustained synth tone: harmonics, vibrato, slow envelope.
+
+    Clean harmonic timbre with no formant structure and no breath noise --
+    the opposite of a real voice.  Placed in the accompaniment, it teaches the
+    model that a prominent sustained pitched tone is not automatically vocals.
+    """
+    f0 = math.exp(random.uniform(math.log(80.0), math.log(880.0)))
+    t = torch.arange(duration, dtype=torch.float32) / sample_rate
+    vibrato_depth = random.uniform(0.0, 0.004)
+    vibrato_rate = random.uniform(3.0, 6.5)
+    freq = f0 * (1.0 + vibrato_depth * torch.sin(2 * math.pi * vibrato_rate * t))
+    phase = 2 * math.pi * torch.cumsum(freq, dim=0) / sample_rate
+    harmonics = random.randint(8, 28)
+    harmonics = min(harmonics, int(sample_rate / (2 * f0)) - 1)
+    harmonics = max(1, harmonics)
+    rolloff = random.uniform(0.7, 1.5)
+    wave = torch.zeros(duration, dtype=torch.float32)
+    for k in range(1, harmonics + 1):
+        amp = (k ** -rolloff) * random.uniform(0.7, 1.3)
+        wave += amp * torch.sin(k * phase)
+    attack = int(random.uniform(0.05, 0.4) * sample_rate)
+    release = int(random.uniform(0.1, 0.6) * sample_rate)
+    env = torch.ones(duration)
+    if attack > 1:
+        env[:attack] = torch.linspace(0.0, 1.0, attack)
+    if release > 1:
+        env[-release:] = torch.linspace(1.0, 0.0, release)
+    tremolo = 1.0 + random.uniform(0.05, 0.2) * torch.sin(
+        2 * math.pi * random.uniform(2.0, 5.0) * t
+    )
+    return wave * env * tremolo
+
+
+def add_synth_lead(
+    other: torch.Tensor,
+    vocal: torch.Tensor,
+    sample_rate: int,
+) -> torch.Tensor:
+    """Drop a prominent vocal-sounding synth lead into the accompaniment.
+
+    Placement is biased toward windows where the vocal is quiet, recreating
+    the hard case of a vocal-like lead synth playing on its own (e.g. the
+    intro of a pop track).
+    """
+    samples = other.shape[-1]
+    duration = min(int(random.uniform(1.5, 6.0) * sample_rate), samples)
+    if random.random() < 0.6 and duration < samples:
+        energy = vocal.square().mean(dim=0)
+        weight = energy.clamp_min(1e-6).sqrt()
+        weight = weight * 0.7 + weight.mean() * 0.3
+        weight = weight.max() - weight + weight.mean() * 0.5
+        candidates = weight[: samples - duration]
+        total_weight = candidates.sum()
+        if total_weight > 0:
+            start = int(torch.multinomial(candidates.double() / total_weight, 1).item())
+        else:
+            start = random.randint(0, samples - duration)
+    else:
+        start = random.randint(0, samples - duration)
+
+    lead = make_synth_lead(sample_rate, duration)
+    lead = lead / lead.square().mean().sqrt().clamp_min(1e-8)
+    rms_scale = max(
+        float(other.square().mean().sqrt()) * random.uniform(0.25, 2.0), 0.02
+    )
+    width = random.uniform(0.0, 0.6)
+    augmented = other.clone()
+    augmented[0, start : start + duration] += rms_scale * lead * (1.0 + width)
+    augmented[1, start : start + duration] += rms_scale * lead * (1.0 - width)
+    return augmented
+
+
+VOWEL_FORMANTS = (
+    (800.0, 1150.0, 2900.0),  # ah
+    (400.0, 2200.0, 2900.0),  # eh
+    (300.0, 2100.0, 2800.0),  # ee
+    (500.0, 800.0, 2800.0),  # oh
+    (350.0, 700.0, 2700.0),  # oo
+)
+
+
+def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
+    """A long synthetic sung vowel: glottal source through formant filters.
+
+    Strong formant structure, vibrato, and breath noise -- the cues that
+    separate a real sustained voice from a synth.  Placed in the vocal stem,
+    it teaches the model to keep long sustained notes (like a held "oo")
+    voiced and free of leaked background.
+    """
+    f0 = math.exp(random.uniform(math.log(90.0), math.log(300.0)))
+    f1, f2, f3 = random.choice(VOWEL_FORMANTS)
+    f1 *= random.uniform(0.85, 1.15)
+    f2 *= random.uniform(0.85, 1.15)
+    f3 *= random.uniform(0.85, 1.15)
+    t = torch.arange(duration, dtype=torch.float32) / sample_rate
+    vibrato_depth = random.uniform(0.004, 0.012)
+    vibrato_rate = random.uniform(4.0, 6.5)
+    freq = f0 * (1.0 + vibrato_depth * torch.sin(2 * math.pi * vibrato_rate * t))
+    phase = 2 * math.pi * torch.cumsum(freq, dim=0) / sample_rate
+
+    # Glottal source spectrum: harmonics at k * f0 with 1/k amplitudes and
+    # random phases (phase is irrelevant; the model reproduces it via masking).
+    n = duration
+    spec = torch.zeros(n // 2 + 1, dtype=torch.complex64)
+    kmax = min(int(sample_rate / (2 * f0)), 160)
+    for k in range(1, kmax + 1):
+        bin_index = int(round(k * f0 * n / sample_rate))
+        if bin_index <= n // 2:
+            angle = random.uniform(0.0, 2 * math.pi)
+            spec[bin_index] = torch.polar(
+                torch.tensor(1.0 / k, dtype=torch.float32),
+                torch.tensor(angle, dtype=torch.float32),
+            )
+    freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate)
+    for formant in (f1, f2, f3):
+        q = random.uniform(5.0, 10.0)
+        ratio = freqs / formant
+        # clamp the 1/ratio term: the glottal source has no DC energy, so
+        # clamping the DC bin is harmless and avoids inf/nan at freq=0.
+        ratio_inv = 1.0 / ratio.clamp_min(1e-6)
+        response = 1.0 / (1.0 + 1j * q * (ratio - ratio_inv))
+        spec = spec * response
+    vowel = torch.fft.irfft(spec, n)
+
+    # Quiet breath noise and a slow sung envelope with tremolo.
+    breath = torch.randn(n, dtype=torch.float32)
+    breath *= random.uniform(0.01, 0.05) * vowel.square().mean().sqrt().clamp_min(1e-8)
+    vowel = vowel + breath
+    attack = int(random.uniform(0.03, 0.15) * sample_rate)
+    release = int(random.uniform(0.15, 0.8) * sample_rate)
+    env = torch.ones(n)
+    if attack > 1:
+        env[:attack] = torch.linspace(0.0, 1.0, attack)
+    if release > 1:
+        env[-release:] = torch.linspace(1.0, 0.0, release)
+    tremolo = 1.0 + random.uniform(0.03, 0.12) * torch.sin(
+        2 * math.pi * random.uniform(2.0, 4.5) * t
+    )
+    return vowel * env * tremolo
+
+
+def add_sustained_vowel(vocal: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Add a long synthetic sustained vowel to the vocal stem."""
+    samples = vocal.shape[-1]
+    duration = min(int(random.uniform(1.5, 6.0) * sample_rate), samples)
+    start = random.randint(0, samples - duration)
+    vowel = make_sustained_vowel(sample_rate, duration)
+    vowel = vowel / vowel.square().mean().sqrt().clamp_min(1e-8)
+    level = max(
+        float(vocal.square().mean().sqrt()) * random.uniform(0.4, 1.5), 0.01
+    )
+    width = random.uniform(0.0, 0.8)
+    augmented = vocal.clone()
+    augmented[0, start : start + duration] += level * vowel * (1.0 + width)
+    augmented[1, start : start + duration] += level * vowel * (1.0 - width)
+    return augmented
 
 
 class StemDataset(Dataset):
@@ -1297,7 +1588,7 @@ class StemDataset(Dataset):
         return torch.stack(targets)
 
     @staticmethod
-    def _augment(targets: torch.Tensor) -> torch.Tensor:
+    def _augment(targets: torch.Tensor, sample_rate: int) -> torch.Tensor:
         gains_db = torch.empty(targets.shape[0]).uniform_(-8.0, 4.0)
         gains = torch.pow(10.0, gains_db / 20.0).view(-1, 1, 1)
         targets = targets * gains
@@ -1305,7 +1596,12 @@ class StemDataset(Dataset):
         for stem_index in range(targets.shape[0]):
             if random.random() < 0.5:
                 targets[stem_index] = -targets[stem_index]
-            width = random.uniform(0.75, 1.25)
+            if stem_index == 0:
+                # Vocals may be pushed far out to the sides; accompaniment
+                # keeps a more conservative width range.
+                width = random.uniform(0.5, 1.6)
+            else:
+                width = random.uniform(0.75, 1.25)
             mid = (targets[stem_index, 0] + targets[stem_index, 1]) * 0.5
             side = (targets[stem_index, 0] - targets[stem_index, 1]) * 0.5 * width
             targets[stem_index, 0] = mid + side
@@ -1340,6 +1636,31 @@ class StemDataset(Dataset):
                         )
                 vocal.mul_(envelope)
 
+        # --- Wet / backwards-echo / airy vocal augmentation ---
+        # Synthetic reverb, reversed "pre-echo" swells, and air-boosted highs
+        # teach the model to track time-smeared, low-level vocal content that
+        # real mixes bury in the instrumentation.  The mixture is built after
+        # augmentation, so the model sees these effects as part of the vocal
+        # stem it must recover.
+        vocal = targets[0]
+        if random.random() < 0.4:
+            vocal = apply_reverb(vocal, sample_rate)
+        if random.random() < 0.25:
+            vocal = apply_reverse_echo(vocal, sample_rate)
+        if random.random() < 0.25:
+            vocal = apply_air_boost(vocal)
+        if random.random() < 0.25:
+            vocal = add_sustained_vowel(vocal, sample_rate)
+        targets[0] = vocal
+
+        # Vocal-sounding sustained synth leads belong to the accompaniment:
+        # without these examples the model defaults any prominent sustained
+        # pitched tone to "vocals" (e.g. a pop lead synth in an intro).
+        other = targets[1]
+        if random.random() < 0.3:
+            other = add_synth_lead(other, vocal, sample_rate)
+        targets[1] = other
+
         if random.random() < 0.5:
             targets = targets.flip(dims=(1,))
 
@@ -1355,7 +1676,7 @@ class StemDataset(Dataset):
         last_error: Exception | None = None
         for _attempt in range(20):
             try:
-                targets = self._augment(self._sample_targets())
+                targets = self._augment(self._sample_targets(), self.sample_rate)
                 mixture = targets.sum(dim=0)
                 if mixture.square().mean().sqrt() < self.min_activity_rms:
                     continue
@@ -2095,7 +2416,7 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, silence, vocal_db, mask_mag = torch.stack(
+            wave, main_stft, mrstft, silence, vocal_db, mask_mag, log_db, mask_tv = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
@@ -2103,6 +2424,8 @@ def train(
                     latest_metrics["silence"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
+                    latest_metrics["log_db"],
+                    latest_metrics["mask_tv"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
@@ -2112,6 +2435,8 @@ def train(
                 sil=f"{silence:.3f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
+                logdb=f"{log_db:.2f}dB",
+                mtv=f"{mask_tv:.3f}",
                 refresh=False,
             )
         progress.update(1)
@@ -2405,6 +2730,11 @@ def main() -> None:
                 print(
                     "No compatible auto-resume checkpoint was found. Starting fresh; "
                     "use --checkpoint_path to resume an exact checkpoint."
+                )
+            elif checkpoint_path is not None:
+                print(
+                    f"Auto-resuming training from {checkpoint_path}. "
+                    "Use --fresh to start a new run instead."
                 )
         elif args.infer:
             checkpoint_path = (
