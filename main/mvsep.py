@@ -1480,6 +1480,286 @@ def add_sustained_vowel(vocal: torch.Tensor, sample_rate: int) -> torch.Tensor:
     return augmented
 
 
+# -----------------------------------------------------------------------------
+# Broad-spectrum augmentation: pitch, EQ, noise, drive, dynamics, delay, space
+# -----------------------------------------------------------------------------
+# Everything here is cheap for an 8 s crop: vectorized ops, a handful of FFTs
+# only when triggered, and small frame-level loops.  Every effect preserves the
+# sum-to-mixture contract by construction (stems are augmented, then summed).
+
+
+def fft_resample(audio: torch.Tensor, factor: float) -> torch.Tensor:
+    """Bandlimited linear-phase resampling, RMS-preserving, [..., samples].
+
+    Linear-phase resampling via FFT is the cheap stand-in for a polyphase FIR:
+    one forward and one inverse FFT, all vectorized.  Callers truncate or pad
+    the result back to the fixed segment length.
+    """
+    n = audio.shape[-1]
+    new_len = max(1, int(round(n * factor)))
+    spec = torch.fft.rfft(audio, n, dim=-1)
+    half = new_len // 2 + 1
+    if half <= spec.shape[-1]:
+        new_spec = spec[..., :half]
+    else:
+        new_spec = F.pad(spec, (0, half - spec.shape[-1]))
+    shifted = torch.fft.irfft(new_spec, new_len, dim=-1)
+    rms = audio.square().mean().sqrt().clamp_min(1e-8)
+    shifted_rms = shifted.square().mean().sqrt().clamp_min(1e-8)
+    return shifted * (rms / shifted_rms)
+
+
+def pitch_shift_crop(targets: torch.Tensor) -> torch.Tensor:
+    """Pitch-shift the whole crop by resampling (+-2 semitones).
+
+    Applied to every stem so the key stays internally consistent (a real track
+    does not detune the vocal against the band).  Resampling also moves the
+    tempo, mirroring how different recordings of the same song sit in
+    different keys *and* tempos; the resampled crop is truncated or zero-padded
+    back to the fixed segment length.
+    """
+    factor = 2.0 ** (random.uniform(-2.0, 2.0) / 12.0)
+    n = targets.shape[-1]
+    shifted = fft_resample(targets, factor)
+    if shifted.shape[-1] >= n:
+        return shifted[..., :n]
+    return F.pad(shifted, (0, n - shifted.shape[-1]))
+
+
+def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Random smooth EQ curve in the FFT domain (shelves, bells, rolloffs).
+
+    Covers the real-mix spectral shape family: muffled radio vocals, bright
+    airy pop, telephone band-pass, nasal notches, thin low-cut mixes.  The
+    response is real and non-negative, so phase is untouched and the filter is
+    zero-phase; at these intensities it reads as "different microphone / EQ",
+    not as an artifact.  Loudness is restored so EQ changes timbre, not level.
+    """
+    n = audio.shape[-1]
+    freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
+    log_f = torch.log(freqs)
+    response = torch.ones_like(freqs)
+
+    def bell(center_hz: float, q: float, gain_db: float) -> None:
+        nonlocal response
+        sigma = math.log(2.0) / max(q, 0.25)
+        response *= 10.0 ** (
+            gain_db / 20.0 * torch.exp(-0.5 * ((log_f - math.log(center_hz)) / sigma) ** 2)
+        )
+
+    def shelf(center_hz: float, width_decades: float, gain_db: float) -> None:
+        nonlocal response
+        response *= 10.0 ** (
+            gain_db / 20.0
+            * 0.5
+            * (1.0 + torch.tanh((log_f - math.log(center_hz)) / (math.log(10.0) * width_decades)))
+        )
+
+    def lowpass(corner_hz: float, order: float = 2.0) -> None:
+        nonlocal response
+        response *= (1.0 + (freqs / corner_hz) ** (2.0 * order)).rsqrt()
+
+    def highpass(corner_hz: float, order: float = 2.0) -> None:
+        nonlocal response
+        response *= (1.0 + (corner_hz / freqs) ** (2.0 * order)).rsqrt()
+
+    for _ in range(random.randint(1, 3)):
+        choice = random.random()
+        if choice < 0.25:
+            bell(
+                random.uniform(200.0, 8000.0),
+                random.uniform(0.5, 4.0),
+                random.uniform(-10.0, 8.0),
+            )
+        elif choice < 0.5:
+            shelf(random.uniform(200.0, 600.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 8.0))
+        elif choice < 0.75:
+            shelf(random.uniform(2500.0, 9000.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 8.0))
+        else:
+            corner = random.uniform(150.0, 2500.0)
+            order = random.uniform(1.0, 3.0)
+            if random.random() < 0.5:
+                lowpass(corner, order)
+            else:
+                highpass(corner, order)
+    spec = torch.fft.rfft(audio, n, dim=-1)
+    filtered = torch.fft.irfft(spec * response.to(spec.dtype), n, dim=-1)
+    rms = audio.square().mean().sqrt().clamp_min(1e-8)
+    filtered_rms = filtered.square().mean().sqrt().clamp_min(1e-8)
+    return filtered * (rms / filtered_rms)
+
+
+_PINK_NOISE_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
+    """Per-worker cached pink-noise buffer, sliced randomly per call.
+
+    The expensive part (spectrum construction + one inverse FFT) runs once per
+    worker process; every augmentation step is then a cheap random slice.
+    Workers keep separate buffers, so they never share identical noise.
+    """
+    key = (length, sample_rate)
+    buffer = _PINK_NOISE_CACHE.get(key)
+    if buffer is None:
+        total = max(2 ** 20, 4 * length)
+        freqs = torch.fft.rfftfreq(total, 1.0 / sample_rate).clamp_min(1.0)
+        amp = 1.0 / freqs.sqrt()
+        spec = torch.complex(
+            torch.randn(total // 2 + 1, dtype=torch.float32),
+            torch.randn(total // 2 + 1, dtype=torch.float32),
+        )
+        spec = spec * amp
+        spec[0] = 0.0
+        buffer = torch.fft.irfft(spec, total)
+        buffer = buffer / buffer.square().mean().sqrt().clamp_min(1e-8)
+        _PINK_NOISE_CACHE[key] = buffer
+    offset = random.randint(0, max(0, buffer.shape[-1] - length))
+    return buffer[offset : offset + length]
+
+
+def add_noise_floor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Add a pink-noise floor (tape hiss / room tone) at -52..-32 dB."""
+    length = audio.shape[-1]
+    level_db = random.uniform(-52.0, -32.0)
+    level = 10.0 ** (level_db / 20.0) * audio.square().mean().sqrt().clamp_min(1e-8)
+    return audio + level * _pink_noise(length, sample_rate)
+
+
+def apply_saturation(audio: torch.Tensor) -> torch.Tensor:
+    """Soft-knee tanh drive (tube / tape) with a dry/wet mix."""
+    drive = random.uniform(1.5, 6.0)
+    mix = random.uniform(0.3, 1.0)
+    wet = torch.tanh(drive * audio) / math.tanh(drive)
+    return mix * wet + (1.0 - mix) * audio
+
+
+def _frame_rms(audio: torch.Tensor, frame: int = 512) -> torch.Tensor:
+    """Per-frame RMS envelope of [channels, samples], returns [n_frames]."""
+    power = audio.square().mean(dim=0)
+    n = power.shape[-1]
+    pad = frame - (n % frame)
+    if pad < frame:
+        power = F.pad(power, (0, pad))
+    return power.reshape(-1, frame).mean(dim=1).sqrt().clamp_min(1e-8)
+
+
+def apply_bus_compression(targets: torch.Tensor, frame: int = 512) -> torch.Tensor:
+    """Side-chain "mix bus" compression applied identically to every stem.
+
+    The gain envelope is derived from the mixture, exactly like a real bus
+    compressor, and the same gain is applied to the stems and the mixture so
+    the sum-to-mixture contract survives.  This is the last big realism gap in
+    a pipeline that otherwise only varies levels with linear gains: real mixes
+    are heavily compressed, with pumping and ducking that flat gains never
+    reproduce.  Frame-level envelope + 1-pole smoothing keeps it vectorized.
+    """
+    mixture = targets.sum(dim=0)
+    env = _frame_rms(mixture, frame)
+    env_db = 20.0 * torch.log10(env)
+    threshold_db = random.uniform(-38.0, -12.0)
+    ratio = random.uniform(2.0, 8.0)
+    mix = random.uniform(0.3, 1.0)
+    gain_db = torch.clamp((env_db - threshold_db) * (1.0 - 1.0 / ratio), max=0.0)
+    alpha = random.uniform(0.25, 0.6)
+    smoothed = torch.empty_like(gain_db)
+    acc = gain_db[0].clone()
+    for i in range(gain_db.shape[0]):
+        acc = alpha * acc + (1.0 - alpha) * gain_db[i]
+        smoothed[i] = acc
+    gain = torch.pow(10.0, (mix * smoothed) / 20.0)
+    gain_full = F.interpolate(
+        gain.view(1, 1, -1),
+        size=mixture.shape[-1],
+        mode="linear",
+        align_corners=False,
+    ).view(-1)
+    return targets * gain_full.view(1, 1, -1)
+
+
+def _delay(audio: torch.Tensor, samples: int) -> torch.Tensor:
+    """Zero-padded delay of [..., samples]; safe for out-of-range delays."""
+    if samples <= 0 or samples >= audio.shape[-1]:
+        return torch.zeros_like(audio)
+    out = torch.zeros_like(audio)
+    out[..., samples:] = audio[..., :-samples]
+    return out
+
+
+def apply_echo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Multi-tap slapback / delay echo (FIR: no feedback recursion, no pre-echo)."""
+    taps = random.randint(1, 3)
+    delay_ms = random.uniform(40.0, 320.0)
+    gain = random.uniform(0.15, 0.45)
+    out = audio.clone()
+    for tap in range(1, taps + 1):
+        d = int(
+            delay_ms * tap * (1.0 + random.uniform(-0.1, 0.1)) / 1000.0 * sample_rate
+        )
+        out = out + gain / tap * _delay(audio, d)
+    return out
+
+
+def apply_chorus(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Static chorus / Haas decorrelation: short per-channel delays.
+
+    A real chorus sweeps a delay LFO; a static short delay with a darkened
+    copy is a faithful-enough stand-in that costs only a few shifted adds.
+    """
+    out = audio.clone()
+    for ch in range(audio.shape[0]):
+        d = int(random.uniform(5.0, 30.0) / 1000.0 * sample_rate)
+        g = random.uniform(0.15, 0.4)
+        delayed = _delay(audio[ch], d)
+        # Darken the delayed copy with a cheap 3-tap moving average.
+        delayed = (delayed + torch.roll(delayed, 1) + torch.roll(delayed, 2)) / 3.0
+        out[ch] = audio[ch] + g * delayed
+    return out
+
+
+def apply_pan_sweep(audio: torch.Tensor) -> torch.Tensor:
+    """Slow mid/side pan movement: the stereo image drifts over the segment."""
+    n = audio.shape[-1]
+    mid = (audio[0] + audio[1]) * 0.5
+    side = (audio[0] - audio[1]) * 0.5
+    start = random.uniform(0.5, 1.2)
+    end = random.uniform(0.5, 1.2)
+    ramp = torch.linspace(start, end, n)
+    out = audio.clone()
+    out[0] = mid + side * ramp
+    out[1] = mid - side * ramp
+    return out
+
+
+def apply_vocal_tremolo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Slow amplitude modulation on the vocal stem (sung tremolo)."""
+    n = audio.shape[-1]
+    t = torch.arange(n, dtype=torch.float32) / sample_rate
+    depth = random.uniform(0.03, 0.12)
+    rate = random.uniform(1.0, 5.0)
+    phase = random.uniform(0.0, 2.0 * math.pi)
+    mod = 1.0 + depth * torch.sin(2.0 * math.pi * rate * t + phase)
+    return audio * mod.view(1, -1)
+
+
+def apply_vocal_doubling(vocal: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Double-tracked vocal: a slightly detuned, few-ms-delayed copy layered in.
+
+    Pop vocals are double-tracked constantly; a resampled copy (+-1.5 %) plus
+    a short delay gives the thickened chorus sound without a second take.
+    """
+    factor = 1.0 + random.uniform(-0.015, 0.015)
+    n = vocal.shape[-1]
+    copy = fft_resample(vocal, factor)
+    if copy.shape[-1] >= n:
+        copy = copy[..., :n]
+    else:
+        copy = F.pad(copy, (0, n - copy.shape[-1]))
+    d = int(random.uniform(0.0, 15.0) / 1000.0 * sample_rate)
+    gain = random.uniform(0.4, 0.9)
+    return vocal + gain * _delay(copy, d)
+
+
 class StemDataset(Dataset):
     def __init__(
         self,
@@ -1597,15 +1877,23 @@ class StemDataset(Dataset):
             if random.random() < 0.5:
                 targets[stem_index] = -targets[stem_index]
             if stem_index == 0:
-                # Vocals may be pushed far out to the sides; accompaniment
+                # Vocals may be pushed far out to the sides or squashed to
+                # near-mono (phone / live / mono-synth mixes); accompaniment
                 # keeps a more conservative width range.
-                width = random.uniform(0.5, 1.6)
+                if random.random() < 0.3:
+                    width = random.uniform(0.0, 0.4)
+                else:
+                    width = random.uniform(0.5, 1.6)
             else:
                 width = random.uniform(0.75, 1.25)
             mid = (targets[stem_index, 0] + targets[stem_index, 1]) * 0.5
             side = (targets[stem_index, 0] - targets[stem_index, 1]) * 0.5 * width
             targets[stem_index, 0] = mid + side
             targets[stem_index, 1] = mid - side
+
+        # Whole-crop key/tempo variation, before any per-stem effects.
+        if random.random() < 0.2:
+            targets = pitch_shift_crop(targets)
 
         # Add occasional *local* vocal gaps, but never manufacture an entire
         # six-second no-vocal example.  Whole-segment erasure combined with
@@ -1636,33 +1924,66 @@ class StemDataset(Dataset):
                         )
                 vocal.mul_(envelope)
 
-        # --- Wet / backwards-echo / airy vocal augmentation ---
-        # Synthetic reverb, reversed "pre-echo" swells, and air-boosted highs
-        # teach the model to track time-smeared, low-level vocal content that
-        # real mixes bury in the instrumentation.  The mixture is built after
-        # augmentation, so the model sees these effects as part of the vocal
-        # stem it must recover.
+        # --- Vocal signal chain ---
+        # Signal-flow order: timbre (EQ, drive) first, then time-based effects
+        # (chorus, echo, reverb), then level effects (doubling, tremolo) and
+        # the synthetic vowel, with the noise floor last.  The mixture is
+        # built after augmentation, so the model sees every effect as part of
+        # the vocal stem it must recover.
         vocal = targets[0]
+        if random.random() < 0.3:
+            vocal = random_spectral_eq(vocal, sample_rate)
+        if random.random() < 0.3:
+            vocal = apply_saturation(vocal)
+        if random.random() < 0.2:
+            vocal = apply_chorus(vocal, sample_rate)
+        if random.random() < 0.25:
+            vocal = apply_echo(vocal, sample_rate)
         if random.random() < 0.4:
             vocal = apply_reverb(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = apply_reverse_echo(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = apply_air_boost(vocal)
+        if random.random() < 0.15:
+            vocal = apply_vocal_doubling(vocal, sample_rate)
+        if random.random() < 0.15:
+            vocal = apply_vocal_tremolo(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = add_sustained_vowel(vocal, sample_rate)
+        if random.random() < 0.25:
+            vocal = add_noise_floor(vocal, sample_rate)
         targets[0] = vocal
 
-        # Vocal-sounding sustained synth leads belong to the accompaniment:
-        # without these examples the model defaults any prominent sustained
-        # pitched tone to "vocals" (e.g. a pop lead synth in an intro).
+        # --- Accompaniment signal chain ---
+        # Wet instruments are just as common as wet vocals; EQ, drive, noise
+        # and pan movement widen the instrument timbre space too.
         other = targets[1]
         if random.random() < 0.3:
+            other = random_spectral_eq(other, sample_rate)
+        if random.random() < 0.2:
+            other = apply_saturation(other)
+        if random.random() < 0.25:
+            other = apply_reverb(other, sample_rate)
+        if random.random() < 0.15:
+            other = apply_pan_sweep(other)
+        if random.random() < 0.3:
             other = add_synth_lead(other, vocal, sample_rate)
+        if random.random() < 0.2:
+            other = add_noise_floor(other, sample_rate)
         targets[1] = other
+
+        # Mix-bus dynamics: the same gain curve on every stem, so real-world
+        # compression/pumping is present without breaking sum-to-mixture.
+        if random.random() < 0.25:
+            targets = apply_bus_compression(targets)
 
         if random.random() < 0.5:
             targets = targets.flip(dims=(1,))
+        if random.random() < 0.5:
+            # Time reversal: free (no FFT), and a strong regularizer -- the
+            # network cannot lean on direction-of-time cues.
+            targets = targets.flip(dims=(2,))
 
         global_gain = db_to_gain(random.uniform(-4.0, 3.0))
         targets = targets * global_gain
