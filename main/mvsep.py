@@ -1253,7 +1253,12 @@ def fft_convolve(signal: torch.Tensor, impulse: torch.Tensor) -> torch.Tensor:
 
 
 def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
-    """Random exponentially decaying noise IR with a short pre-delay."""
+    """Random exponentially decaying noise IR with a short pre-delay.
+
+    The tail is low-passed at a random 3-9 kHz corner.  A white-noise IR
+    sounds like a bright hiss and trains the separator to smear broadband
+    energy around the voice; real rooms roll the highs off.
+    """
     length = min(int(random.uniform(0.4, 2.0) * sample_rate), max_length)
     pre_delay = int(random.uniform(0.0, 0.12) * sample_rate)
     tail = max(1, length - pre_delay)
@@ -1262,6 +1267,11 @@ def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
     impulse = torch.randn(tail, dtype=torch.float32) * torch.exp(-time / tau)
     if pre_delay > 0:
         impulse = torch.cat((torch.zeros(pre_delay, dtype=torch.float32), impulse))
+    n = impulse.shape[-1]
+    freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
+    cutoff = random.uniform(3_000.0, 9_000.0)
+    response = (1.0 + (freqs / cutoff) ** 2).rsqrt()
+    impulse = torch.fft.irfft(torch.fft.rfft(impulse, n) * response, n)
     return impulse / impulse.square().sum().sqrt().clamp_min(1e-8)
 
 
@@ -1314,8 +1324,13 @@ def apply_reverse_echo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
 
 
 def apply_air_boost(audio: torch.Tensor) -> torch.Tensor:
-    """Random first-order pre-emphasis: a cheap high-frequency "air" lift."""
-    coefficient = random.uniform(0.5, 0.95)
+    """Random first-order pre-emphasis: a gentle high-frequency "air" lift.
+
+    The coefficient is kept moderate: y[n] = x[n] - c*x[n-1] is a high-freq
+    differentiator, and at c=0.95 it pushes +6 dB at Nyquist while turning any
+    residual stem noise into audible hiss.
+    """
+    coefficient = random.uniform(0.3, 0.6)
     boosted = audio.clone()
     boosted[:, 1:] = audio[:, 1:] - coefficient * audio[:, :-1]
     return boosted
@@ -1337,7 +1352,10 @@ def make_synth_lead(sample_rate: int, duration: int) -> torch.Tensor:
     harmonics = random.randint(8, 28)
     harmonics = min(harmonics, int(sample_rate / (2 * f0)) - 1)
     harmonics = max(1, harmonics)
-    rolloff = random.uniform(0.7, 1.5)
+    # Rolloff kept >= 1.0: slower rolloffs make the lead buzzy, and a bright
+    # harmonic stack in the accompaniment is exactly what leaks into the
+    # vocal output as high-frequency shimmer.
+    rolloff = random.uniform(1.0, 1.5)
     wave = torch.zeros(duration, dtype=torch.float32)
     for k in range(1, harmonics + 1):
         amp = (k ** -rolloff) * random.uniform(0.7, 1.3)
@@ -1424,9 +1442,12 @@ def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
 
     # Glottal source spectrum: harmonics at k * f0 with 1/k amplitudes and
     # random phases (phase is irrelevant; the model reproduces it via masking).
+    # Harmonics are capped at ~8 kHz: a sustained vowel that manufactures
+    # energy in the air band teaches the separator to emit high-frequency
+    # shimmer around the voice.
     n = duration
     spec = torch.zeros(n // 2 + 1, dtype=torch.complex64)
-    kmax = min(int(sample_rate / (2 * f0)), 160)
+    kmax = min(int(sample_rate / (2 * f0)), 160, int(8_000.0 / f0))
     for k in range(1, kmax + 1):
         bin_index = int(round(k * f0 * n / sample_rate))
         if bin_index <= n // 2:
@@ -1446,9 +1467,11 @@ def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
         spec = spec * response
     vowel = torch.fft.irfft(spec, n)
 
-    # Quiet breath noise and a slow sung envelope with tremolo.
-    breath = torch.randn(n, dtype=torch.float32)
-    breath *= random.uniform(0.01, 0.05) * vowel.square().mean().sqrt().clamp_min(1e-8)
+    # Quiet breath noise and a slow sung envelope with tremolo.  Breath is
+    # pink and quiet: white hiss in the vocal target is unrecoverable by the
+    # mask separator (it reads as static), and real breath is darker than 1/f.
+    breath = _pink_noise(n, sample_rate)
+    breath *= random.uniform(0.003, 0.010) * vowel.square().mean().sqrt().clamp_min(1e-8)
     vowel = vowel + breath
     attack = int(random.uniform(0.03, 0.15) * sample_rate)
     release = int(random.uniform(0.15, 0.8) * sample_rate)
@@ -1569,12 +1592,12 @@ def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
             bell(
                 random.uniform(200.0, 8000.0),
                 random.uniform(0.5, 4.0),
-                random.uniform(-10.0, 8.0),
+                random.uniform(-10.0, 6.0),
             )
         elif choice < 0.5:
-            shelf(random.uniform(200.0, 600.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 8.0))
+            shelf(random.uniform(200.0, 600.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 6.0))
         elif choice < 0.75:
-            shelf(random.uniform(2500.0, 9000.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 8.0))
+            shelf(random.uniform(2500.0, 9000.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 6.0))
         else:
             corner = random.uniform(150.0, 2500.0)
             order = random.uniform(1.0, 3.0)
@@ -1619,16 +1642,23 @@ def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
 
 
 def add_noise_floor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Add a pink-noise floor (tape hiss / room tone) at -52..-32 dB."""
+    """Add a pink-noise floor (tape hiss / room tone) at -56..-40 dB."""
     length = audio.shape[-1]
-    level_db = random.uniform(-52.0, -32.0)
+    level_db = random.uniform(-56.0, -40.0)
     level = 10.0 ** (level_db / 20.0) * audio.square().mean().sqrt().clamp_min(1e-8)
     return audio + level * _pink_noise(length, sample_rate)
 
 
 def apply_saturation(audio: torch.Tensor) -> torch.Tensor:
-    """Soft-knee tanh drive (tube / tape) with a dry/wet mix."""
-    drive = random.uniform(1.5, 6.0)
+    """Soft-knee tanh drive (tube / tape) with a dry/wet mix.
+
+    Drive stays low.  tanh intermodulation manufactures energy above the
+    voice's natural bandwidth (measured +15-25 dB in the >8 kHz band at
+    drive 3) and the mask separator smears that back out as fuzz riding the
+    vocal.  Drive 1.2-2 is gentle tube warmth: harmonics appear, but the
+    top end is not manufactured from nothing.
+    """
+    drive = random.uniform(1.2, 2.0)
     mix = random.uniform(0.3, 1.0)
     wet = torch.tanh(drive * audio) / math.tanh(drive)
     return mix * wet + (1.0 - mix) * audio
@@ -1927,9 +1957,14 @@ class StemDataset(Dataset):
         # --- Vocal signal chain ---
         # Signal-flow order: timbre (EQ, drive) first, then time-based effects
         # (chorus, echo, reverb), then level effects (doubling, tremolo) and
-        # the synthetic vowel, with the noise floor last.  The mixture is
-        # built after augmentation, so the model sees every effect as part of
-        # the vocal stem it must recover.
+        # the synthetic vowel.  The mixture is built after augmentation, so the
+        # model sees every effect as part of the vocal stem it must recover.
+        # Note: no noise floor here.  Independent per-stem hiss is unrecoverable
+        # by a mask separator (two uncorrelated broadband noises cannot be told
+        # apart), so the model answered with a high-frequency static riding the
+        # voice.  Hiss is a recording-chain property: it lives in the
+        # accompaniment, and the model should learn to push it there, keeping
+        # the vocal clean.
         vocal = targets[0]
         if random.random() < 0.3:
             vocal = random_spectral_eq(vocal, sample_rate)
@@ -1951,13 +1986,15 @@ class StemDataset(Dataset):
             vocal = apply_vocal_tremolo(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = add_sustained_vowel(vocal, sample_rate)
-        if random.random() < 0.25:
-            vocal = add_noise_floor(vocal, sample_rate)
         targets[0] = vocal
 
         # --- Accompaniment signal chain ---
         # Wet instruments are just as common as wet vocals; EQ, drive, noise
-        # and pan movement widen the instrument timbre space too.
+        # and pan movement widen the instrument timbre space too.  The noise
+        # floor lives here: a single correlated hiss in the instrumental is
+        # physically believable (tape hiss / room tone) and the model learns
+        # to route it to the accompaniment instead of smearing it on the
+        # vocal as static.
         other = targets[1]
         if random.random() < 0.3:
             other = random_spectral_eq(other, sample_rate)
