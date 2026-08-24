@@ -91,7 +91,7 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
-    silence_weight: float = 0.05
+    silence_weight: float = 0.08
     # True dB-domain supervision on vocal-occupied bins.  The log1p() terms
     # are nearly linear near zero, so quiet vocal content (reverb tails,
     # reversed pre-echoes, airy highs) is otherwise almost weightless.
@@ -99,6 +99,11 @@ class LossConfig:
     # Temporal stability of the vocal mask: sustained notes should not
     # flicker voiced/unvoiced or dip under the accompaniment.
     mask_tv_weight: float = 0.02
+    # Vocal leakage guard: squared vocal mask in instrumental-dominated bins.
+    # Relative/log losses barely penalize a slightly-open mask there, and a
+    # separator trained on broadband-augmented vocals answers by reproducing
+    # the mixture's high band (cymbals, hats, air) as static riding the voice.
+    leakage_weight: float = 0.3
 
 
 # -----------------------------------------------------------------------------
@@ -1095,6 +1100,25 @@ class SeparationLoss(nn.Module):
         vocal_mask_mag = masks[:, 0].abs()
         mask_tv = (vocal_mask_mag[..., 1:] - vocal_mask_mag[..., :-1]).abs().mean()
 
+        # Vocal leakage guard.  The relative and log-domain losses barely
+        # penalize a slightly-open vocal mask in bins the instrumental
+        # dominates (the error is a small fraction of a large level), so a
+        # separator trained on broadband-augmented vocal targets learns to
+        # reproduce the mixture's high band -- cymbals, hats, air -- as a
+        # static shimmer riding the voice, and it gets worse as training fits
+        # those targets better.  Penalize the squared vocal mask directly in
+        # instrumental-dominated bins (target vocal at least 12 dB below the
+        # mixture, mixture actually present).  In pure-leak bins the ideal is
+        # zero; where the voice is genuinely singing at low level the main
+        # losses pull the mask back up, so the net effect is clean highs
+        # instead of a static version of the instrumental.
+        mixture_mag = mixture_spec.abs()
+        leak_bins = (target_vocal_mag < 0.25 * mixture_mag) & (mixture_mag > 0.1)
+        if leak_bins.any():
+            leakage_loss = vocal_mask_mag[leak_bins].square().mean()
+        else:
+            leakage_loss = pred_audio.new_tensor(0.0)
+
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
         true_mid, true_side = mid_side(target_audio)
@@ -1141,6 +1165,7 @@ class SeparationLoss(nn.Module):
             + cfg.silence_weight * silence_loss
             + cfg.log_db_weight * log_db_loss
             + cfg.mask_tv_weight * mask_tv
+            + cfg.leakage_weight * leakage_loss
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1170,6 +1195,7 @@ class SeparationLoss(nn.Module):
             "vocal_mask_mag": vocal_mask_mag.detach(),
             "log_db": log_db_loss.detach(),
             "mask_tv": mask_tv.detach(),
+            "leakage": leakage_loss.detach(),
         }
         return total, metrics
 
@@ -1269,17 +1295,23 @@ def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
         impulse = torch.cat((torch.zeros(pre_delay, dtype=torch.float32), impulse))
     n = impulse.shape[-1]
     freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
-    cutoff = random.uniform(3_000.0, 9_000.0)
+    cutoff = random.uniform(3_000.0, 7_000.0)
     response = (1.0 + (freqs / cutoff) ** 2).rsqrt()
     impulse = torch.fft.irfft(torch.fft.rfft(impulse, n) * response, n)
     return impulse / impulse.square().sum().sqrt().clamp_min(1e-8)
 
 
 def apply_reverb(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Mix a synthetic reverb tail into a stem so wet vocals stay extractable."""
+    """Mix a synthetic reverb tail into a stem so wet vocals stay extractable.
+
+    The wet mix is deliberately modest: a loud diffuse tail in the vocal
+    target overlaps the instrumental's high band (cymbals, hats) for seconds
+    after the voice stops, and a mask separator answers by leaving its mask
+    open there -- the "static instrumental riding the vocals" artifact.
+    """
     impulse = make_reverb_impulse(sample_rate, audio.shape[-1])
     wet = fft_convolve(audio, impulse)
-    mix = random.uniform(0.15, 0.5)
+    mix = random.uniform(0.1, 0.3)
     return (1.0 - mix) * audio + mix * wet
 
 
@@ -1966,19 +1998,19 @@ class StemDataset(Dataset):
         # accompaniment, and the model should learn to push it there, keeping
         # the vocal clean.
         vocal = targets[0]
-        if random.random() < 0.3:
+        if random.random() < 0.25:
             vocal = random_spectral_eq(vocal, sample_rate)
-        if random.random() < 0.3:
+        if random.random() < 0.25:
             vocal = apply_saturation(vocal)
         if random.random() < 0.2:
             vocal = apply_chorus(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = apply_echo(vocal, sample_rate)
-        if random.random() < 0.4:
+        if random.random() < 0.25:
             vocal = apply_reverb(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = apply_reverse_echo(vocal, sample_rate)
-        if random.random() < 0.25:
+        if random.random() < 0.2:
             vocal = apply_air_boost(vocal)
         if random.random() < 0.15:
             vocal = apply_vocal_doubling(vocal, sample_rate)
@@ -2774,7 +2806,7 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, silence, vocal_db, mask_mag, log_db, mask_tv = torch.stack(
+            wave, main_stft, mrstft, silence, vocal_db, mask_mag, log_db, mask_tv, leakage = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
@@ -2784,6 +2816,7 @@ def train(
                     latest_metrics["vocal_mask_mag"],
                     latest_metrics["log_db"],
                     latest_metrics["mask_tv"],
+                    latest_metrics["leakage"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
@@ -2795,6 +2828,7 @@ def train(
                 vmask=f"{mask_mag:.3f}",
                 logdb=f"{log_db:.2f}dB",
                 mtv=f"{mask_tv:.3f}",
+                leak=f"{leakage:.4f}",
                 refresh=False,
             )
         progress.update(1)
