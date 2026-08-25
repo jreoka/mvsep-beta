@@ -99,11 +99,12 @@ class LossConfig:
     # Temporal stability of the vocal mask: sustained notes should not
     # flicker voiced/unvoiced or dip under the accompaniment.
     mask_tv_weight: float = 0.02
-    # Vocal leakage guard: squared vocal mask in instrumental-dominated bins.
-    # Relative/log losses barely penalize a slightly-open mask there, and a
-    # separator trained on broadband-augmented vocals answers by reproducing
-    # the mixture's high band (cymbals, hats, air) as static riding the voice.
-    leakage_weight: float = 0.3
+    # Vocal leakage guard: log-RMS penalty on the vocal mask in excess of the
+    # per-bin ideal, in instrumental-dominated bins.  The old squared-mask form
+    # was diluted to near-zero by the mean over millions of leak bins; this
+    # targets the leakage spikes with silence-loss-like gradients and never
+    # fights reproduction of the voice's own content.
+    leakage_weight: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -1112,10 +1113,24 @@ class SeparationLoss(nn.Module):
         # zero; where the voice is genuinely singing at low level the main
         # losses pull the mask back up, so the net effect is clean highs
         # instead of a static version of the instrumental.
-        mixture_mag = mixture_spec.abs()
+        mixture_mag = mixture_spec.abs().clamp_min(1e-6)
         leak_bins = (target_vocal_mag < 0.25 * mixture_mag) & (mixture_mag > 0.1)
+        # Penalize only the vocal mask ABOVE the per-bin ideal (the leakage
+        # spikes): where the voice is genuinely present the ideal mask is v/mix
+        # and reconstruction is never penalized, while any estimate beyond it
+        # is instrumental content riding the voice.  The log-RMS form (same
+        # shape as the silence loss) keeps a strong gradient for masks far
+        # above the floor and a finite gradient at zero, so the
+        # mean-over-millions-of-bins dilution that made the old square form
+        # inert no longer applies.
+        eff_mask = est_vocal_mag / mixture_mag
+        ideal_mask = target_vocal_mag / mixture_mag
+        excess_mask = (eff_mask - ideal_mask).clamp_min(0)
+        leak_floor = 0.02 ** 2  # mask 2% => leakage ~34 dB below the mixture
         if leak_bins.any():
-            leakage_loss = vocal_mask_mag[leak_bins].square().mean()
+            leakage_loss = 0.5 * torch.log1p(
+                excess_mask[leak_bins].square() / leak_floor
+            ).mean()
         else:
             leakage_loss = pred_audio.new_tensor(0.0)
 
