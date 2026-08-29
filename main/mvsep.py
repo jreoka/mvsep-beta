@@ -26,7 +26,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 8
+CHECKPOINT_FORMAT_VERSION = 9
 
 
 # -----------------------------------------------------------------------------
@@ -44,11 +44,14 @@ class ModelConfig:
     num_stems: int = len(STEMS)
     num_bands: int = 124
     dim: int = 384
-    depth: int = 14
+    depth: int = 12
     heads: int = 8
     dropout: float = 0.0
+    subnet_dim: int = 192
+    subnet_depth: int = 3
+    subnet_patch: int = 4
     use_checkpoint: bool = True
-    architecture: str = "bs124_roformer_axial_v6_direct_mask"
+    architecture: str = "bs124_roformer_apbs_v7_dual_subnet"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -75,11 +78,13 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture != "bs124_roformer_axial_v6_direct_mask":
+        if self.subnet_dim <= 0 or self.subnet_depth <= 0 or self.subnet_patch <= 0:
+            raise ValueError("subnet_dim, subnet_depth, and subnet_patch must be positive.")
+        if self.architecture != "bs124_roformer_apbs_v7_dual_subnet":
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_roformer_axial_v6_direct_mask."
+                "bs124_roformer_apbs_v7_dual_subnet."
             )
 
 
@@ -370,17 +375,33 @@ class RoPEAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.out_dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
+        # QK-RMSNorm keeps attention logits bounded at larger dims/depths, so
+        # the model trains stably without warmup hand-holding.
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        # Per-head sigmoid gates on the attention output let the network
+        # suppress uninformative heads per token.
+        self.to_gates = nn.Linear(dim, heads)
+        # Value-residual learning: every layer blends its values with the
+        # first layer's values under a learned per-head gate.
+        self.to_value_residual_mix = nn.Linear(dim, heads)
 
     def forward(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        value_residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, length, dim = x.shape
         qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        q = self.q_norm(q.transpose(1, 2))
+        k = self.k_norm(k.transpose(1, 2))
         v = v.transpose(1, 2)
+        orig_v = v
+
+        if value_residual is not None:
+            mix = torch.sigmoid(self.to_value_residual_mix(x))
+            v = v + (value_residual - v) * mix.transpose(1, 2).unsqueeze(-1)
 
         cos, sin = self.rope(length, x.device, q.dtype)
         q = apply_rope(q, cos, sin)
@@ -396,8 +417,10 @@ class RoPEAttention(nn.Module):
             dropout_p=attention_dropout,
             is_causal=False,
         )
+        gates = torch.sigmoid(self.to_gates(x))
+        out = out * gates.transpose(1, 2).unsqueeze(-1)
         out = out.transpose(1, 2).reshape(batch, length, dim)
-        return self.out_dropout(self.out_proj(out))
+        return self.out_dropout(self.out_proj(out)), orig_v
 
 
 class TransformerUnit(nn.Module):
@@ -421,9 +444,14 @@ class TransformerUnit(nn.Module):
         # starts neutral and is learned on top of the attention function.
         nn.init.zeros_(self.ff.out_proj.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        return x + self.ff(self.ff_norm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        value_residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_out, orig_v = self.attn(self.attn_norm(x), value_residual)
+        x = x + attn_out
+        return x + self.ff(self.ff_norm(x)), orig_v
 
 
 class DualPathEncoder(nn.Module):
@@ -456,24 +484,35 @@ class DualPathEncoder(nn.Module):
     def _run_module(
         module: nn.Module,
         x: torch.Tensor,
+        value_residual: torch.Tensor | None,
         use_checkpoint: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not use_checkpoint:
-            return module(x)
-        return checkpoint(module, x, use_reentrant=False)
+            return module(x, value_residual)
+        return checkpoint(module, x, value_residual, use_reentrant=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, frames, bands, dim]
         batch, frames, bands, dim = x.shape
         should_checkpoint = self.use_checkpoint and self.training
+        time_v_residual: torch.Tensor | None = None
+        freq_v_residual: torch.Tensor | None = None
 
         for time_layer, freq_layer in zip(self.time_layers, self.freq_layers):
             time_x = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
-            time_x = self._run_module(time_layer, time_x, should_checkpoint)
+            time_x, time_v = self._run_module(
+                time_layer, time_x, time_v_residual, should_checkpoint
+            )
+            if time_v_residual is None:
+                time_v_residual = time_v
             x = time_x.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
 
             freq_x = x.reshape(batch * frames, bands, dim)
-            freq_x = self._run_module(freq_layer, freq_x, should_checkpoint)
+            freq_x, freq_v = self._run_module(
+                freq_layer, freq_x, freq_v_residual, should_checkpoint
+            )
+            if freq_v_residual is None:
+                freq_v_residual = freq_v
             x = freq_x.reshape(batch, frames, bands, dim)
 
         return self.output_norm(x)
@@ -802,19 +841,214 @@ class MaskHead(nn.Module):
 
 
 
+class SubnetConvNeXtBlock(nn.Module):
+    """ConvNeXt v2-style block over a [B, D, F', T'] patch grid."""
+
+    def __init__(self, dim: int, expansion: int = 4):
+        super().__init__()
+        self.dwconv = nn.Conv2d(
+            dim, dim, kernel_size=7, padding=3, groups=dim
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.pw1 = nn.Linear(dim, dim * expansion)
+        self.act = nn.GELU()
+        self.pw2 = nn.Linear(dim * expansion, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.pw2(self.act(self.pw1(self.norm(x))))
+        return residual + x.permute(0, 3, 1, 2)
+
+
+def build_band_patch_counts(
+    bands: Sequence[tuple[int, int]],
+    freq_bins: int,
+    patch: int,
+) -> torch.Tensor:
+    """Count how many real-STFT bins of each band fall in each freq patch.
+
+    Shape [num_bands, freq_patches]. Bands are disjoint, so each bin belongs
+    to exactly one band and one patch.
+    """
+    freq_patches = math.ceil(freq_bins / patch)
+    counts = torch.zeros(len(bands), freq_patches)
+    for band_id, (start, end) in enumerate(bands):
+        for bin_index in range(start, end):
+            counts[band_id, bin_index // patch] += 1
+    return counts
+
+
+class InputSubnet(nn.Module):
+    """ConvNeXt branch over the raw complex spectrogram at patch resolution.
+
+    Band-split tokens collapse each band's fine frequency/phase structure into
+    one vector, which biases the mask inside bands and makes it discontinuous
+    across band edges. This branch preserves full local 2-D context and injects
+    it into the transformer token sequence, mitigating that bias.
+    """
+
+    def __init__(self, config: ModelConfig, bands: Sequence[tuple[int, int]]):
+        super().__init__()
+        patch = config.subnet_patch
+        self.patch = patch
+        self.freq_bins = config.n_fft // 2 + 1
+        self.freq_patches = math.ceil(self.freq_bins / patch)
+        dim = config.subnet_dim
+        in_channels = config.audio_channels * 2
+
+        self.patch_embed = nn.Conv2d(
+            in_channels, dim, kernel_size=patch, stride=patch
+        )
+        self.blocks = nn.ModuleList(
+            SubnetConvNeXtBlock(dim) for _ in range(config.subnet_depth)
+        )
+        self.out_norm = nn.LayerNorm(dim)
+        self.to_tokens = nn.Linear(dim, config.dim)
+        nn.init.normal_(self.to_tokens.weight, std=0.02)
+        nn.init.zeros_(self.to_tokens.bias)
+
+        counts = build_band_patch_counts(bands, self.freq_bins, patch)
+        # Row-normalized: average the patch features each band's bins see.
+        weights = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+        self.register_buffer(
+            "band_patch_weights", weights, persistent=False
+        )
+
+    def forward(
+        self, ri_norm: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ri_norm: [B, T, F, C, 2]
+        batch, num_frames, freq_bins, channels, _ = ri_norm.shape
+        x = ri_norm.permute(0, 3, 4, 2, 1).reshape(
+            batch, channels * 2, freq_bins, num_frames
+        )
+        freq_pad = self.freq_patches * self.patch - freq_bins
+        time_pad = (-num_frames) % self.patch
+        if freq_pad or time_pad:
+            x = F.pad(x, (0, time_pad, 0, freq_pad))
+        x = self.patch_embed(x)
+        for block in self.blocks:
+            x = block(x)
+
+        # x: [B, D, P_f, P_t] -> channel-last for norm.
+        x = self.out_norm(x.permute(0, 2, 3, 1))
+        # Pool patches into band features: [B, T', bands, D].
+        band_feats = torch.einsum(
+            "np,bptd->btnd", self.band_patch_weights.to(x.dtype), x
+        )
+        # Upsample time back to frame resolution (each patch covers `patch`
+        # consecutive frames).
+        band_feats = band_feats.repeat_interleave(self.patch, dim=1)[
+            :, :num_frames
+        ]
+        return self.to_tokens(band_feats), x.permute(0, 3, 1, 2)
+
+
+class OutputSubnet(nn.Module):
+    """ConvNeXt branch that refines the predicted mask at full resolution.
+
+    Decoded band tokens are scattered back to a patch grid, fused with the
+    input branch's patch features, convolved, and upsampled to predict an
+    additive real/imag correction to the band-wise mask. This restores the
+    cross-band smoothness and local detail that per-band mask prediction
+    cannot express.
+    """
+
+    def __init__(self, config: ModelConfig, bands: Sequence[tuple[int, int]]):
+        super().__init__()
+        patch = config.subnet_patch
+        self.patch = patch
+        self.freq_bins = config.n_fft // 2 + 1
+        self.freq_patches = math.ceil(self.freq_bins / patch)
+        dim = config.subnet_dim
+
+        self.token_proj = nn.Linear(config.dim, dim)
+        self.fuse = nn.Conv2d(dim * 2, dim, kernel_size=1)
+        self.blocks = nn.ModuleList(
+            SubnetConvNeXtBlock(dim) for _ in range(config.subnet_depth)
+        )
+        self.out_norm = nn.LayerNorm(dim)
+        out_channels = config.audio_channels * 2
+        self.to_mask = nn.Conv2d(dim, out_channels, kernel_size=1)
+        # Zero-init so the mask correction starts at exactly zero and the
+        # model boots as the plain band-split masker; gradients still flow
+        # into the head weights.
+        nn.init.zeros_(self.to_mask.weight)
+        nn.init.zeros_(self.to_mask.bias)
+
+        counts = build_band_patch_counts(bands, self.freq_bins, patch)
+        # Column-normalized: scatter band tokens into patches weighted by
+        # each band's bin occupancy inside the patch.
+        weights = counts / counts.sum(dim=0, keepdim=True).clamp_min(1.0)
+        self.register_buffer(
+            "patch_band_weights", weights, persistent=False
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        input_patch_feats: torch.Tensor,
+        num_frames: int,
+    ) -> torch.Tensor:
+        # tokens: [B, T, bands, D]
+        x = self.token_proj(tokens).transpose(1, 2)  # [B, bands, T, dim]
+        x = torch.einsum(
+            "np,bntd->bptd", self.patch_band_weights.to(x.dtype), x
+        )
+        x = x.permute(0, 3, 1, 2)  # [B, dim, P_f, T]
+        time_pad = (-num_frames) % self.patch
+        if time_pad:
+            x = F.pad(x, (0, time_pad))
+        x = x.reshape(
+            x.shape[0], x.shape[1], x.shape[2], -1, self.patch
+        ).mean(dim=-1)  # [B, dim, P_f, T']
+
+        x = self.fuse(torch.cat((x, input_patch_feats), dim=1))
+        for block in self.blocks:
+            x = block(x)
+        x = self.out_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = self.to_mask(x)  # [B, C*2, P_f, T']
+        x = F.interpolate(
+            x,
+            size=(self.freq_bins, num_frames),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x.reshape(
+            x.shape[0], -1, 2, self.freq_bins, num_frames
+        ).permute(0, 1, 3, 4, 2)  # [B, C, F, T, 2] (matches MaskHead layout)
+
+
 class BSRoFormerSeparator(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
+        self.input_subnet = InputSubnet(config, self.bands)
+        self.output_subnet = OutputSubnet(config, self.bands)
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, self.bands)
 
     def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
-        tokens = self.band_split.forward_real(mixture_real_imag)
+        # mixture_real_imag: [B, C, F, T, 2]. The subnet path wants time-major
+        # [B, T, F, C, 2] and a peak-magnitude normalization for stable conv
+        # dynamics; the mask is still applied to the raw mixture.
+        tokens_time_major = mixture_real_imag.permute(0, 3, 2, 1, 4)
+        magnitude = tokens_time_major.square().sum(dim=-1).sqrt()
+        scale = magnitude.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        ri_norm = tokens_time_major / scale[..., None]
+
+        subnet_tokens, subnet_patch_feats = self.input_subnet(ri_norm)
+        tokens = self.band_split.forward_real(mixture_real_imag) + subnet_tokens
         tokens = self.encoder(tokens)
         vocal_mask = self.mask_head.forward_real(tokens)
+        mask_correction = self.output_subnet(
+            tokens, subnet_patch_feats, tokens_time_major.shape[1]
+        )
+        vocal_mask = vocal_mask + mask_correction.unsqueeze(1)
 
         # No vocal activity gate: the separator's foreground mask is used directly.
         # The accompaniment remains the exact residual complement, so reconstruction
@@ -2666,6 +2900,9 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         depth=args.depth,
         heads=args.heads,
         dropout=args.dropout,
+        subnet_dim=args.subnet_dim,
+        subnet_depth=args.subnet_depth,
+        subnet_patch=args.subnet_patch,
         use_checkpoint=args.ckpt,
     )
 
@@ -2723,7 +2960,8 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "124-band regular BS-RoFormer with axial attention, "
+            "124-band BS-RoFormer with APBS dual ConvNeXt subnets "
+            "(attenuating phase bias), QK-norm gated RoPE axial attention, "
             "foreground-residual separation, trained with the standard "
             "BS-RoFormer L1 + multi-resolution STFT loss"
         )
@@ -2759,8 +2997,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--model_dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=14)
+    parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--subnet_dim", type=int, default=192)
+    parser.add_argument("--subnet_depth", type=int, default=3)
+    parser.add_argument("--subnet_patch", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
