@@ -91,20 +91,6 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
-    silence_weight: float = 0.08
-    # True dB-domain supervision on vocal-occupied bins.  The log1p() terms
-    # are nearly linear near zero, so quiet vocal content (reverb tails,
-    # reversed pre-echoes, airy highs) is otherwise almost weightless.
-    log_db_weight: float = 0.12
-    # Temporal stability of the vocal mask: sustained notes should not
-    # flicker voiced/unvoiced or dip under the accompaniment.
-    mask_tv_weight: float = 0.02
-    # Vocal leakage guard: log-RMS penalty on the vocal mask in excess of the
-    # per-bin ideal, in instrumental-dominated bins.  The old squared-mask form
-    # was diluted to near-zero by the mean over millions of leak bins; this
-    # targets the leakage spikes with silence-loss-like gradients and never
-    # fights reproduction of the voice's own content.
-    leakage_weight: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -1078,96 +1064,12 @@ class SeparationLoss(nn.Module):
         )
         mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
 
-        # True log-domain supervision on vocal-occupied bins only.  log1p() is
-        # nearly linear near zero, so quiet vocal content (reverb tails,
-        # reversed pre-echoes, airy highs) is nearly weightless in the other
-        # spectral terms; a real dB-domain error weights those bins by their
-        # audible level.  The bin gate keeps this from forcing vocal energy
-        # into bins the target leaves silent.
-        est_vocal_mag = estimates[:, 0].abs()
-        target_vocal_mag = target_specs[:, 0].abs()
-        vocal_bins = target_vocal_mag > self.activity_threshold
-        if vocal_bins.any():
-            log_db_error = 20.0 * (
-                torch.log10(est_vocal_mag.clamp_min(1e-7))
-                - torch.log10(target_vocal_mag.clamp_min(1e-7))
-            ).abs()
-            log_db_loss = log_db_error[vocal_bins].clamp_max(60.0).mean()
-        else:
-            log_db_loss = pred_audio.new_tensor(0.0)
-
-        # Temporal stability of the vocal mask: a sustained note should not
-        # flicker between voiced and unvoiced or dip under the accompaniment.
-        vocal_mask_mag = masks[:, 0].abs()
-        mask_tv = (vocal_mask_mag[..., 1:] - vocal_mask_mag[..., :-1]).abs().mean()
-
-        # Vocal leakage guard.  The relative and log-domain losses barely
-        # penalize a slightly-open vocal mask in bins the instrumental
-        # dominates (the error is a small fraction of a large level), so a
-        # separator trained on broadband-augmented vocal targets learns to
-        # reproduce the mixture's high band -- cymbals, hats, air -- as a
-        # static shimmer riding the voice, and it gets worse as training fits
-        # those targets better.  Penalize the squared vocal mask directly in
-        # instrumental-dominated bins (target vocal at least 12 dB below the
-        # mixture, mixture actually present).  In pure-leak bins the ideal is
-        # zero; where the voice is genuinely singing at low level the main
-        # losses pull the mask back up, so the net effect is clean highs
-        # instead of a static version of the instrumental.
-        mixture_mag = mixture_spec.abs().clamp_min(1e-6)
-        leak_bins = (target_vocal_mag < 0.25 * mixture_mag) & (mixture_mag > 0.1)
-        # Penalize only the vocal mask ABOVE the per-bin ideal (the leakage
-        # spikes): where the voice is genuinely present the ideal mask is v/mix
-        # and reconstruction is never penalized, while any estimate beyond it
-        # is instrumental content riding the voice.  The log-RMS form (same
-        # shape as the silence loss) keeps a strong gradient for masks far
-        # above the floor and a finite gradient at zero, so the
-        # mean-over-millions-of-bins dilution that made the old square form
-        # inert no longer applies.
-        eff_mask = est_vocal_mag / mixture_mag
-        ideal_mask = target_vocal_mag / mixture_mag
-        excess_mask = (eff_mask - ideal_mask).clamp_min(0)
-        leak_floor = 0.02 ** 2  # mask 2% => leakage ~34 dB below the mixture
-        if leak_bins.any():
-            leakage_loss = 0.5 * torch.log1p(
-                excess_mask[leak_bins].square() / leak_floor
-            ).mean()
-        else:
-            leakage_loss = pred_audio.new_tensor(0.0)
-
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
         true_mid, true_side = mid_side(target_audio)
         midside_loss = 0.5 * (
             normalized_l1(pred_mid, true_mid) + normalized_l1(pred_side, true_side)
         )
-
-        # Any-channel frame power of the vocal stem: a widely panned or
-        # side-only vocal must still count as active; a single channel would
-        # misread it as silence.
-        target_vocal_power = frame_mean_square(
-            target_audio[:, 0].square().amax(dim=1),
-            self.model_config.win_length,
-            self.model_config.hop_length,
-        )
-        pred_vocal_power = frame_mean_square(
-            pred_audio[:, 0].square().amax(dim=1),
-            self.model_config.win_length,
-            self.model_config.hop_length,
-        )
-        frames = min(target_vocal_power.shape[-1], pred_vocal_power.shape[-1])
-        target_vocal_power = target_vocal_power[..., :frames]
-        pred_vocal_power = pred_vocal_power[..., :frames]
-
-        silence_power = self.activity_threshold**2
-        silent = target_vocal_power < silence_power
-        if silent.any():
-            # Equivalent to a log-RMS penalty at large leakage levels, but unlike
-            # sqrt(power) it has a finite, zero gradient at perfect digital silence.
-            silence_loss = 0.5 * torch.log1p(
-                pred_vocal_power[silent] / silence_power
-            ).mean()
-        else:
-            silence_loss = pred_audio.new_tensor(0.0)
 
         cfg = self.loss_config
         total = (
@@ -1177,10 +1079,6 @@ class SeparationLoss(nn.Module):
             + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
-            + cfg.silence_weight * silence_loss
-            + cfg.log_db_weight * log_db_loss
-            + cfg.mask_tv_weight * mask_tv
-            + cfg.leakage_weight * leakage_loss
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1205,12 +1103,8 @@ class SeparationLoss(nn.Module):
             "mask": mask_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
-            "silence": silence_loss.detach(),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
-            "log_db": log_db_loss.detach(),
-            "mask_tv": mask_tv.detach(),
-            "leakage": leakage_loss.detach(),
         }
         return total, metrics
 
@@ -2821,29 +2715,21 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, silence, vocal_db, mask_mag, log_db, mask_tv, leakage = torch.stack(
+            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
-                    latest_metrics["silence"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
-                    latest_metrics["log_db"],
-                    latest_metrics["mask_tv"],
-                    latest_metrics["leakage"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
                 wave=f"{wave:.3f}",
                 stft=f"{main_stft:.3f}",
                 mr=f"{mrstft:.3f}",
-                sil=f"{silence:.3f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
-                logdb=f"{log_db:.2f}dB",
-                mtv=f"{mask_tv:.3f}",
-                leak=f"{leakage:.4f}",
                 refresh=False,
             )
         progress.update(1)
