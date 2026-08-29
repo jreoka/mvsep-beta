@@ -26,7 +26,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 8
 
 
 # -----------------------------------------------------------------------------
@@ -44,14 +44,11 @@ class ModelConfig:
     num_stems: int = len(STEMS)
     num_bands: int = 124
     dim: int = 384
-    depth: int = 12
+    depth: int = 14
     heads: int = 8
     dropout: float = 0.0
-    subnet_dim: int = 192
-    subnet_depth: int = 3
-    subnet_patch: int = 4
     use_checkpoint: bool = True
-    architecture: str = "bs124_roformer_apbs_v7_dual_subnet"
+    architecture: str = "bs124_roformer_axial_v6_direct_mask"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -78,14 +75,36 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.subnet_dim <= 0 or self.subnet_depth <= 0 or self.subnet_patch <= 0:
-            raise ValueError("subnet_dim, subnet_depth, and subnet_patch must be positive.")
-        if self.architecture != "bs124_roformer_apbs_v7_dual_subnet":
+        if self.architecture != "bs124_roformer_axial_v6_direct_mask":
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_roformer_apbs_v7_dual_subnet."
+                "bs124_roformer_axial_v6_direct_mask."
             )
+
+
+@dataclass
+class LossConfig:
+    waveform_weight: float = 1.0
+    main_stft_weight: float = 0.65
+    mrstft_weight: float = 0.9
+    mask_weight: float = 0.15
+    sdr_weight: float = 0.30
+    midside_weight: float = 0.05
+    silence_weight: float = 0.08
+    # True dB-domain supervision on vocal-occupied bins.  The log1p() terms
+    # are nearly linear near zero, so quiet vocal content (reverb tails,
+    # reversed pre-echoes, airy highs) is otherwise almost weightless.
+    log_db_weight: float = 0.12
+    # Temporal stability of the vocal mask: sustained notes should not
+    # flicker voiced/unvoiced or dip under the accompaniment.
+    mask_tv_weight: float = 0.02
+    # Vocal leakage guard: log-RMS penalty on the vocal mask in excess of the
+    # per-bin ideal, in instrumental-dominated bins.  The old squared-mask form
+    # was diluted to near-zero by the mean over millions of leak bins; this
+    # targets the leakage spikes with silence-loss-like gradients and never
+    # fights reproduction of the voice's own content.
+    leakage_weight: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -375,33 +394,17 @@ class RoPEAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.out_dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
-        # QK-RMSNorm keeps attention logits bounded at larger dims/depths, so
-        # the model trains stably without warmup hand-holding.
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
-        # Per-head sigmoid gates on the attention output let the network
-        # suppress uninformative heads per token.
-        self.to_gates = nn.Linear(dim, heads)
-        # Value-residual learning: every layer blends its values with the
-        # first layer's values under a learned per-head gate.
-        self.to_value_residual_mix = nn.Linear(dim, heads)
 
     def forward(
         self,
         x: torch.Tensor,
-        value_residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         batch, length, dim = x.shape
         qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q = self.q_norm(q.transpose(1, 2))
-        k = self.k_norm(k.transpose(1, 2))
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        orig_v = v
-
-        if value_residual is not None:
-            mix = torch.sigmoid(self.to_value_residual_mix(x))
-            v = v + (value_residual - v) * mix.transpose(1, 2).unsqueeze(-1)
 
         cos, sin = self.rope(length, x.device, q.dtype)
         q = apply_rope(q, cos, sin)
@@ -417,10 +420,8 @@ class RoPEAttention(nn.Module):
             dropout_p=attention_dropout,
             is_causal=False,
         )
-        gates = torch.sigmoid(self.to_gates(x))
-        out = out * gates.transpose(1, 2).unsqueeze(-1)
         out = out.transpose(1, 2).reshape(batch, length, dim)
-        return self.out_dropout(self.out_proj(out)), orig_v
+        return self.out_dropout(self.out_proj(out))
 
 
 class TransformerUnit(nn.Module):
@@ -444,14 +445,9 @@ class TransformerUnit(nn.Module):
         # starts neutral and is learned on top of the attention function.
         nn.init.zeros_(self.ff.out_proj.weight)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        value_residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        attn_out, orig_v = self.attn(self.attn_norm(x), value_residual)
-        x = x + attn_out
-        return x + self.ff(self.ff_norm(x)), orig_v
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x))
+        return x + self.ff(self.ff_norm(x))
 
 
 class DualPathEncoder(nn.Module):
@@ -484,35 +480,24 @@ class DualPathEncoder(nn.Module):
     def _run_module(
         module: nn.Module,
         x: torch.Tensor,
-        value_residual: torch.Tensor | None,
         use_checkpoint: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if not use_checkpoint:
-            return module(x, value_residual)
-        return checkpoint(module, x, value_residual, use_reentrant=False)
+            return module(x)
+        return checkpoint(module, x, use_reentrant=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, frames, bands, dim]
         batch, frames, bands, dim = x.shape
         should_checkpoint = self.use_checkpoint and self.training
-        time_v_residual: torch.Tensor | None = None
-        freq_v_residual: torch.Tensor | None = None
 
         for time_layer, freq_layer in zip(self.time_layers, self.freq_layers):
             time_x = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
-            time_x, time_v = self._run_module(
-                time_layer, time_x, time_v_residual, should_checkpoint
-            )
-            if time_v_residual is None:
-                time_v_residual = time_v
+            time_x = self._run_module(time_layer, time_x, should_checkpoint)
             x = time_x.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
 
             freq_x = x.reshape(batch * frames, bands, dim)
-            freq_x, freq_v = self._run_module(
-                freq_layer, freq_x, freq_v_residual, should_checkpoint
-            )
-            if freq_v_residual is None:
-                freq_v_residual = freq_v
+            freq_x = self._run_module(freq_layer, freq_x, should_checkpoint)
             x = freq_x.reshape(batch, frames, bands, dim)
 
         return self.output_norm(x)
@@ -841,214 +826,19 @@ class MaskHead(nn.Module):
 
 
 
-class SubnetConvNeXtBlock(nn.Module):
-    """ConvNeXt v2-style block over a [B, D, F', T'] patch grid."""
-
-    def __init__(self, dim: int, expansion: int = 4):
-        super().__init__()
-        self.dwconv = nn.Conv2d(
-            dim, dim, kernel_size=7, padding=3, groups=dim
-        )
-        self.norm = nn.LayerNorm(dim)
-        self.pw1 = nn.Linear(dim, dim * expansion)
-        self.act = nn.GELU()
-        self.pw2 = nn.Linear(dim * expansion, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)
-        x = self.pw2(self.act(self.pw1(self.norm(x))))
-        return residual + x.permute(0, 3, 1, 2)
-
-
-def build_band_patch_counts(
-    bands: Sequence[tuple[int, int]],
-    freq_bins: int,
-    patch: int,
-) -> torch.Tensor:
-    """Count how many real-STFT bins of each band fall in each freq patch.
-
-    Shape [num_bands, freq_patches]. Bands are disjoint, so each bin belongs
-    to exactly one band and one patch.
-    """
-    freq_patches = math.ceil(freq_bins / patch)
-    counts = torch.zeros(len(bands), freq_patches)
-    for band_id, (start, end) in enumerate(bands):
-        for bin_index in range(start, end):
-            counts[band_id, bin_index // patch] += 1
-    return counts
-
-
-class InputSubnet(nn.Module):
-    """ConvNeXt branch over the raw complex spectrogram at patch resolution.
-
-    Band-split tokens collapse each band's fine frequency/phase structure into
-    one vector, which biases the mask inside bands and makes it discontinuous
-    across band edges. This branch preserves full local 2-D context and injects
-    it into the transformer token sequence, mitigating that bias.
-    """
-
-    def __init__(self, config: ModelConfig, bands: Sequence[tuple[int, int]]):
-        super().__init__()
-        patch = config.subnet_patch
-        self.patch = patch
-        self.freq_bins = config.n_fft // 2 + 1
-        self.freq_patches = math.ceil(self.freq_bins / patch)
-        dim = config.subnet_dim
-        in_channels = config.audio_channels * 2
-
-        self.patch_embed = nn.Conv2d(
-            in_channels, dim, kernel_size=patch, stride=patch
-        )
-        self.blocks = nn.ModuleList(
-            SubnetConvNeXtBlock(dim) for _ in range(config.subnet_depth)
-        )
-        self.out_norm = nn.LayerNorm(dim)
-        self.to_tokens = nn.Linear(dim, config.dim)
-        nn.init.normal_(self.to_tokens.weight, std=0.02)
-        nn.init.zeros_(self.to_tokens.bias)
-
-        counts = build_band_patch_counts(bands, self.freq_bins, patch)
-        # Row-normalized: average the patch features each band's bins see.
-        weights = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
-        self.register_buffer(
-            "band_patch_weights", weights, persistent=False
-        )
-
-    def forward(
-        self, ri_norm: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # ri_norm: [B, T, F, C, 2]
-        batch, num_frames, freq_bins, channels, _ = ri_norm.shape
-        x = ri_norm.permute(0, 3, 4, 2, 1).reshape(
-            batch, channels * 2, freq_bins, num_frames
-        )
-        freq_pad = self.freq_patches * self.patch - freq_bins
-        time_pad = (-num_frames) % self.patch
-        if freq_pad or time_pad:
-            x = F.pad(x, (0, time_pad, 0, freq_pad))
-        x = self.patch_embed(x)
-        for block in self.blocks:
-            x = block(x)
-
-        # x: [B, D, P_f, P_t] -> channel-last for norm.
-        x = self.out_norm(x.permute(0, 2, 3, 1))
-        # Pool patches into band features: [B, T', bands, D].
-        band_feats = torch.einsum(
-            "np,bptd->btnd", self.band_patch_weights.to(x.dtype), x
-        )
-        # Upsample time back to frame resolution (each patch covers `patch`
-        # consecutive frames).
-        band_feats = band_feats.repeat_interleave(self.patch, dim=1)[
-            :, :num_frames
-        ]
-        return self.to_tokens(band_feats), x.permute(0, 3, 1, 2)
-
-
-class OutputSubnet(nn.Module):
-    """ConvNeXt branch that refines the predicted mask at full resolution.
-
-    Decoded band tokens are scattered back to a patch grid, fused with the
-    input branch's patch features, convolved, and upsampled to predict an
-    additive real/imag correction to the band-wise mask. This restores the
-    cross-band smoothness and local detail that per-band mask prediction
-    cannot express.
-    """
-
-    def __init__(self, config: ModelConfig, bands: Sequence[tuple[int, int]]):
-        super().__init__()
-        patch = config.subnet_patch
-        self.patch = patch
-        self.freq_bins = config.n_fft // 2 + 1
-        self.freq_patches = math.ceil(self.freq_bins / patch)
-        dim = config.subnet_dim
-
-        self.token_proj = nn.Linear(config.dim, dim)
-        self.fuse = nn.Conv2d(dim * 2, dim, kernel_size=1)
-        self.blocks = nn.ModuleList(
-            SubnetConvNeXtBlock(dim) for _ in range(config.subnet_depth)
-        )
-        self.out_norm = nn.LayerNorm(dim)
-        out_channels = config.audio_channels * 2
-        self.to_mask = nn.Conv2d(dim, out_channels, kernel_size=1)
-        # Zero-init so the mask correction starts at exactly zero and the
-        # model boots as the plain band-split masker; gradients still flow
-        # into the head weights.
-        nn.init.zeros_(self.to_mask.weight)
-        nn.init.zeros_(self.to_mask.bias)
-
-        counts = build_band_patch_counts(bands, self.freq_bins, patch)
-        # Column-normalized: scatter band tokens into patches weighted by
-        # each band's bin occupancy inside the patch.
-        weights = counts / counts.sum(dim=0, keepdim=True).clamp_min(1.0)
-        self.register_buffer(
-            "patch_band_weights", weights, persistent=False
-        )
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        input_patch_feats: torch.Tensor,
-        num_frames: int,
-    ) -> torch.Tensor:
-        # tokens: [B, T, bands, D]
-        x = self.token_proj(tokens).transpose(1, 2)  # [B, bands, T, dim]
-        x = torch.einsum(
-            "np,bntd->bptd", self.patch_band_weights.to(x.dtype), x
-        )
-        x = x.permute(0, 3, 1, 2)  # [B, dim, P_f, T]
-        time_pad = (-num_frames) % self.patch
-        if time_pad:
-            x = F.pad(x, (0, time_pad))
-        x = x.reshape(
-            x.shape[0], x.shape[1], x.shape[2], -1, self.patch
-        ).mean(dim=-1)  # [B, dim, P_f, T']
-
-        x = self.fuse(torch.cat((x, input_patch_feats), dim=1))
-        for block in self.blocks:
-            x = block(x)
-        x = self.out_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x = self.to_mask(x)  # [B, C*2, P_f, T']
-        x = F.interpolate(
-            x,
-            size=(self.freq_bins, num_frames),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return x.reshape(
-            x.shape[0], -1, 2, self.freq_bins, num_frames
-        ).permute(0, 1, 3, 4, 2)  # [B, C, F, T, 2] (matches MaskHead layout)
-
-
 class BSRoFormerSeparator(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
-        self.input_subnet = InputSubnet(config, self.bands)
-        self.output_subnet = OutputSubnet(config, self.bands)
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, self.bands)
 
     def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
-        # mixture_real_imag: [B, C, F, T, 2]. The subnet path wants time-major
-        # [B, T, F, C, 2] and a peak-magnitude normalization for stable conv
-        # dynamics; the mask is still applied to the raw mixture.
-        tokens_time_major = mixture_real_imag.permute(0, 3, 2, 1, 4)
-        magnitude = tokens_time_major.square().sum(dim=-1).sqrt()
-        scale = magnitude.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-        ri_norm = tokens_time_major / scale[..., None]
-
-        subnet_tokens, subnet_patch_feats = self.input_subnet(ri_norm)
-        tokens = self.band_split.forward_real(mixture_real_imag) + subnet_tokens
+        tokens = self.band_split.forward_real(mixture_real_imag)
         tokens = self.encoder(tokens)
         vocal_mask = self.mask_head.forward_real(tokens)
-        mask_correction = self.output_subnet(
-            tokens, subnet_patch_feats, tokens_time_major.shape[1]
-        )
-        vocal_mask = vocal_mask + mask_correction.unsqueeze(1)
 
         # No vocal activity gate: the separator's foreground mask is used directly.
         # The accompaniment remains the exact residual complement, so reconstruction
@@ -1078,41 +868,165 @@ class BSRoFormerSeparator(nn.Module):
 # -----------------------------------------------------------------------------
 # Losses
 # -----------------------------------------------------------------------------
-# The loss system is the standard BS-RoFormer training loss from
-# ZFTurbo/Music-Source-Separation-Training (models/bs_roformer/bs_roformer.py):
-# a plain L1 loss on the reconstructed waveform plus a multi-resolution STFT
-# L1 loss over window sizes (4096, 2048, 1024, 512, 256) with hop 147 and a
-# resolution-loss weight of 1.0.  No masking, silence, SDR, or leakage terms.
 
 
-class BSRoFormerLoss(nn.Module):
-    """ZFTurbo MSS BS-RoFormer loss: L1 waveform + multi-resolution STFT L1."""
-
+class MultiResolutionSTFTLoss(nn.Module):
     def __init__(
         self,
-        model_config: ModelConfig,
-        multi_stft_resolution_loss_weight: float = 1.0,
-        multi_stft_resolutions_window_sizes: Sequence[int] = (
-            4096, 2048, 1024, 512, 256,
+        resolutions: Sequence[tuple[int, int, int]] = (
+            (2048, 147, 2048),
+            (1024, 147, 1024),
+            (512, 147, 512),
+            (256, 147, 256),
         ),
-        multi_stft_hop_size: int = 147,
+        activity_threshold: float = 1e-4,
     ):
         super().__init__()
-        self.model_config = model_config
-        self.multi_stft_resolution_loss_weight = multi_stft_resolution_loss_weight
-        self.multi_stft_resolutions_window_sizes = tuple(
-            multi_stft_resolutions_window_sizes
+        self.resolutions = tuple(resolutions)
+        self.activity_threshold = activity_threshold
+        for index, (_, _, win_length) in enumerate(self.resolutions):
+            self.register_buffer(
+                f"window_{index}",
+                torch.hann_window(win_length),
+                persistent=False,
+            )
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_flat = prediction.reshape(-1, prediction.shape[-1]).float()
+        target_flat = target.reshape(-1, target.shape[-1]).float()
+        active_targets = (
+            target_flat.square().mean(dim=1).sqrt() >= self.activity_threshold
         )
-        self.multi_stft_hop_size = multi_stft_hop_size
+        total = pred_flat.new_tensor(0.0)
+
+        for index, (n_fft, hop_length, win_length) in enumerate(self.resolutions):
+            window = getattr(self, f"window_{index}")
+            pred_spec = torch.stft(
+                pred_flat,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                center=True,
+                return_complex=True,
+            )
+            target_spec = torch.stft(
+                target_flat,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                center=True,
+                return_complex=True,
+            )
+            pred_mag = pred_spec.abs()
+            target_mag = target_spec.abs()
+
+            diff_norm = torch.linalg.vector_norm(
+                (pred_mag - target_mag).flatten(1), dim=1
+            )
+            target_norm = torch.linalg.vector_norm(target_mag.flatten(1), dim=1)
+            # Spectral convergence is a relative error and is undefined for a
+            # silent target. Dividing leakage by a tiny epsilon made silent stem
+            # channels produce losses in the hundreds of millions. The absolute
+            # log-magnitude and complex terms below still train those channels
+            # toward silence.
+            active_diff_norm = diff_norm[active_targets]
+            active_target_norm = target_norm[active_targets]
+            spectral_convergence = (
+                active_diff_norm / active_target_norm.clamp_min(1e-6)
+            ).sum() / active_targets.count_nonzero().clamp_min(1)
+
+            log_magnitude = F.l1_loss(
+                torch.log1p(pred_mag),
+                torch.log1p(target_mag),
+            )
+            complex_normalizer = target_mag.mean().detach().clamp_min(1e-4)
+            complex_loss = (pred_spec - target_spec).abs().mean() / complex_normalizer
+            total = total + spectral_convergence + log_magnitude + 0.25 * complex_loss
+
+        return total / len(self.resolutions)
+
+
+def normalized_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Relative L1 without letting fully silent stems dominate the batch.
+
+    A fixed 1e-4 denominator makes a deliberately zeroed vocal target hundreds of
+    times more important than an ordinary active source.  That creates a strong
+    collapse incentive for a foreground/residual separator: predicting no vocals
+    anywhere cheaply solves those rare examples.  Floor each source denominator
+    at 5% of the strongest target level in the same example instead.  Active
+    sources keep their normal relative scaling while silent sources remain
+    supervised, just not catastrophically overweighted.
+    """
+    error = (prediction - target).abs().mean(dim=-1)
+    scale = target.abs().mean(dim=-1)
+    if scale.ndim > 1:
+        reduce_dims = tuple(range(1, scale.ndim))
+        reference = scale.amax(dim=reduce_dims, keepdim=True)
+    else:
+        reference = scale
+    scale_floor = (0.05 * reference).clamp_min(1e-4)
+    return (error / torch.maximum(scale, scale_floor)).mean()
+
+
+def scale_dependent_sdr_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    error_power = (prediction - target).square().mean(dim=(-2, -1))
+    target_power = target.square().mean(dim=(-2, -1))
+    valid = target_power > 1e-7
+    ratio_db = 10.0 * torch.log10(
+        (target_power + 1e-8) / (error_power + 1e-8)
+    )
+    ratio_db = ratio_db.clamp(-50.0, 50.0)
+    if valid.any():
+        return -ratio_db[valid].mean()
+    return prediction.new_tensor(0.0)
+
+
+def mid_side(audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mid = (audio[..., 0, :] + audio[..., 1, :]) * 0.5
+    side = (audio[..., 0, :] - audio[..., 1, :]) * 0.5
+    return mid, side
+
+
+def frame_mean_square(
+    audio: torch.Tensor,
+    win_length: int,
+    hop_length: int,
+) -> torch.Tensor:
+    """Frame-local mean-square envelope aligned to center=True STFT frames.
+
+    ``audio`` is [..., samples] and the result is [..., n_frames]; leading
+    dimensions are preserved so a batch of mixes is pooled independently (the
+    previous mean over dim -2 merged batch entries together).
+
+    Keeping this in the power domain avoids the singular derivative of sqrt(0),
+    which matters because silence augmentation intentionally creates exact zeros.
+    """
+    flat = audio.square().reshape(-1, audio.shape[-1]).unsqueeze(1)
+    pooled = F.avg_pool1d(
+        flat,
+        kernel_size=win_length,
+        stride=hop_length,
+        padding=win_length // 2,
+        count_include_pad=False,
+    )
+    return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
+
+
+class SeparationLoss(nn.Module):
+    def __init__(self, model_config: ModelConfig, loss_config: LossConfig):
+        super().__init__()
+        self.model_config = model_config
+        self.loss_config = loss_config
+        self.mrstft = MultiResolutionSTFTLoss()
+        self.activity_threshold = 1e-4
         self.register_buffer(
             "window", torch.hann_window(model_config.win_length), persistent=False
         )
-        for index, window_size in enumerate(self.multi_stft_resolutions_window_sizes):
-            self.register_buffer(
-                f"multi_stft_window_{index}",
-                torch.hann_window(window_size),
-                persistent=False,
-            )
 
     def forward(
         self,
@@ -1133,45 +1047,173 @@ class BSRoFormerLoss(nn.Module):
             win_length=self.model_config.win_length,
             window=self.window,
         )
-
-        # Plain L1 on the separated waveform vs the target stem waveforms.
-        l1_loss = F.l1_loss(pred_audio, target_audio)
-
-        # Multi-resolution STFT L1 on the complex spectra.
-        multi_stft_resolution_loss = pred_audio.new_tensor(0.0)
-        for index, window_size in enumerate(self.multi_stft_resolutions_window_sizes):
-            # As in the reference repo: n_fft is at least the model FFT size,
-            # so small windows are zero-padded up to it.
-            res_stft_kwargs = dict(
-                n_fft=max(window_size, self.model_config.n_fft),
-                win_length=window_size,
-                hop_length=self.multi_stft_hop_size,
-                window=getattr(self, f"multi_stft_window_{index}"),
-                center=True,
-                return_complex=True,
-            )
-            pred_spec = torch.stft(
-                pred_audio.reshape(-1, pred_audio.shape[-1]),
-                **res_stft_kwargs,
-            )
-            target_spec = torch.stft(
-                target_audio.reshape(-1, target_audio.shape[-1]),
-                **res_stft_kwargs,
-            )
-            multi_stft_resolution_loss = multi_stft_resolution_loss + F.l1_loss(
-                pred_spec, target_spec
-            )
-
-        total = (
-            l1_loss
-            + multi_stft_resolution_loss * self.multi_stft_resolution_loss_weight
+        target_specs = make_stft(
+            target_audio,
+            n_fft=self.model_config.n_fft,
+            hop_length=self.model_config.hop_length,
+            win_length=self.model_config.win_length,
+            window=self.window,
         )
+
+        wave_loss = normalized_l1(pred_audio, target_audio)
+        mrstft_loss = self.mrstft(pred_audio, target_audio)
+
+        target_mag = target_specs.abs()
+        spec_normalizer = target_mag.mean().detach().clamp_min(1e-4)
+        main_complex = (estimates - target_specs).abs().mean() / spec_normalizer
+        main_logmag = F.l1_loss(torch.log1p(estimates.abs()), torch.log1p(target_mag))
+        main_stft_loss = main_complex + main_logmag
+
+        mix_power = mixture_spec.abs().square()
+        ideal_masks = (
+            target_specs * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
+        )
+        ideal_mag = ideal_masks.abs().clamp_max(8.0)
+        ideal_masks = torch.polar(ideal_mag, torch.angle(ideal_masks))
+        tf_weight = mixture_spec.abs()
+        tf_weight = tf_weight / tf_weight.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-4)
+        tf_weight = tf_weight.clamp(max=5.0)
+        effective_masks = (
+            estimates * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
+        )
+        mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
+
+        # True log-domain supervision on vocal-occupied bins only.  log1p() is
+        # nearly linear near zero, so quiet vocal content (reverb tails,
+        # reversed pre-echoes, airy highs) is nearly weightless in the other
+        # spectral terms; a real dB-domain error weights those bins by their
+        # audible level.  The bin gate keeps this from forcing vocal energy
+        # into bins the target leaves silent.
+        est_vocal_mag = estimates[:, 0].abs()
+        target_vocal_mag = target_specs[:, 0].abs()
+        vocal_bins = target_vocal_mag > self.activity_threshold
+        if vocal_bins.any():
+            log_db_error = 20.0 * (
+                torch.log10(est_vocal_mag.clamp_min(1e-7))
+                - torch.log10(target_vocal_mag.clamp_min(1e-7))
+            ).abs()
+            log_db_loss = log_db_error[vocal_bins].clamp_max(60.0).mean()
+        else:
+            log_db_loss = pred_audio.new_tensor(0.0)
+
+        # Temporal stability of the vocal mask: a sustained note should not
+        # flicker between voiced and unvoiced or dip under the accompaniment.
+        vocal_mask_mag = masks[:, 0].abs()
+        mask_tv = (vocal_mask_mag[..., 1:] - vocal_mask_mag[..., :-1]).abs().mean()
+
+        # Vocal leakage guard.  The relative and log-domain losses barely
+        # penalize a slightly-open vocal mask in bins the instrumental
+        # dominates (the error is a small fraction of a large level), so a
+        # separator trained on broadband-augmented vocal targets learns to
+        # reproduce the mixture's high band -- cymbals, hats, air -- as a
+        # static shimmer riding the voice, and it gets worse as training fits
+        # those targets better.  Penalize the squared vocal mask directly in
+        # instrumental-dominated bins (target vocal at least 12 dB below the
+        # mixture, mixture actually present).  In pure-leak bins the ideal is
+        # zero; where the voice is genuinely singing at low level the main
+        # losses pull the mask back up, so the net effect is clean highs
+        # instead of a static version of the instrumental.
+        mixture_mag = mixture_spec.abs().clamp_min(1e-6)
+        leak_bins = (target_vocal_mag < 0.25 * mixture_mag) & (mixture_mag > 0.1)
+        # Penalize only the vocal mask ABOVE the per-bin ideal (the leakage
+        # spikes): where the voice is genuinely present the ideal mask is v/mix
+        # and reconstruction is never penalized, while any estimate beyond it
+        # is instrumental content riding the voice.  The log-RMS form (same
+        # shape as the silence loss) keeps a strong gradient for masks far
+        # above the floor and a finite gradient at zero, so the
+        # mean-over-millions-of-bins dilution that made the old square form
+        # inert no longer applies.
+        eff_mask = est_vocal_mag / mixture_mag
+        ideal_mask = target_vocal_mag / mixture_mag
+        excess_mask = (eff_mask - ideal_mask).clamp_min(0)
+        leak_floor = 0.02 ** 2  # mask 2% => leakage ~34 dB below the mixture
+        if leak_bins.any():
+            leakage_loss = 0.5 * torch.log1p(
+                excess_mask[leak_bins].square() / leak_floor
+            ).mean()
+        else:
+            leakage_loss = pred_audio.new_tensor(0.0)
+
+        sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
+        pred_mid, pred_side = mid_side(pred_audio)
+        true_mid, true_side = mid_side(target_audio)
+        midside_loss = 0.5 * (
+            normalized_l1(pred_mid, true_mid) + normalized_l1(pred_side, true_side)
+        )
+
+        # Any-channel frame power of the vocal stem: a widely panned or
+        # side-only vocal must still count as active; a single channel would
+        # misread it as silence.
+        target_vocal_power = frame_mean_square(
+            target_audio[:, 0].square().amax(dim=1),
+            self.model_config.win_length,
+            self.model_config.hop_length,
+        )
+        pred_vocal_power = frame_mean_square(
+            pred_audio[:, 0].square().amax(dim=1),
+            self.model_config.win_length,
+            self.model_config.hop_length,
+        )
+        frames = min(target_vocal_power.shape[-1], pred_vocal_power.shape[-1])
+        target_vocal_power = target_vocal_power[..., :frames]
+        pred_vocal_power = pred_vocal_power[..., :frames]
+
+        silence_power = self.activity_threshold**2
+        silent = target_vocal_power < silence_power
+        if silent.any():
+            # Equivalent to a log-RMS penalty at large leakage levels, but unlike
+            # sqrt(power) it has a finite, zero gradient at perfect digital silence.
+            silence_loss = 0.5 * torch.log1p(
+                pred_vocal_power[silent] / silence_power
+            ).mean()
+        else:
+            silence_loss = pred_audio.new_tensor(0.0)
+
+        cfg = self.loss_config
+        total = (
+            cfg.waveform_weight * wave_loss
+            + cfg.main_stft_weight * main_stft_loss
+            + cfg.mrstft_weight * mrstft_loss
+            + cfg.mask_weight * mask_loss
+            + cfg.sdr_weight * sdr_loss
+            + cfg.midside_weight * midside_loss
+            + cfg.silence_weight * silence_loss
+            + cfg.log_db_weight * log_db_loss
+            + cfg.mask_tv_weight * mask_tv
+            + cfg.leakage_weight * leakage_loss
+        )
+        with torch.no_grad():
+            pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
+            true_vocal_rms = target_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
+            active_segments = true_vocal_rms >= self.activity_threshold
+            if active_segments.any():
+                vocal_level_db = (
+                    20.0
+                    * torch.log10(
+                        (pred_vocal_rms[active_segments] + 1e-8)
+                        / (true_vocal_rms[active_segments] + 1e-8)
+                    )
+                ).mean()
+            else:
+                vocal_level_db = pred_audio.new_tensor(0.0)
+            vocal_mask_mag = masks[:, 0].abs().mean()
+
         metrics = {
-            "l1": l1_loss.detach(),
-            "multi_stft": multi_stft_resolution_loss.detach(),
-            "total": total.detach(),
+            "wave": wave_loss.detach(),
+            "main_stft": main_stft_loss.detach(),
+            "mrstft": mrstft_loss.detach(),
+            "mask": mask_loss.detach(),
+            "sdr_loss": sdr_loss.detach(),
+            "midside": midside_loss.detach(),
+            "silence": silence_loss.detach(),
+            "vocal_level_db": vocal_level_db.detach(),
+            "vocal_mask_mag": vocal_mask_mag.detach(),
+            "log_db": log_db_loss.detach(),
+            "mask_tv": mask_tv.detach(),
+            "leakage": leakage_loss.detach(),
         }
         return total, metrics
+
 
 # -----------------------------------------------------------------------------
 # Dataset and augmentation
@@ -2560,7 +2602,7 @@ def train(
     model: BSRoFormerSeparator,
     dataloader: DataLoader,
     optimizer: Prodigy,
-    loss_module: BSRoFormerLoss,
+    loss_module: SeparationLoss,
     device: torch.device,
     args: argparse.Namespace,
     checkpoint_path: str | None,
@@ -2779,15 +2821,29 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            l1_value, multi_stft_value = torch.stack(
+            wave, main_stft, mrstft, silence, vocal_db, mask_mag, log_db, mask_tv, leakage = torch.stack(
                 (
-                    latest_metrics["l1"],
-                    latest_metrics["multi_stft"],
+                    latest_metrics["wave"],
+                    latest_metrics["main_stft"],
+                    latest_metrics["mrstft"],
+                    latest_metrics["silence"],
+                    latest_metrics["vocal_level_db"],
+                    latest_metrics["vocal_mask_mag"],
+                    latest_metrics["log_db"],
+                    latest_metrics["mask_tv"],
+                    latest_metrics["leakage"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
-                l1=f"{l1_value:.3f}",
-                mstft=f"{multi_stft_value:.3f}",
+                wave=f"{wave:.3f}",
+                stft=f"{main_stft:.3f}",
+                mr=f"{mrstft:.3f}",
+                sil=f"{silence:.3f}",
+                vdb=f"{vocal_db:+.1f}",
+                vmask=f"{mask_mag:.3f}",
+                logdb=f"{log_db:.2f}dB",
+                mtv=f"{mask_tv:.3f}",
+                leak=f"{leakage:.4f}",
                 refresh=False,
             )
         progress.update(1)
@@ -2900,9 +2956,6 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         depth=args.depth,
         heads=args.heads,
         dropout=args.dropout,
-        subnet_dim=args.subnet_dim,
-        subnet_depth=args.subnet_depth,
-        subnet_patch=args.subnet_patch,
         use_checkpoint=args.ckpt,
     )
 
@@ -2960,10 +3013,8 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "124-band BS-RoFormer with APBS dual ConvNeXt subnets "
-            "(attenuating phase bias), QK-norm gated RoPE axial attention, "
-            "foreground-residual separation, trained with the standard "
-            "BS-RoFormer L1 + multi-resolution STFT loss"
+            "124-band regular BS-RoFormer with axial attention, "
+            "foreground-residual separation, and silence-focused training"
         )
     )
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -2997,11 +3048,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--model_dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--depth", type=int, default=14)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--subnet_dim", type=int, default=192)
-    parser.add_argument("--subnet_depth", type=int, default=3)
-    parser.add_argument("--subnet_patch", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
@@ -3153,7 +3201,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             slice_p=args.slice_p,
         )
-        loss_module = BSRoFormerLoss(config)
+        loss_module = SeparationLoss(config, LossConfig())
         train(
             model,
             dataloader,
