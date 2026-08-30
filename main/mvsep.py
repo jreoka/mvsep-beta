@@ -1735,6 +1735,134 @@ def apply_vocal_doubling(vocal: torch.Tensor, sample_rate: int) -> torch.Tensor:
     return vocal + gain * _delay(copy, d)
 
 
+# -----------------------------------------------------------------------------
+# Lightweight zero-FFT augmentations (all O(n) vectorized, ~0.2-0.5 ms / 8s)
+# -----------------------------------------------------------------------------
+
+def apply_cheap_lowpass(audio: torch.Tensor) -> torch.Tensor:
+    """3-7 tap box low-pass (moving average) via reflect padding.
+
+    Cheap stand-in for a muffled mic / dull tape. No FFT, one avg_pool1d.
+    """
+    k = random.choice([3, 5, 7])
+    # avg_pool1d is highly optimized; reflect pad avoids edge clicks.
+    padded = F.pad(audio.unsqueeze(0), (k // 2, k // 2), mode="reflect").squeeze(0)
+    # F.avg_pool1d expects [N,C,L]; treat channels as batch
+    filtered = F.avg_pool1d(padded.unsqueeze(0), kernel_size=k, stride=1).squeeze(0)
+    # blend so it reads as tone, not total loss of air
+    mix = random.uniform(0.5, 1.0)
+    return mix * filtered + (1.0 - mix) * audio
+
+
+def apply_cheap_highpass(audio: torch.Tensor) -> torch.Tensor:
+    """Thin high-pass: original minus 3-tap moving average.
+
+    Simulates cheap laptop mic / aggressive low-cut. Zero FFT.
+    """
+    low = F.avg_pool1d(
+        F.pad(audio.unsqueeze(0), (1, 1), mode="reflect").squeeze(0).unsqueeze(0),
+        kernel_size=3, stride=1,
+    ).squeeze(0)
+    hp = audio - low
+    mix = random.uniform(0.4, 0.9)
+    return mix * hp + (1.0 - mix) * audio
+
+
+def apply_telephone_bandlimit(audio: torch.Tensor) -> torch.Tensor:
+    """Narrow telephone band: high-pass + low-pass via two box filters."""
+    # high-pass first, then dull the top - both via avg_pool, still no FFT
+    hp = audio - F.avg_pool1d(
+        F.pad(audio.unsqueeze(0), (2, 2), mode="reflect").squeeze(0).unsqueeze(0),
+        kernel_size=5, stride=1,
+    ).squeeze(0)
+    lp = F.avg_pool1d(F.pad(hp.unsqueeze(0), (2, 2), mode="reflect").squeeze(0).unsqueeze(0), kernel_size=5, stride=1).squeeze(0)
+    mix = random.uniform(0.6, 1.0)
+    return mix * lp + (1.0 - mix) * audio
+
+
+def apply_bitcrush(audio: torch.Tensor) -> torch.Tensor:
+    """Uniform quantization noise: 10-14 bit crush. One round(), no FFT."""
+    bits = random.randint(10, 14)
+    scale = float(1 << bits)
+    # peak-normalized so step size is relative, not absolute
+    peak = audio.abs().amax().clamp_min(1e-4)
+    norm = audio / peak
+    crushed = torch.round(norm * scale) / scale
+    return crushed * peak
+
+
+def apply_soft_clip(audio: torch.Tensor) -> torch.Tensor:
+    """Hard digital clipping at 0.5..0.95 (cheap limiter simulation)."""
+    gain = random.uniform(1.2, 2.2)
+    thresh = random.uniform(0.5, 0.95)
+    return torch.clamp(audio * gain, min=-thresh, max=thresh) / gain
+
+
+def apply_mono_fold(audio: torch.Tensor) -> torch.Tensor:
+    """Fold to mono: copy one channel to both (mono radio / phone)."""
+    idx = random.randint(0, 1)
+    mono = audio[idx : idx + 1].repeat(2, 1)
+    return mono
+
+
+def apply_micro_delay(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Per-channel micro delay +-12 ms via _delay (no FFT, just shift).
+
+    Simulates mic-bleed timing / small alignment drift.
+    """
+    out = audio.clone()
+    for ch in range(audio.shape[0]):
+        if random.random() < 0.7:
+            d = int(random.uniform(-12.0, 12.0) / 1000.0 * sample_rate)
+            if d == 0:
+                continue
+            if d > 0:
+                out[ch] = _delay(audio[ch : ch + 1], d).squeeze(0)
+            else:
+                # negative delay = advance (roll left then zero pad tail)
+                adv = -d
+                tmp = torch.zeros_like(audio[ch])
+                if adv < audio.shape[-1]:
+                    tmp[..., :-adv] = audio[ch, adv:]
+                out[ch] = tmp
+    return out
+
+
+def apply_static_pan(audio: torch.Tensor) -> torch.Tensor:
+    """Constant pan law gain: independent L/R scalar (one multiply)."""
+    g_l = random.uniform(0.7, 1.3)
+    g_r = random.uniform(0.7, 1.3)
+    out = audio.clone()
+    out[0] *= g_l
+    out[1] *= g_r
+    # keep loudness roughly constant
+    out *= (2.0 / (g_l + g_r))
+    return out
+
+
+def apply_fade_edges(audio: torch.Tensor) -> torch.Tensor:
+    """Short linear fade in/out 5-40 ms at a random edge."""
+    n = audio.shape[-1]
+    out = audio.clone()
+    if random.random() < 0.5:
+        fade_len = int(random.uniform(0.005, 0.040) * 44100)  # sample_rate agnostic enough
+        fade_len = min(fade_len, n // 4)
+        ramp = torch.linspace(0.0, 1.0, fade_len, device=audio.device)
+        out[:, :fade_len] *= ramp
+    else:
+        fade_len = int(random.uniform(0.005, 0.040) * 44100)
+        fade_len = min(fade_len, n // 4)
+        ramp = torch.linspace(1.0, 0.0, fade_len, device=audio.device)
+        out[:, -fade_len:] *= ramp
+    return out
+
+
+def apply_channel_gain_jitter(audio: torch.Tensor) -> torch.Tensor:
+    """Independent per-channel gain +-1.5 dB (cable / preamp trim)."""
+    g = torch.empty(2, 1, device=audio.device).uniform_(0.84, 1.19)  # +-1.5 dB
+    return audio * g
+
+
 class StemDataset(Dataset):
     def __init__(
         self,
@@ -1867,8 +1995,32 @@ class StemDataset(Dataset):
             targets[stem_index, 1] = mid - side
 
         # Whole-crop key/tempo variation, before any per-stem effects.
-        if random.random() < 0.2:
+        if random.random() < 0.20:
             targets = pitch_shift_crop(targets)
+
+        # --- Lightweight global color (all O(n), no FFT) ---
+        # These are intentionally low-probability and vectorized so 8 workers
+        # stay well under CPU budget. Each is a single multiply / shift / pool.
+        if random.random() < 0.08:
+            # independent L/R trim on whole mix (keeps sum-to-mixture)
+            g = torch.empty(targets.shape[0], 2, 1).uniform_(0.84, 1.19)
+            targets = targets * g
+        if random.random() < 0.06:
+            # whole-crop mono fold (mono compatibility)
+            c = random.randint(0, 1)
+            targets = targets[:, c : c + 1, :].repeat(1, 2, 1) if random.random() < 0.5 else targets
+        if random.random() < 0.08:
+            # whole-crop micro-alignment drift +-6 ms (same shift on all stems)
+            d = int(random.uniform(-6.0, 6.0) / 1000.0 * sample_rate)
+            if d != 0:
+                if d > 0:
+                    targets = torch.stack([_delay(t, d) for t in targets])
+                else:
+                    adv = -d
+                    tmp = torch.zeros_like(targets)
+                    if adv < targets.shape[-1]:
+                        tmp[..., :-adv] = targets[..., adv:]
+                    targets = tmp
 
         # Add occasional *local* vocal gaps, but never manufacture an entire
         # six-second no-vocal example.  Whole-segment erasure combined with
@@ -1913,24 +2065,44 @@ class StemDataset(Dataset):
         vocal = targets[0]
         if random.random() < 0.25:
             vocal = random_spectral_eq(vocal, sample_rate)
+        if random.random() < 0.09:
+            vocal = apply_cheap_lowpass(vocal)
+        if random.random() < 0.09:
+            vocal = apply_cheap_highpass(vocal)
+        if random.random() < 0.06:
+            vocal = apply_telephone_bandlimit(vocal)
         if random.random() < 0.25:
             vocal = apply_saturation(vocal)
-        if random.random() < 0.2:
+        if random.random() < 0.08:
+            vocal = apply_soft_clip(vocal)
+        if random.random() < 0.07:
+            vocal = apply_bitcrush(vocal)
+        if random.random() < 0.20:
             vocal = apply_chorus(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = apply_echo(vocal, sample_rate)
         if random.random() < 0.25:
             vocal = apply_reverb(vocal, sample_rate)
-        if random.random() < 0.25:
+        if random.random() < 0.20:
             vocal = apply_reverse_echo(vocal, sample_rate)
-        if random.random() < 0.2:
+        if random.random() < 0.20:
             vocal = apply_air_boost(vocal)
+        if random.random() < 0.10:
+            vocal = apply_micro_delay(vocal, sample_rate)
+        if random.random() < 0.10:
+            vocal = apply_static_pan(vocal)
+        if random.random() < 0.08:
+            vocal = apply_channel_gain_jitter(vocal)
+        if random.random() < 0.07:
+            vocal = apply_fade_edges(vocal)
         if random.random() < 0.15:
             vocal = apply_vocal_doubling(vocal, sample_rate)
         if random.random() < 0.15:
             vocal = apply_vocal_tremolo(vocal, sample_rate)
-        if random.random() < 0.25:
+        if random.random() < 0.22:
             vocal = add_sustained_vowel(vocal, sample_rate)
+        if random.random() < 0.06:
+            vocal = apply_mono_fold(vocal)
         targets[0] = vocal
 
         # --- Accompaniment signal chain ---
@@ -1941,17 +2113,35 @@ class StemDataset(Dataset):
         # to route it to the accompaniment instead of smearing it on the
         # vocal as static.
         other = targets[1]
-        if random.random() < 0.3:
+        if random.random() < 0.30:
             other = random_spectral_eq(other, sample_rate)
-        if random.random() < 0.2:
+        if random.random() < 0.10:
+            other = apply_cheap_lowpass(other)
+        if random.random() < 0.10:
+            other = apply_cheap_highpass(other)
+        if random.random() < 0.07:
+            other = apply_telephone_bandlimit(other)
+        if random.random() < 0.20:
             other = apply_saturation(other)
+        if random.random() < 0.09:
+            other = apply_soft_clip(other)
+        if random.random() < 0.07:
+            other = apply_bitcrush(other)
+        if random.random() < 0.10:
+            other = apply_micro_delay(other, sample_rate)
+        if random.random() < 0.12:
+            other = apply_channel_gain_jitter(other)
+        if random.random() < 0.07:
+            other = apply_fade_edges(other)
         if random.random() < 0.25:
             other = apply_reverb(other, sample_rate)
         if random.random() < 0.15:
             other = apply_pan_sweep(other)
-        if random.random() < 0.3:
+        if random.random() < 0.12:
+            other = apply_static_pan(other)
+        if random.random() < 0.30:
             other = add_synth_lead(other, vocal, sample_rate)
-        if random.random() < 0.2:
+        if random.random() < 0.20:
             other = add_noise_floor(other, sample_rate)
         targets[1] = other
 
