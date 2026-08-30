@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import math
 import os
 import random
@@ -1579,7 +1580,10 @@ def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
         buffer = buffer / buffer.square().mean().sqrt().clamp_min(1e-8)
         _PINK_NOISE_CACHE[key] = buffer
     offset = random.randint(0, max(0, buffer.shape[-1] - length))
-    return buffer[offset : offset + length]
+    # Clone the slice so the returned tensor does not hold a view reference
+    # to the large cached buffer. Without clone, DataLoader's pickle of the
+    # batch would keep the entire 1.4M buffer alive per item and leak CPU RAM.
+    return buffer[offset : offset + length].clone()
 
 
 def add_noise_floor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
@@ -2116,12 +2120,16 @@ def find_latest_compatible_checkpoint(
         except Exception as error:
             print(f"Ignoring unreadable checkpoint {path}: {error}")
             continue
-        if (
-            checkpoint_data.get("checkpoint_format_version", 0)
-            >= CHECKPOINT_FORMAT_VERSION
-            and model_configs_compatible(checkpoint_data.get("model_config"), config)
-        ):
-            return str(path)
+        try:
+            if (
+                checkpoint_data.get("checkpoint_format_version", 0)
+                >= CHECKPOINT_FORMAT_VERSION
+                and model_configs_compatible(checkpoint_data.get("model_config"), config)
+            ):
+                return str(path)
+        finally:
+            del checkpoint_data
+            gc.collect()
     return None
 
 
@@ -2148,19 +2156,23 @@ def find_best_checkpoint(
             except Exception as error:
                 print(f"Ignoring unreadable best checkpoint {path}: {error}")
                 continue
-            if config is not None and (
-                checkpoint_data.get("checkpoint_format_version", 0)
-                < CHECKPOINT_FORMAT_VERSION
-                or not model_configs_compatible(
-                    checkpoint_data.get("model_config"), config
-                )
-            ):
-                continue
-            if (
-                validation_metric is not None
-                and checkpoint_data.get("validation_metric") != validation_metric
-            ):
-                continue
+            try:
+                if config is not None and (
+                    checkpoint_data.get("checkpoint_format_version", 0)
+                    < CHECKPOINT_FORMAT_VERSION
+                    or not model_configs_compatible(
+                        checkpoint_data.get("model_config"), config
+                    )
+                ):
+                    continue
+                if (
+                    validation_metric is not None
+                    and checkpoint_data.get("validation_metric") != validation_metric
+                ):
+                    continue
+            finally:
+                del checkpoint_data
+                gc.collect()
         scored.append((score, path))
     return str(max(scored, key=lambda item: item[0])[1]) if scored else None
 
@@ -2211,14 +2223,18 @@ def prune_old_checkpoints(
                 )
             except Exception:
                 continue
-            if (
-                checkpoint_data.get("checkpoint_format_version", 0)
-                < CHECKPOINT_FORMAT_VERSION
-                or not model_configs_compatible(
-                    checkpoint_data.get("model_config"), config
-                )
-            ):
-                continue
+            try:
+                if (
+                    checkpoint_data.get("checkpoint_format_version", 0)
+                    < CHECKPOINT_FORMAT_VERSION
+                    or not model_configs_compatible(
+                        checkpoint_data.get("model_config"), config
+                    )
+                ):
+                    continue
+            finally:
+                del checkpoint_data
+                gc.collect()
         paths.append(path)
     paths.sort(key=lambda path: path.stat().st_mtime)
     for path in paths[:-keep]:
@@ -2584,6 +2600,14 @@ def train(
 
         if "scaler_state_dict" in checkpoint_data:
             scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
+        # Free the large checkpoint dict (model+ema+optimizer ~1GB on CPU)
+        # to avoid overnight RSS growth. Without this the dict stays alive
+        # for the entire training run.
+        del checkpoint_data
+        checkpoint_data = None
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         best_checkpoint = find_best_checkpoint(
             "best_ckpts",
             model.config,
@@ -2649,6 +2673,16 @@ def train(
             try:
                 mixture_audio, target_audio = next(data_iterator)
             except StopIteration:
+                # Properly discard the exhausted iterator so its prefetch
+                # queue + pin_memory buffers are freed. Overwriting without
+                # del caused the old queue to stay alive and leak CPU RAM.
+                try:
+                    if hasattr(data_iterator, "_shutdown_workers"):
+                        data_iterator._shutdown_workers()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                del data_iterator
+                gc.collect()
                 data_iterator = iter(dataloader)
                 mixture_audio, target_audio = next(data_iterator)
 
@@ -2805,9 +2839,28 @@ def train(
                 print(f"New best checkpoint: {best_path}\n")
             elif combined_sdr is not None:
                 print(f"Best combined SDR remains {best_sdr:.4f} dB.\n")
+            # Validation loads full tracks + checkpoints on CPU; ensure
+            # memory is returned to OS instead of accumulating overnight.
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     progress.close()
     signal.signal(signal.SIGINT, previous_sigint_handler)
+    # Ensure DataLoader workers + pin_memory thread are terminated and
+    # not counted as leaked RAM in Task Manager.
+    try:
+        if "data_iterator" in locals() and hasattr(data_iterator, "_shutdown_workers"):
+            data_iterator._shutdown_workers()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        del data_iterator
+    except Exception:
+        pass
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     if step > 0:
         stopped_path = f"ckpts/checkpoint_step_{step}.pt"
         save_checkpoint(
@@ -2851,17 +2904,21 @@ def inspect_checkpoint_config(
     fallback: ModelConfig,
 ) -> ModelConfig:
     checkpoint_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    saved_stems = tuple(checkpoint_data.get("stems", STEMS))
-    if saved_stems != STEMS:
-        raise ValueError(
-            f"Checkpoint stems {saved_stems} do not match this script's STEMS {STEMS}."
-        )
-    config_data = checkpoint_data.get("model_config")
-    if not config_data:
-        return fallback
-    valid_fields = ModelConfig.__dataclass_fields__.keys()
-    filtered = {key: value for key, value in config_data.items() if key in valid_fields}
-    return ModelConfig(**filtered)
+    try:
+        saved_stems = tuple(checkpoint_data.get("stems", STEMS))
+        if saved_stems != STEMS:
+            raise ValueError(
+                f"Checkpoint stems {saved_stems} do not match this script's STEMS {STEMS}."
+            )
+        config_data = checkpoint_data.get("model_config")
+        if not config_data:
+            return fallback
+        valid_fields = ModelConfig.__dataclass_fields__.keys()
+        filtered = {key: value for key, value in config_data.items() if key in valid_fields}
+        return ModelConfig(**filtered)
+    finally:
+        del checkpoint_data
+        gc.collect()
 
 
 def load_inference_weights(
@@ -2869,18 +2926,22 @@ def load_inference_weights(
     checkpoint_path: str,
 ) -> None:
     checkpoint_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state = checkpoint_data.get("ema_state_dict") or checkpoint_data.get("model_state_dict")
-    if state is None:
-        state = checkpoint_data
-    report = load_matching_state_dict(model, state)
-    if not report.is_exact:
-        raise RuntimeError(
-            "Checkpoint architecture mismatch: "
-            f"loaded {report.matched}/{report.expected} required tensors; "
-            f"{len(report.skipped)} incoming tensors were incompatible and "
-            f"{len(report.missing)} required tensors were missing."
-        )
-    print(f"Loaded EMA/model weights from {checkpoint_path}.")
+    try:
+        state = checkpoint_data.get("ema_state_dict") or checkpoint_data.get("model_state_dict")
+        if state is None:
+            state = checkpoint_data
+        report = load_matching_state_dict(model, state)
+        if not report.is_exact:
+            raise RuntimeError(
+                "Checkpoint architecture mismatch: "
+                f"loaded {report.matched}/{report.expected} required tensors; "
+                f"{len(report.skipped)} incoming tensors were incompatible and "
+                f"{len(report.missing)} required tensors were missing."
+            )
+        print(f"Loaded EMA/model weights from {checkpoint_path}.")
+    finally:
+        del checkpoint_data
+        gc.collect()
 
 
 def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
@@ -3071,13 +3132,22 @@ def main() -> None:
         )
         generator = torch.Generator()
         generator.manual_seed(args.seed)
+        # pin_memory + persistent_workers on Windows (spawn) is the #1
+        # cause of overnight CPU RAM leaks: the pin_memory thread caches
+        # cudaHostAlloc blocks forever and persistent workers keep their
+        # prefetch queues alive even after the iterator is overwritten.
+        # Disable both for stable long runs. Re-enable only if you
+        # explicitly need the ~5% speedup and can monitor RAM.
+        use_pin_memory = False
+        use_persistent = False
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            pin_memory=device.type == "cuda",
-            persistent_workers=args.num_workers > 0,
+            pin_memory=use_pin_memory,
+            persistent_workers=use_persistent,
+            prefetch_factor=2 if args.num_workers > 0 else None,
             worker_init_fn=seed_worker,
             generator=generator,
             drop_last=True,
