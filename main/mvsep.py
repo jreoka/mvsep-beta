@@ -113,6 +113,16 @@ def seed_worker(worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
+def training_worker_init(worker_id: int) -> None:
+    seed_worker(worker_id)
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    dataset = info.dataset
+    if hasattr(dataset, "segment_samples") and hasattr(dataset, "sample_rate"):
+        _pink_noise(dataset.segment_samples, dataset.sample_rate)
+
+
 def clean_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     cleaned: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -1554,20 +1564,25 @@ def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
     return filtered * (rms / filtered_rms)
 
 
-_PINK_NOISE_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_PINK_NOISE_CACHE: dict[int, torch.Tensor] = {}
 
 
 def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
-    """Per-worker cached pink-noise buffer, sliced randomly per call.
+    """Bounded per-sample-rate pink-noise buffer.
 
-    The expensive part (spectrum construction + one inverse FFT) runs once per
-    worker process; every augmentation step is then a cheap random slice.
-    Workers keep separate buffers, so they never share identical noise.
+    The previous implementation keyed the cache by (length, sample_rate).
+    make_sustained_vowel() passes a random duration, so every new duration
+    inserted a new multi-MB buffer into each DataLoader worker.
+
+    This version keeps only one buffer per sample rate and slices random
+    windows from it.
     """
-    key = (length, sample_rate)
-    buffer = _PINK_NOISE_CACHE.get(key)
-    if buffer is None:
-        total = max(2 ** 20, 4 * length)
+    if length <= 0:
+        return torch.zeros(0)
+    needed = max(2 ** 20, 4 * length)
+    buffer = _PINK_NOISE_CACHE.get(sample_rate)
+    if buffer is None or buffer.numel() < needed:
+        total = needed
         freqs = torch.fft.rfftfreq(total, 1.0 / sample_rate).clamp_min(1.0)
         amp = 1.0 / freqs.sqrt()
         spec = torch.complex(
@@ -1578,11 +1593,10 @@ def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
         spec[0] = 0.0
         buffer = torch.fft.irfft(spec, total)
         buffer = buffer / buffer.square().mean().sqrt().clamp_min(1e-8)
-        _PINK_NOISE_CACHE[key] = buffer
-    offset = random.randint(0, max(0, buffer.shape[-1] - length))
-    # Clone the slice so the returned tensor does not hold a view reference
-    # to the large cached buffer. Without clone, DataLoader's pickle of the
-    # batch would keep the entire 1.4M buffer alive per item and leak CPU RAM.
+        _PINK_NOISE_CACHE.clear()
+        _PINK_NOISE_CACHE[sample_rate] = buffer
+    offset = random.randint(0, buffer.shape[-1] - length)
+    # Clone so returned tensors do not keep views into the cached buffer.
     return buffer[offset : offset + length].clone()
 
 
@@ -3338,7 +3352,7 @@ def main() -> None:
             pin_memory=use_pin_memory,
             persistent_workers=use_persistent,
             prefetch_factor=2 if args.num_workers > 0 else None,
-            worker_init_fn=seed_worker,
+            worker_init_fn=training_worker_init,
             generator=generator,
             drop_last=True,
         )
