@@ -26,8 +26,20 @@ from tqdm import tqdm
 
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
-VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 8
+
+# Checkpoint selection is fixed: blend the multi-resolution spectral score
+# with SDR and always pick the best checkpoint on that blend.
+BLEND_VALIDATION_METRIC = "full_stem_blend_v1"
+# Best-checkpoint filename label for the fixed selection metric.
+BEST_CHECKPOINT_METRIC_LABEL = "blend"
+# Fixed recipe for that blend: the spectral term dominates because it is the
+# one that can see a stem is full.  SDR rides along at a lower weight purely
+# as a guard against a model that invents content wholesale instead of
+# completing what the mixture implies.
+VAL_SDR_WEIGHT = 0.4
+VAL_MSR_WEIGHT = 1.0
+
+CHECKPOINT_FORMAT_VERSION = 9
 
 
 # -----------------------------------------------------------------------------
@@ -49,7 +61,7 @@ class ModelConfig:
     heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
-    architecture: str = "bs124_roformer_axial_v6_direct_mask"
+    architecture: str = "bs124_roformer_axial_v7_full_stems"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -76,22 +88,44 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture != "bs124_roformer_axial_v6_direct_mask":
+        if self.architecture != "bs124_roformer_axial_v7_full_stems":
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_roformer_axial_v6_direct_mask."
+                "bs124_roformer_axial_v7_full_stems."
             )
 
 
 @dataclass
 class LossConfig:
-    waveform_weight: float = 1.0
+    waveform_weight: float = 0.6
     main_stft_weight: float = 0.65
     mrstft_weight: float = 0.9
-    mask_weight: float = 0.15
-    sdr_weight: float = 0.30
+    # Asymmetric completion in shared TF bins: a hole costs 1.0, an equal
+    # amount of surplus energy costs ``over_penalty``.
+    fullness_weight: float = 0.8
+    # Keeps the synthesized residual honest outside the crossover regions.
+    synthesis_weight: float = 0.05
+    # Soft anchor only.  The stems are free to overlap, so their sum is not
+    # forced back onto the mixture; this just keeps the total from drifting.
+    mixture_weight: float = 0.10
     midside_weight: float = 0.05
+    # Fraction of the strict reconstruction error forgiven in a TF bin where
+    # both stems carry equal energy.  A mask cannot resolve those bins, so
+    # punishing the model's guess there only teaches it to guess the average.
+    overlap_relief: float = 0.6
+    # Completion margins as fractions of the target magnitude: fill up to
+    # 0.85 of the target before a hole is penalized at all, then allow +40%
+    # of headroom before surplus energy costs anything.
+    under_slack: float = 0.85
+    over_slack: float = 1.4
+    over_penalty: float = 0.2
+    # Cap on a single bin's normalized deviation.  Two dense stems collide
+    # bin by bin even when the region is shared, so without a cap one Rayleigh
+    # dip in the target -- a bin the model is *supposed* to fill -- would cost
+    # more than the rest of the spectrum combined and quietly reinstate the
+    # thin, dip-tracking behaviour this loss exists to remove.
+    deviation_cap: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -107,20 +141,19 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def seed_worker(worker_id: int) -> None:
+def seed_worker() -> None:
     worker_seed = torch.initial_seed() % (2**32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
 
 
-def training_worker_init(worker_id: int) -> None:
-    seed_worker(worker_id)
-    info = torch.utils.data.get_worker_info()
-    if info is None:
-        return
-    dataset = info.dataset
-    if hasattr(dataset, "segment_samples") and hasattr(dataset, "sample_rate"):
-        _pink_noise(dataset.segment_samples, dataset.sample_rate)
+def training_worker_init(_worker_id: int) -> None:
+    seed_worker()
+    # Pre-build the pink-noise buffer once per worker: it is the only
+    # augmentation with a large shared allocation, and building it per crop
+    # made every worker hold one buffer per random duration.
+    dataset = torch.utils.data.get_worker_info().dataset
+    _pink_noise(dataset.segment_samples, dataset.sample_rate)
 
 
 def clean_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -464,9 +497,7 @@ class DualPathEncoder(nn.Module):
         self.output_norm = nn.RMSNorm(config.dim)
         self.use_checkpoint = config.use_checkpoint
 
-    def compile_layers(self, mode: str = "default") -> None:
-        if mode != "default":
-            raise ValueError("compile_layers currently supports only the default mode.")
+    def compile_layers(self) -> None:
         for unit in (*self.time_layers, *self.freq_layers):
             unit.compile(
                 dynamic=True,
@@ -675,11 +706,29 @@ class BandSplit(nn.Module):
         )[None, None]
         return output + energy_tokens.to(dtype=output.dtype) + metadata_tokens
 
-    def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
-        return self.forward_real(torch.view_as_real(mixture_spec.to(torch.complex64)))
+
+def ri_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Complex product of two real/imaginary tensors shaped [..., 2]."""
+    left_real, left_imag = left.unbind(dim=-1)
+    right_real, right_imag = right.unbind(dim=-1)
+    real = left_real * right_real - left_imag * right_imag
+    imag = left_real * right_imag + left_imag * right_real
+    return torch.stack((real, imag), dim=-1)
 
 
-class BandMaskGroup(nn.Module):
+class BandSourceGroup(nn.Module):
+    """Decode band tokens into a complex mask plus a free complex residual.
+
+    ``mask * mixture`` can only re-weight energy the mixture already holds.
+    That is exactly why a pure mask sounds thin wherever the two stems
+    overlap: the phase there belongs to the sum, and the magnitude is a
+    shared compromise.  ``residual`` is synthesized from the token alone, so
+    the stem can be completed with energy the mixture never handed over.
+
+    Both stems are decoded independently.  There is no complement constraint,
+    so vocals and accompaniment may both be full in the same TF bin.
+    """
+
     def __init__(
         self,
         config: ModelConfig,
@@ -688,7 +737,7 @@ class BandMaskGroup(nn.Module):
         bucket_width: int,
     ):
         super().__init__()
-        self.num_predicted_stems = 1
+        self.num_stems = config.num_stems
         self.audio_channels = config.audio_channels
         self.bucket_width = bucket_width
         self.feature_width = bucket_width * config.audio_channels * 2
@@ -717,18 +766,64 @@ class BandMaskGroup(nn.Module):
         self.register_buffer("freq_indices", freq_indices, persistent=False)
         self.register_buffer("feature_valid", feature_valid, persistent=False)
 
-        # Each band token is decoded to its complex stereo mask by a single
-        # band-specific gated linear projection. There is no shared predictor
-        # network on top of the transformer; the encoder representation is
-        # mapped straight to mask coefficients.
-        output_width = self.num_predicted_stems * self.feature_width
+        # Each band token is decoded by a single band-specific gated linear
+        # projection. There is no shared predictor network on top of the
+        # transformer; the encoder representation is mapped straight to
+        # complex coefficients.
+        self.output_width = self.num_stems * self.feature_width
+        # One GLU per path, so the last axis is laid out as
+        # [mask value | mask gate | residual value | residual gate].
         self.output_weight = nn.Parameter(
-            torch.empty(self.num_group_bands, config.dim, output_width * 2)
+            torch.empty(self.num_group_bands, config.dim, self.output_width * 4)
         )
-        self.output_bias = nn.Parameter(
-            torch.zeros(self.num_group_bands, output_width * 2)
-        )
+        self.output_bias = nn.Parameter(self._initial_bias())
         nn.init.normal_(self.output_weight, std=1e-3)
+        with torch.no_grad():
+            # The additive path starts at exactly zero, so every stem begins
+            # life as a plain mask separator whose masks sum to one, and the
+            # residual grows only where the loss asks for energy the mixture
+            # does not contain.  (The residual *gate* gets no gradient on the
+            # very first step, because its gradient is scaled by the value,
+            # which is zero; it unfreezes as soon as the value branch takes
+            # its first update.  One step out of ~1e5 is irrelevant.)
+            width = self.output_width
+            self.output_weight[:, :, width * 2 : width * 3].zero_()
+
+    def _initial_bias(self) -> torch.Tensor:
+        bias = torch.zeros(self.num_group_bands, self.output_width * 4)
+        real_slots = (torch.arange(self.output_width) % 2) == 0
+        # Start every stem at half the mixture: GLU emits value * sigmoid(gate),
+        # so a value bias of 1 on the real slots with a zero gate gives 0.5.
+        bias[:, : self.output_width][:, real_slots] = 1.0
+        return bias
+
+    def _to_source_layout(self, raw: torch.Tensor) -> torch.Tensor:
+        batch, frames = raw.shape[0], raw.shape[1]
+        raw = raw.reshape(
+            batch,
+            frames,
+            self.num_group_bands,
+            self.num_stems,
+            self.feature_width,
+        )
+        raw = raw * self.feature_valid[None, None, :, None]
+        raw = raw.reshape(
+            batch,
+            frames,
+            self.num_group_bands,
+            self.num_stems,
+            self.bucket_width,
+            self.audio_channels,
+            2,
+        )
+        return raw.permute(0, 3, 5, 1, 2, 4, 6).reshape(
+            batch,
+            self.num_stems,
+            self.audio_channels,
+            frames,
+            self.num_group_bands * self.bucket_width,
+            2,
+        )
 
     def forward(
         self,
@@ -736,42 +831,31 @@ class BandMaskGroup(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # x: [B, T, group_bands, D]
         raw = torch.einsum("btnd,ndq->btnq", x, self.output_weight)
-        raw = F.glu(raw + self.output_bias[None, None], dim=-1)
-        raw = raw.reshape(
-            x.shape[0],
-            x.shape[1],
-            self.num_group_bands,
-            self.num_predicted_stems,
-            self.feature_width,
+        raw = raw + self.output_bias[None, None]
+        mask = F.glu(raw[..., : self.output_width * 2], dim=-1)
+        residual = F.glu(raw[..., self.output_width * 2 :], dim=-1)
+        return (
+            self._to_source_layout(mask),
+            self._to_source_layout(residual),
         )
-        raw = raw * self.feature_valid[None, None, :, None]
-        raw = raw.reshape(
-            x.shape[0],
-            x.shape[1],
-            self.num_group_bands,
-            self.num_predicted_stems,
-            self.bucket_width,
-            self.audio_channels,
-            2,
-        )
-        source = raw.permute(0, 3, 5, 1, 2, 4, 6).reshape(
-            x.shape[0],
-            self.num_predicted_stems,
-            self.audio_channels,
-            x.shape[1],
-            self.num_group_bands * self.bucket_width,
-            2,
-        )
-        return source, self.freq_indices.reshape(-1)
 
 
-class MaskHead(nn.Module):
-    """Decode final transformer tokens into the foreground vocal mask.
+class SourceHead(nn.Module):
+    """Decode final transformer tokens into both complex stem spectrograms.
 
-    Mask prediction happens entirely inside the transformer's output stage:
-    each normalized band token is mapped to its band's complex stereo mask by
-    a per-band gated linear projection, with no dedicated predictor network
-    between the encoder and the mask output.
+    Synthesis happens entirely inside the transformer's output stage: each
+    normalized band token is mapped to its band's complex stereo mask *and*
+    its complex stereo residual by per-band gated linear projections, with no
+    dedicated predictor network between the encoder and the output:
+
+        stem_s = mask_s * mixture + residual_s
+
+    The residual is the whole point.  It is not bounded by what the mixture
+    contains, so a stem stays full through the TF regions the two stems share
+    instead of collapsing to a dull, phase-scrambled compromise.  Both stems
+    get their own mask and their own residual: there is no complement
+    constraint, so the accompaniment is no longer just "whatever the vocal
+    mask threw away".
     """
 
     def __init__(
@@ -780,6 +864,7 @@ class MaskHead(nn.Module):
         bands: Sequence[tuple[int, int]],
     ):
         super().__init__()
+        self.num_stems = config.num_stems
         self.audio_channels = config.audio_channels
         self.freq_bins = config.n_fft // 2 + 1
 
@@ -788,7 +873,7 @@ class MaskHead(nn.Module):
             bucket = next_power_of_two(end - start)
             grouped_ids.setdefault(bucket, []).append(band_id)
         self.groups = nn.ModuleList(
-            BandMaskGroup(config, bands, ids, bucket)
+            BandSourceGroup(config, bands, ids, bucket)
             for bucket, ids in sorted(grouped_ids.items())
         )
 
@@ -798,28 +883,42 @@ class MaskHead(nn.Module):
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
-    def forward_real(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, bands, D]
-        output = x.new_zeros(
-            x.shape[0], 1, self.audio_channels, x.shape[1], self.freq_bins, 2
+    def forward_real(
+        self,
+        x: torch.Tensor,
+        mixture_real_imag: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: [B, T, bands, D]; mixture_real_imag: [B, C, F, T, 2]
+        batch, frames = x.shape[0], x.shape[1]
+        shape = (
+            batch,
+            self.num_stems,
+            self.audio_channels,
+            frames,
+            self.freq_bins,
+            2,
         )
+        masks = x.new_zeros(shape)
+        residuals = x.new_zeros(shape)
         for group in self.groups:
             group_x = x.index_select(2, group.band_ids)
-            source, flat_indices = group(group_x)
+            group_mask, group_residual = group(group_x)
+            flat_indices = group.freq_indices.reshape(-1)
             scatter_index = flat_indices.view(1, 1, 1, 1, -1, 1).expand(
-                x.shape[0], 1, self.audio_channels, x.shape[1], -1, 2
+                batch, self.num_stems, self.audio_channels, frames, -1, 2
             )
-            output.scatter_add_(dim=4, index=scatter_index, src=source)
+            masks = masks.scatter_add(dim=4, index=scatter_index, src=group_mask)
+            residuals = residuals.scatter_add(
+                dim=4, index=scatter_index, src=group_residual
+            )
 
-        output = output.permute(0, 1, 2, 4, 3, 5).contiguous().float()
-        # Keep a neutral two-source prior. It does not force leakage: the learned
-        # raw mask can move all the way to zero, while retaining 0.5 keeps the
-        # vocal head centered at the outset of training.
-        mask_bias = output.new_tensor((0.5, 0.0))
-        return output + mask_bias
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.view_as_complex(self.forward_real(x))
+        # Cast back to FP32 before building complex tensors: under autocast
+        # the tokens are BF16 and view_as_complex would hand back complex32.
+        masks = masks.permute(0, 1, 2, 4, 3, 5).contiguous().float()
+        residuals = residuals.permute(0, 1, 2, 4, 3, 5).contiguous().float()
+        mixture = mixture_real_imag[:, None].to(dtype=masks.dtype)
+        estimates = ri_multiply(masks, mixture) + residuals
+        return estimates, residuals
 
 
 
@@ -830,36 +929,33 @@ class BSRoFormerSeparator(nn.Module):
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
         self.encoder = DualPathEncoder(config)
-        self.mask_head = MaskHead(config, self.bands)
+        self.source_head = SourceHead(config, self.bands)
 
-    def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
+    def forward_real(
+        self, mixture_real_imag: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (estimates, residuals) as real/imag [B, S, C, F, T, 2].
+
+        Every stem is predicted outright.  Nothing is derived as the
+        complement of another stem, so the two outputs may overlap freely and
+        their sum is deliberately allowed to exceed the mixture wherever the
+        original stems shared energy.
+        """
         tokens = self.band_split.forward_real(mixture_real_imag)
         tokens = self.encoder(tokens)
-        vocal_mask = self.mask_head.forward_real(tokens)
+        return self.source_head.forward_real(tokens, mixture_real_imag)
 
-        # No vocal activity gate: the separator's foreground mask is used directly.
-        # The accompaniment remains the exact residual complement, so reconstruction
-        # consistency never injects residual mixture energy back into the vocal stem.
-        one = torch.zeros_like(vocal_mask)
-        one[..., 0] = 1.0
-        other_mask = one - vocal_mask
-        return torch.cat((vocal_mask, other_mask), dim=1)
-
-    def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        mixture_spec: torch.Tensor,
+        return_residuals: bool = False,
+    ):
         mixture_real_imag = torch.view_as_real(mixture_spec.to(torch.complex64))
-        masks_real_imag = self.forward_real(mixture_real_imag)
-        return torch.view_as_complex(masks_real_imag)
-
-    def estimate_specs(
-        self, mixture_spec: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        masks = self(mixture_spec)
-        estimates = masks * mixture_spec[:, None]
-        # Masks are complementary by construction. Route only floating-point
-        # reconstruction residue to the accompaniment so vocals are never polluted.
-        residual = mixture_spec - estimates.sum(dim=1)
-        estimates[:, 1] = estimates[:, 1] + residual
-        return estimates, masks
+        estimates, residuals = self.forward_real(mixture_real_imag)
+        estimates = torch.view_as_complex(estimates)
+        if not return_residuals:
+            return estimates
+        return estimates, torch.view_as_complex(residuals)
 
 
 # -----------------------------------------------------------------------------
@@ -967,51 +1063,79 @@ def normalized_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     return (error / torch.maximum(scale, scale_floor)).mean()
 
 
-def scale_dependent_sdr_loss(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    error_power = (prediction - target).square().mean(dim=(-2, -1))
-    target_power = target.square().mean(dim=(-2, -1))
-    valid = target_power > 1e-7
-    ratio_db = 10.0 * torch.log10(
-        (target_power + 1e-8) / (error_power + 1e-8)
+def stem_overlap_map(
+    target_magnitude: torch.Tensor,
+    smooth_bins: int = 5,
+    smooth_frames: int = 9,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Locate the TF bins the two stems are fighting over.
+
+    ``interference`` is 1 where both stems carry comparable energy in the
+    local neighbourhood -- the bins a mask fundamentally cannot separate,
+    because the mixture only ever reveals their sum -- and 0 where one stem
+    clearly dominates.  Smoothing matters: two dense harmonic signals only
+    collide intermittently bin by bin, but the *region* is shared, and it is
+    the region that sounds dull when the stem is reconstructed from the sum.
+
+    ``level_ratio`` is each stem's smoothed magnitude relative to its own
+    crop mean.  It keeps the completion objective from inflating silence: a
+    bin far below the stem's own level is mostly noise floor, not content
+    that went missing.
+
+    Shapes: in [B, S, C, F, T]; out ([B, 1, 1, F, T], [B, S, 1, 1, 1]).
+    """
+    num_stems = target_magnitude.shape[1]
+    merged = target_magnitude.flatten(1, 2)
+    smoothed = F.avg_pool2d(
+        merged,
+        kernel_size=(smooth_bins, smooth_frames),
+        stride=1,
+        padding=(smooth_bins // 2, smooth_frames // 2),
+        count_include_pad=False,
     )
-    ratio_db = ratio_db.clamp(-50.0, 50.0)
-    if valid.any():
-        return -ratio_db[valid].mean()
-    return prediction.new_tensor(0.0)
+    per_stem = smoothed.reshape(
+        smoothed.shape[0], num_stems, -1, *smoothed.shape[-2:]
+    ).mean(dim=2)
+    total = per_stem.sum(dim=1, keepdim=True)
+    smaller = per_stem.min(dim=1, keepdim=True).values
+    interference = (2.0 * smaller / total.clamp_min(1e-6)).clamp_(0.0, 1.0)
+    level_ratio = per_stem / per_stem.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    return interference.unsqueeze(1), level_ratio.unsqueeze(2)
+
+
+def fullness_loss(
+    prediction_magnitude: torch.Tensor,
+    target_magnitude: torch.Tensor,
+    allowance: torch.Tensor,
+    under_slack: float,
+    over_slack: float,
+    over_penalty: float,
+    deviation_cap: float,
+) -> torch.Tensor:
+    """Asymmetric spectral completion: punish holes hard, extras softly.
+
+    Weighted to the bins the stems share.  There the mixture simply does not
+    contain enough information to reconstruct either stem exactly, so a
+    symmetric loss teaches the model to predict the conditional mean -- which
+    is precisely the thin, dull compromise this trainer exists to avoid.
+    Instead a stem must be *at least* present at ``under_slack`` of its
+    target, and then gets ``over_slack`` of headroom before surplus energy
+    costs anything, at only ``over_penalty`` of the cost of a hole.  Errors
+    are relative to the local target so quiet content is not drowned out.
+    """
+    reference = target_magnitude.clamp_min(1e-6)
+    ratio = prediction_magnitude / reference
+    # Normalized deviations, saturated: past the cap a bin stops shouting.
+    missing = F.relu(under_slack - ratio).clamp_max(deviation_cap)
+    extra = F.relu(ratio - over_slack).clamp_max(deviation_cap)
+    penalty = missing.square() + over_penalty * extra.square()
+    return (allowance * penalty).mean()
 
 
 def mid_side(audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     mid = (audio[..., 0, :] + audio[..., 1, :]) * 0.5
     side = (audio[..., 0, :] - audio[..., 1, :]) * 0.5
     return mid, side
-
-
-def frame_mean_square(
-    audio: torch.Tensor,
-    win_length: int,
-    hop_length: int,
-) -> torch.Tensor:
-    """Frame-local mean-square envelope aligned to center=True STFT frames.
-
-    ``audio`` is [..., samples] and the result is [..., n_frames]; leading
-    dimensions are preserved so a batch of mixes is pooled independently (the
-    previous mean over dim -2 merged batch entries together).
-
-    Keeping this in the power domain avoids the singular derivative of sqrt(0),
-    which matters because silence augmentation intentionally creates exact zeros.
-    """
-    flat = audio.square().reshape(-1, audio.shape[-1]).unsqueeze(1)
-    pooled = F.avg_pool1d(
-        flat,
-        kernel_size=win_length,
-        stride=hop_length,
-        padding=win_length // 2,
-        count_include_pad=False,
-    )
-    return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
 
 
 class SeparationLoss(nn.Module):
@@ -1031,10 +1155,7 @@ class SeparationLoss(nn.Module):
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        masks = model(mixture_spec)
-        estimates = masks * mixture_spec[:, None]
-        residual = mixture_spec - estimates.sum(dim=1)
-        estimates[:, 1] = estimates[:, 1] + residual
+        estimates, residuals = model(mixture_spec, return_residuals=True)
 
         pred_audio = make_istft(
             estimates,
@@ -1056,26 +1177,57 @@ class SeparationLoss(nn.Module):
         mrstft_loss = self.mrstft(pred_audio, target_audio)
 
         target_mag = target_specs.abs()
+        pred_mag = estimates.abs()
         spec_normalizer = target_mag.mean().detach().clamp_min(1e-4)
-        main_complex = (estimates - target_specs).abs().mean() / spec_normalizer
-        main_logmag = F.l1_loss(torch.log1p(estimates.abs()), torch.log1p(target_mag))
+        stem_normalizer = (
+            target_mag.mean(dim=(-3, -2, -1), keepdim=True).detach().clamp_min(1e-4)
+        )
+
+        interference, level_ratio = stem_overlap_map(target_mag)
+        # Bins the two stems share are the bins a mask cannot resolve.  Forgive
+        # part of the strict error there instead of driving the model toward
+        # the average of every plausible answer.  Renormalized to unit mean so
+        # the term keeps its previous scale regardless of overlap_relief.
+        strict_weight = 1.0 - self.loss_config.overlap_relief * interference
+        strict_weight = strict_weight / strict_weight.mean().clamp_min(1e-4)
+        # Completion is only asked for where the stems overlap *and* the stem
+        # actually has content there.
+        completion_allowance = interference * level_ratio.clamp_max(1.0).sqrt()
+
+        main_complex = (
+            (estimates - target_specs).abs() * strict_weight
+        ).mean() / spec_normalizer
+        main_logmag = (
+            F.l1_loss(
+                torch.log1p(pred_mag), torch.log1p(target_mag), reduction="none"
+            )
+            * strict_weight
+        ).mean()
         main_stft_loss = main_complex + main_logmag
 
-        mix_power = mixture_spec.abs().square()
-        ideal_masks = (
-            target_specs * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
+        full_loss = fullness_loss(
+            pred_mag,
+            target_mag,
+            completion_allowance,
+            under_slack=self.loss_config.under_slack,
+            over_slack=self.loss_config.over_slack,
+            over_penalty=self.loss_config.over_penalty,
+            deviation_cap=self.loss_config.deviation_cap,
         )
-        ideal_mag = ideal_masks.abs().clamp_max(8.0)
-        ideal_masks = torch.polar(ideal_mag, torch.angle(ideal_masks))
-        tf_weight = mixture_spec.abs()
-        tf_weight = tf_weight / tf_weight.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-4)
-        tf_weight = tf_weight.clamp(max=5.0)
-        effective_masks = (
-            estimates * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
+        # The additive path is free where the stems overlap and discouraged
+        # everywhere else: outside those regions a mask reproduces the stem
+        # exactly, so synthesis there is invention the mixture never asked for.
+        synthesis_loss = (
+            (residuals.abs() * (1.0 - interference)) / stem_normalizer
+        ).mean()
+        # A soft anchor, not a constraint.  Both stems are free to overlap, so
+        # their sum is expected to exceed the mixture; this only keeps the
+        # total level from drifting away from the input.
+        mix_normalizer = mixture_spec.abs().mean().detach().clamp_min(1e-4)
+        mixture_loss = (
+            (estimates.sum(dim=1) - mixture_spec).abs().mean() / mix_normalizer
         )
-        mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
 
-        sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
         true_mid, true_side = mid_side(target_audio)
         midside_loss = 0.5 * (
@@ -1087,8 +1239,9 @@ class SeparationLoss(nn.Module):
             cfg.waveform_weight * wave_loss
             + cfg.main_stft_weight * main_stft_loss
             + cfg.mrstft_weight * mrstft_loss
-            + cfg.mask_weight * mask_loss
-            + cfg.sdr_weight * sdr_loss
+            + cfg.fullness_weight * full_loss
+            + cfg.synthesis_weight * synthesis_loss
+            + cfg.mixture_weight * mixture_loss
             + cfg.midside_weight * midside_loss
         )
         with torch.no_grad():
@@ -1105,17 +1258,20 @@ class SeparationLoss(nn.Module):
                 ).mean()
             else:
                 vocal_level_db = pred_audio.new_tensor(0.0)
-            vocal_mask_mag = masks[:, 0].abs().mean()
+            # How much of each stem is now coming from the additive path.
+            residual_share = (residuals.abs().mean() / stem_normalizer).mean()
+            residual_db = 20.0 * torch.log10(residual_share.clamp_min(1e-6))
+            overlap_bins = interference.mean()
 
         metrics = {
             "wave": wave_loss.detach(),
             "main_stft": main_stft_loss.detach(),
             "mrstft": mrstft_loss.detach(),
-            "mask": mask_loss.detach(),
-            "sdr_loss": sdr_loss.detach(),
-            "midside": midside_loss.detach(),
+            "full": full_loss.detach(),
+            "synth": synthesis_loss.detach(),
             "vocal_level_db": vocal_level_db.detach(),
-            "vocal_mask_mag": vocal_mask_mag.detach(),
+            "residual_db": residual_db.detach(),
+            "overlap": overlap_bins.detach(),
         }
         return total, metrics
 
@@ -1226,8 +1382,9 @@ def apply_reverb(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
 
     The wet mix is deliberately modest: a loud diffuse tail in the vocal
     target overlaps the instrumental's high band (cymbals, hats) for seconds
-    after the voice stops, and a mask separator answers by leaving its mask
-    open there -- the "static instrumental riding the vocals" artifact.
+    after the voice stops.  Past roughly a 0.3 mix there is no longer any
+    evidence in the mixture that the tail belongs to the voice, so training
+    on it only teaches the model to invent a diffuse halo around the vocal.
     """
     impulse = make_reverb_impulse(sample_rate, audio.shape[-1])
     wet = fft_convolve(audio, impulse)
@@ -1305,7 +1462,7 @@ def make_synth_lead(sample_rate: int, duration: int) -> torch.Tensor:
     harmonics = min(harmonics, int(sample_rate / (2 * f0)) - 1)
     harmonics = max(1, harmonics)
     # Rolloff kept >= 1.0: slower rolloffs make the lead buzzy, and a bright
-    # harmonic stack in the accompaniment is exactly what leaks into the
+    # harmonic stack in the accompaniment is exactly what shows up in the
     # vocal output as high-frequency shimmer.
     rolloff = random.uniform(1.0, 1.5)
     wave = torch.zeros(duration, dtype=torch.float32)
@@ -1376,10 +1533,10 @@ VOWEL_FORMANTS = (
 def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
     """A long synthetic sung vowel: glottal source through formant filters.
 
-    Strong formant structure, vibrato, and breath noise -- the cues that
-    separate a real sustained voice from a synth.  Placed in the vocal stem,
-    it teaches the model to keep long sustained notes (like a held "oo")
-    voiced and free of leaked background.
+    Strong formant structure and breath noise -- the cues that separate a
+    real sustained voice from a synth.  Placed in the vocal stem, it teaches
+    the model to keep long sustained notes (like a held "oo") voiced and
+    free of leaked background.
     """
     f0 = math.exp(random.uniform(math.log(90.0), math.log(300.0)))
     f1, f2, f3 = random.choice(VOWEL_FORMANTS)
@@ -1387,16 +1544,13 @@ def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
     f2 *= random.uniform(0.85, 1.15)
     f3 *= random.uniform(0.85, 1.15)
     t = torch.arange(duration, dtype=torch.float32) / sample_rate
-    vibrato_depth = random.uniform(0.004, 0.012)
-    vibrato_rate = random.uniform(4.0, 6.5)
-    freq = f0 * (1.0 + vibrato_depth * torch.sin(2 * math.pi * vibrato_rate * t))
-    phase = 2 * math.pi * torch.cumsum(freq, dim=0) / sample_rate
 
     # Glottal source spectrum: harmonics at k * f0 with 1/k amplitudes and
-    # random phases (phase is irrelevant; the model reproduces it via masking).
-    # Harmonics are capped at ~8 kHz: a sustained vowel that manufactures
-    # energy in the air band teaches the separator to emit high-frequency
-    # shimmer around the voice.
+    # random per-harmonic phase, shaped by three formant resonators.
+    # Harmonics are capped at ~8 kHz: this is a synthetic stand-in for a
+    # sung note, not a real recording, so generating air-band content that
+    # the glottal model does not actually support would teach the separator
+    # to emit high-frequency shimmer around the voice.
     n = duration
     spec = torch.zeros(n // 2 + 1, dtype=torch.complex64)
     kmax = min(int(sample_rate / (2 * f0)), 160, int(8_000.0 / f0))
@@ -1420,8 +1574,8 @@ def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
     vowel = torch.fft.irfft(spec, n)
 
     # Quiet breath noise and a slow sung envelope with tremolo.  Breath is
-    # pink and quiet: white hiss in the vocal target is unrecoverable by the
-    # mask separator (it reads as static), and real breath is darker than 1/f.
+    # pink and quiet: real breath is darker than 1/f, and a white hiss floor
+    # in the vocal target would just read as static.
     breath = _pink_noise(n, sample_rate)
     breath *= random.uniform(0.003, 0.010) * vowel.square().mean().sqrt().clamp_min(1e-8)
     vowel = vowel + breath
@@ -1577,8 +1731,6 @@ def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
     This version keeps only one buffer per sample rate and slices random
     windows from it.
     """
-    if length <= 0:
-        return torch.zeros(0)
     needed = max(2 ** 20, 4 * length)
     buffer = _PINK_NOISE_CACHE.get(sample_rate)
     if buffer is None or buffer.numel() < needed:
@@ -1613,7 +1765,7 @@ def apply_saturation(audio: torch.Tensor) -> torch.Tensor:
 
     Drive stays low.  tanh intermodulation manufactures energy above the
     voice's natural bandwidth (measured +15-25 dB in the >8 kHz band at
-    drive 3) and the mask separator smears that back out as fuzz riding the
+    drive 3), which the separator then has to account for as fuzz riding the
     vocal.  Drive 1.2-2 is gentle tube warmth: harmonics appear, but the
     top end is not manufactured from nothing.
     """
@@ -2019,10 +2171,10 @@ class StemDataset(Dataset):
             # independent L/R trim on whole mix (keeps sum-to-mixture)
             g = torch.empty(targets.shape[0], 2, 1).uniform_(0.84, 1.19)
             targets = targets * g
-        if random.random() < 0.06:
+        if random.random() < 0.03:
             # whole-crop mono fold (mono compatibility)
-            c = random.randint(0, 1)
-            targets = targets[:, c : c + 1, :].repeat(1, 2, 1) if random.random() < 0.5 else targets
+            channel = random.randint(0, 1)
+            targets = targets[:, channel : channel + 1, :].repeat(1, 2, 1)
         if random.random() < 0.08:
             # whole-crop micro-alignment drift +-6 ms (same shift on all stems)
             d = int(random.uniform(-6.0, 6.0) / 1000.0 * sample_rate)
@@ -2070,13 +2222,12 @@ class StemDataset(Dataset):
         # (chorus, echo, reverb), then level effects (doubling, tremolo) and
         # the synthetic vowel.  The mixture is built after augmentation, so the
         # model sees every effect as part of the vocal stem it must recover.
-        # Note: no noise floor here.  Independent per-stem hiss is unrecoverable
-        # by a mask separator (two uncorrelated broadband noises cannot be told
-        # apart), so the model answered with a high-frequency static riding the
-        # voice.  Hiss is a recording-chain property: it lives in the
-        # accompaniment, and the model should learn to push it there, keeping
-        # the vocal clean.
-        vocal = targets[0]
+        # Note: no noise floor here.  Two uncorrelated broadband noises
+        # cannot be told apart by any separator -- there is nothing in the
+        # mixture to go on -- so per-stem hiss only teaches the model to
+        # manufacture a high-frequency static that rides the voice.  Hiss is
+        # a recording-chain property: it lives in the accompaniment, and the
+        # model should learn to route it there, keeping the vocal clean.
         if random.random() < 0.25:
             vocal = random_spectral_eq(vocal, sample_rate)
         if random.random() < 0.09:
@@ -2337,46 +2488,51 @@ def find_latest_compatible_checkpoint(
     return None
 
 
-def checkpoint_sdr_from_path(path: str | Path) -> float | None:
-    match = re.search(r"sdr_(-?\d+(?:\.\d+)?)\.pt$", Path(path).name)
+# Best-checkpoint filenames encode the selection metric and its score, e.g.
+# checkpoint_step_8000_blend_13.4210.pt or ..._sdr_9.8821.pt from older runs.
+SCORE_FILENAME_PATTERN = re.compile(r"_(?:sdr|msr|blend)_(-?\d+(?:\.\d+)?)\.pt$")
+
+
+def checkpoint_score_from_path(path: str | Path) -> float | None:
+    """Read the model-selection score encoded in a best-checkpoint filename."""
+    match = SCORE_FILENAME_PATTERN.search(Path(path).name)
     return float(match.group(1)) if match else None
 
 
 def find_best_checkpoint(
-    folder: str = "best_ckpts",
-    config: ModelConfig | None = None,
+    folder: str,
+    config: ModelConfig,
     validation_metric: str | None = None,
 ) -> str | None:
     scored: list[tuple[float, Path]] = []
     for path in Path(folder).glob("*.pt"):
-        score = checkpoint_sdr_from_path(path)
+        score = checkpoint_score_from_path(path)
         if score is None:
             continue
-        if config is not None or validation_metric is not None:
-            try:
-                checkpoint_data = torch.load(
-                    path, map_location="cpu", weights_only=False
+        try:
+            checkpoint_data = torch.load(
+                path, map_location="cpu", weights_only=False
+            )
+        except Exception as error:
+            print(f"Ignoring unreadable best checkpoint {path}: {error}")
+            continue
+        try:
+            if (
+                checkpoint_data.get("checkpoint_format_version", 0)
+                < CHECKPOINT_FORMAT_VERSION
+                or not model_configs_compatible(
+                    checkpoint_data.get("model_config"), config
                 )
-            except Exception as error:
-                print(f"Ignoring unreadable best checkpoint {path}: {error}")
+            ):
                 continue
-            try:
-                if config is not None and (
-                    checkpoint_data.get("checkpoint_format_version", 0)
-                    < CHECKPOINT_FORMAT_VERSION
-                    or not model_configs_compatible(
-                        checkpoint_data.get("model_config"), config
-                    )
-                ):
-                    continue
-                if (
-                    validation_metric is not None
-                    and checkpoint_data.get("validation_metric") != validation_metric
-                ):
-                    continue
-            finally:
-                del checkpoint_data
-                gc.collect()
+            if (
+                validation_metric is not None
+                and checkpoint_data.get("validation_metric") != validation_metric
+            ):
+                continue
+        finally:
+            del checkpoint_data
+            gc.collect()
         scored.append((score, path))
     return str(max(scored, key=lambda item: item[0])[1]) if scored else None
 
@@ -2388,7 +2544,7 @@ def save_checkpoint(
     optimizer: Prodigy,
     scaler: torch.amp.GradScaler,
     step: int,
-    best_sdr: float,
+    best_score: float,
     avg_loss: float,
 ) -> None:
     payload = {
@@ -2399,8 +2555,8 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "optimizer_class": optimizer.__class__.__name__,
         "scaler_state_dict": scaler.state_dict(),
-        "best_sdr": best_sdr,
-        "validation_metric": VALIDATION_METRIC,
+        "best_score": best_score,
+        "validation_metric": BLEND_VALIDATION_METRIC,
         "avg_loss": avg_loss,
         "stems": STEMS,
         "model_config": asdict(model.config),
@@ -2415,30 +2571,29 @@ def save_checkpoint(
 
 def prune_old_checkpoints(
     folder: str,
-    keep: int = 3,
-    config: ModelConfig | None = None,
+    keep: int,
+    config: ModelConfig,
 ) -> None:
     paths: list[Path] = []
     for path in Path(folder).glob("*.pt"):
-        if config is not None:
-            try:
-                checkpoint_data = torch.load(
-                    path, map_location="cpu", weights_only=False
+        try:
+            checkpoint_data = torch.load(
+                path, map_location="cpu", weights_only=False
+            )
+        except Exception:
+            continue
+        try:
+            if (
+                checkpoint_data.get("checkpoint_format_version", 0)
+                < CHECKPOINT_FORMAT_VERSION
+                or not model_configs_compatible(
+                    checkpoint_data.get("model_config"), config
                 )
-            except Exception:
+            ):
                 continue
-            try:
-                if (
-                    checkpoint_data.get("checkpoint_format_version", 0)
-                    < CHECKPOINT_FORMAT_VERSION
-                    or not model_configs_compatible(
-                        checkpoint_data.get("model_config"), config
-                    )
-                ):
-                    continue
-            finally:
-                del checkpoint_data
-                gc.collect()
+        finally:
+            del checkpoint_data
+            gc.collect()
         paths.append(path)
     paths.sort(key=lambda path: path.stat().st_mtime)
     for path in paths[:-keep]:
@@ -2475,8 +2630,6 @@ def chunk_starts(total_length: int, chunk_size: int, overlap: int) -> list[int]:
     if total_length <= chunk_size:
         return [0]
     step = chunk_size - overlap
-    if step <= 0:
-        raise ValueError("Overlap must be smaller than chunk size.")
     starts = list(range(0, total_length - chunk_size + 1, step))
     final_start = total_length - chunk_size
     if starts[-1] != final_start:
@@ -2501,15 +2654,6 @@ def separate_tensor(
     precision: str = "bf16",
     show_progress: bool = False,
 ) -> list[torch.Tensor]:
-    if mixture.ndim != 2:
-        raise ValueError("Mixture must be [channels, samples].")
-    if mixture.shape[0] == 1:
-        mixture = mixture.repeat(2, 1)
-    if mixture.shape[0] != model.config.audio_channels:
-        raise ValueError(
-            f"Expected {model.config.audio_channels} channels, got {mixture.shape[0]}."
-        )
-
     mixture = mixture.to(device=device, dtype=torch.float32)
     total_length = mixture.shape[-1]
     starts = chunk_starts(total_length, chunk_size, overlap)
@@ -2547,7 +2691,7 @@ def separate_tensor(
             window=stft_window,
         )
         with autocast_context(device, precision):
-            estimated_specs, _ = model.estimate_specs(spec)
+            estimated_specs = model(spec)
         estimated = make_istft(
             estimated_specs,
             length=chunk_size,
@@ -2572,10 +2716,11 @@ def separate_tensor(
 
     output = output / weight_sum.clamp_min(1e-8)
 
-    # Enforce exact waveform mixture consistency after overlap-add. Do not
-    # clamp; clipping predictions changes SDR and belongs only at export.
-    residual = mixture - output.sum(dim=0)
-    output[1] = output[1] + residual
+    # No mixture-consistency repair.  Both stems are synthesized in full, so
+    # their sum is expected to exceed the mixture wherever the original stems
+    # shared energy.  Dumping that excess into the accompaniment would put
+    # the crossover content straight back and undo the whole point.  Do not
+    # clamp either: clipping predictions belongs at export, not inference.
     return [output[index] for index in range(model.config.num_stems)]
 
 
@@ -2604,6 +2749,72 @@ def calculate_track_sdr(
     return score if math.isfinite(score) else None
 
 
+# Multi-resolution STFT geometries used only for validation scoring.
+MSR_RESOLUTIONS = ((4096, 1024), (2048, 512), (1024, 256), (512, 128))
+
+
+def calculate_track_spectral_score(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    accumulation_samples: int,
+) -> float | None:
+    """Multi-resolution magnitude score in dB (higher is better).
+
+    This is the metric the trainer selects on.  SDR compares waveforms sample
+    by sample, so a stem with the right spectral content but a phase the
+    mixture never revealed scores as badly as one that is simply wrong -- the
+    exact failure that pushes a model toward thin, safe, quiet stems.  This
+    score compares magnitude spectrograms at several resolutions only, so it
+    is blind to phase and tolerant of level, and it rewards a stem that is
+    spectrally complete through the regions the two stems share.
+    """
+    error = torch.zeros((), device=target.device, dtype=torch.float64)
+    reference = torch.zeros((), device=target.device, dtype=torch.float64)
+    windows = [
+        torch.hann_window(n_fft, device=target.device)
+        for n_fft, _ in MSR_RESOLUTIONS
+    ]
+    longest = max(n_fft for n_fft, _ in MSR_RESOLUTIONS)
+    for start in range(0, target.shape[-1], accumulation_samples):
+        end = min(start + accumulation_samples, target.shape[-1])
+        block = end - start
+        if block <= longest:
+            continue
+        target_block = target[..., start:end].float().reshape(-1, block)
+        prediction_block = prediction[..., start:end].float().reshape(-1, block)
+        for (n_fft, hop_length), window in zip(MSR_RESOLUTIONS, windows):
+            target_magnitude = torch.stft(
+                target_block,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                window=window,
+                center=True,
+                return_complex=True,
+            ).abs()
+            prediction_magnitude = torch.stft(
+                prediction_block,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                window=window,
+                center=True,
+                return_complex=True,
+            ).abs()
+            error += (prediction_magnitude - target_magnitude).abs().double().sum()
+            reference += target_magnitude.double().sum()
+    if reference <= 0.0:
+        return None
+    relative = (error / reference).clamp_min(1e-12)
+    score = float(-20.0 * torch.log10(relative))
+    return score if math.isfinite(score) else None
+
+
+def blend_score(sdr: float, msr: float) -> float:
+    """Blend the waveform and spectral validation scores."""
+    return (
+        VAL_SDR_WEIGHT * sdr + VAL_MSR_WEIGHT * msr
+    ) / (VAL_SDR_WEIGHT + VAL_MSR_WEIGHT)
+
+
 @torch.inference_mode()
 def validate(
     model: BSRoFormerSeparator,
@@ -2612,7 +2823,12 @@ def validate(
     chunk_size: int,
     overlap: int,
     precision: str,
-) -> tuple[list[float], float | None]:
+) -> tuple[list[float], float | None, list[float]]:
+    """Score validation tracks on SDR and on spectral completeness.
+
+    Returns the per-stem blend scores, the combined blend score, and the raw
+    per-stem SDR for the log line.
+    """
     model.eval()
     track_dirs = [
         os.path.join(test_dir, name)
@@ -2621,9 +2837,9 @@ def validate(
     ] if os.path.isdir(test_dir) else []
     if not track_dirs:
         print(f"No validation tracks found under {test_dir!r}.")
-        return [0.0 for _ in STEMS], None
+        return [0.0 for _ in STEMS], None, []
 
-    per_stem_track_scores: list[list[float]] = [[] for _ in STEMS]
+    per_stem_records: list[list[dict[str, float]]] = [[] for _ in STEMS]
     valid_tracks = 0
     progress = tqdm(track_dirs, desc="Validating", leave=False)
     for track_dir in progress:
@@ -2670,7 +2886,7 @@ def validate(
                 precision=precision,
                 show_progress=False,
             )
-            scores = [
+            sdr_scores = [
                 calculate_track_sdr(
                     pred,
                     target,
@@ -2678,33 +2894,58 @@ def validate(
                 )
                 for pred, target in zip(predictions, targets)
             ]
-            for index, score in enumerate(scores):
-                if score is not None:
-                    per_stem_track_scores[index].append(score)
+            msr_scores = [
+                calculate_track_spectral_score(
+                    pred,
+                    target,
+                    accumulation_samples=chunk_size,
+                )
+                for pred, target in zip(predictions, targets)
+            ]
+            for index, (sdr, msr) in enumerate(zip(sdr_scores, msr_scores)):
+                record: dict[str, float] = {}
+                if sdr is not None:
+                    record["sdr"] = sdr
+                if msr is not None:
+                    record["msr"] = msr
+                per_stem_records[index].append(record)
             valid_tracks += 1
             progress.set_postfix_str(
                 " | ".join(
-                    f"{stem}: {score:.3f}" if score is not None else f"{stem}: inactive"
-                    for stem, score in zip(STEMS, scores)
+                    f"{stem}: {sdr:.2f}/{msr:.2f}"
+                    if sdr is not None and msr is not None
+                    else f"{stem}: inactive"
+                    for stem, sdr, msr in zip(STEMS, sdr_scores, msr_scores)
                 )
             )
         except Exception as error:
             print(f"\nSkipping {track_dir}: {error}")
 
-    if valid_tracks == 0 or not any(per_stem_track_scores):
-        return [0.0 for _ in STEMS], None
-    means = [
-        sum(scores) / len(scores) if scores else float("nan")
-        for scores in per_stem_track_scores
+    if valid_tracks == 0 or not any(per_stem_records):
+        return [0.0 for _ in STEMS], None, []
+
+    def stem_values(key: str) -> list[list[float]]:
+        return [
+            [record[key] for record in records if key in record]
+            for records in per_stem_records
+        ]
+
+    def stem_means(values: list[list[float]]) -> list[float]:
+        return [
+            sum(row) / len(row) if row else float("nan") for row in values
+        ]
+
+    def combined_mean(values: list[list[float]]) -> float | None:
+        flat = [value for row in values for value in row if math.isfinite(value)]
+        return sum(flat) / len(flat) if flat else None
+
+    sdr_values = stem_values("sdr")
+    msr_values = stem_values("msr")
+    blended = [
+        [blend_score(sdr, msr) for sdr, msr in zip(sdr_row, msr_row)]
+        for sdr_row, msr_row in zip(sdr_values, msr_values)
     ]
-    all_scores = [
-        score
-        for scores in per_stem_track_scores
-        for score in scores
-        if math.isfinite(score)
-    ]
-    combined = sum(all_scores) / len(all_scores) if all_scores else None
-    return means, combined
+    return stem_means(blended), combined_mean(blended), stem_means(sdr_values)
 
 
 # -----------------------------------------------------------------------------
@@ -2728,9 +2969,10 @@ def train(
         enabled=device.type == "cuda" and args.precision == "fp16",
     )
     step = 0
-    best_sdr = -float("inf")
+    best_score = -float("inf")
     avg_loss = 0.0
     checkpoint_data: dict | None = None
+    validation_metric = BLEND_VALIDATION_METRIC
 
     if checkpoint_path:
         checkpoint_data = torch.load(
@@ -2745,7 +2987,7 @@ def train(
             )
         # A true continuation must resume the raw trainable weights alongside
         # optimizer/EMA state, not replace them with averaged weights.
-        model_state = checkpoint_data.get("model_state_dict", checkpoint_data)
+        model_state = checkpoint_data["model_state_dict"]
         report = load_matching_state_dict(model, model_state)
         if not report.is_exact:
             raise RuntimeError(
@@ -2760,21 +3002,20 @@ def train(
     ema = EMA(model, decay=args.ema_decay)
 
     if checkpoint_data is not None:
-        if "ema_state_dict" in checkpoint_data:
-            ema_report = ema.load_state_dict(
-                checkpoint_data["ema_state_dict"],
-                updates=int(checkpoint_data.get("ema_updates", 0)),
+        ema_report = ema.load_state_dict(
+            checkpoint_data["ema_state_dict"],
+            updates=int(checkpoint_data["ema_updates"]),
+        )
+        if not ema_report.is_exact:
+            raise RuntimeError(
+                "Exact model checkpoint has an incomplete EMA state: "
+                f"{ema_report.matched}/{ema_report.expected} tensors matched."
             )
-            if not ema_report.is_exact:
-                raise RuntimeError(
-                    "Exact model checkpoint has an incomplete EMA state: "
-                    f"{ema_report.matched}/{ema_report.expected} tensors matched."
-                )
-            print(f"Loaded complete EMA state at update {ema.updates}.")
+        print(f"Loaded complete EMA state at update {ema.updates}.")
 
-        step = int(checkpoint_data.get("step", 0))
-        best_sdr = float(checkpoint_data.get("best_sdr", best_sdr))
-        avg_loss = float(checkpoint_data.get("avg_loss", 0.0))
+        step = int(checkpoint_data["step"])
+        best_score = float(checkpoint_data["best_score"])
+        avg_loss = float(checkpoint_data["avg_loss"])
 
         if args.reset_optimizer:
             print(
@@ -2802,8 +3043,7 @@ def train(
                 group["lr"] = 1.0
                 group["weight_decay"] = args.weight_decay
 
-        if "scaler_state_dict" in checkpoint_data:
-            scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
+        scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
         # Free the large checkpoint dict (model+ema+optimizer ~1GB on CPU)
         # to avoid overnight RSS growth. Without this the dict stays alive
         # for the entire training run.
@@ -2815,18 +3055,18 @@ def train(
         best_checkpoint = find_best_checkpoint(
             "best_ckpts",
             model.config,
-            validation_metric=VALIDATION_METRIC,
+            validation_metric=validation_metric,
         )
-        best_checkpoint_sdr = (
-            checkpoint_sdr_from_path(best_checkpoint)
+        best_checkpoint_score = (
+            checkpoint_score_from_path(best_checkpoint)
             if best_checkpoint is not None
             else None
         )
-        if best_checkpoint_sdr is not None and best_checkpoint_sdr > best_sdr:
-            best_sdr = best_checkpoint_sdr
+        if best_checkpoint_score is not None and best_checkpoint_score > best_score:
+            best_score = best_checkpoint_score
             print(
-                f"Recovered newer best SDR {best_sdr:.4f} dB from "
-                f"{best_checkpoint}."
+                f"Recovered newer best {validation_metric} score "
+                f"{best_score:.4f} from {best_checkpoint}."
             )
         optimizer_status = "Fresh" if args.reset_optimizer else "Resuming"
         active_slice_p = int(optimizer.param_groups[0]["slice_p"])
@@ -2837,7 +3077,7 @@ def train(
         )
 
     if args.compile:
-        model.encoder.compile_layers(mode="default")
+        model.encoder.compile_layers()
         print(
             f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
             "transformer units; activation checkpoint boundaries remain eager."
@@ -2949,25 +3189,40 @@ def train(
         progress.set_description(
             f"Step {step} | loss {accumulated_loss:.4f} | avg {avg_loss:.4f} "
             f"| lr {current_lr:.2e} | grad {float(grad_norm):.2f} "
-            f"| best {best_sdr:.4f}",
+            f"| best {best_score:.4f}",
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
+            (
+                wave,
+                main_stft,
+                mrstft,
+                full,
+                synth,
+                vocal_db,
+                residual_db,
+                overlap,
+            ) = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
+                    latest_metrics["full"],
+                    latest_metrics["synth"],
                     latest_metrics["vocal_level_db"],
-                    latest_metrics["vocal_mask_mag"],
+                    latest_metrics["residual_db"],
+                    latest_metrics["overlap"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
                 wave=f"{wave:.3f}",
                 stft=f"{main_stft:.3f}",
                 mr=f"{mrstft:.3f}",
+                full=f"{full:.3f}",
+                synth=f"{synth:.3f}",
                 vdb=f"{vocal_db:+.1f}",
-                vmask=f"{mask_mag:.3f}",
+                rdb=f"{residual_db:+.1f}",
+                ovl=f"{overlap:.2f}",
                 refresh=False,
             )
         progress.update(1)
@@ -2981,10 +3236,10 @@ def train(
                 optimizer,
                 scaler,
                 step,
-                best_sdr,
+                best_score,
                 avg_loss,
             )
-            prune_old_checkpoints("ckpts", keep=3, config=model.config)
+            prune_old_checkpoints("ckpts", 3, model.config)
 
             with ema.average_parameters():
                 # The transformer units are compiled for training with gradients
@@ -2998,7 +3253,7 @@ def train(
                     else contextlib.nullcontext()
                 )
                 with compiler_context:
-                    stem_scores, combined_sdr = validate(
+                    stem_scores, combined_score, raw_sdr = validate(
                         model,
                         args.test_dir,
                         device,
@@ -3007,25 +3262,33 @@ def train(
                         precision=args.precision,
                     )
 
-            improved = combined_sdr is not None and combined_sdr > best_sdr
-            if combined_sdr is None:
-                print("\nValidation produced no valid tracks; best SDR was not changed.")
+            improved = combined_score is not None and combined_score > best_score
+            if combined_score is None:
+                print(
+                    "\nValidation produced no valid tracks; the best score was "
+                    "not changed."
+                )
             else:
                 score_text = ", ".join(
-                    f"{stem}: {score:.4f} dB"
+                    f"{stem}: {score:.4f}"
                     for stem, score in zip(STEMS, stem_scores)
                 )
-                print(
-                    f"\nValidation step {step} "
-                    "(EMA, mean full-track SDR): "
-                    f"{score_text}, combined: {combined_sdr:.4f} dB"
+                sdr_text = ", ".join(
+                    f"{stem}: {score:.4f} dB"
+                    for stem, score in zip(STEMS, raw_sdr)
                 )
+                print(
+                    f"\nValidation step {step} (EMA, {validation_metric}): "
+                    f"{score_text}, combined: {combined_score:.4f}"
+                )
+                print(f"  SDR for reference: {sdr_text}")
                 if improved:
-                    best_sdr = combined_sdr
+                    best_score = combined_score
 
-            if improved and combined_sdr is not None:
+            if improved and combined_score is not None:
                 best_path = (
-                    f"best_ckpts/checkpoint_step_{step}_sdr_{combined_sdr:.4f}.pt"
+                    f"best_ckpts/checkpoint_step_{step}_"
+                    f"{BEST_CHECKPOINT_METRIC_LABEL}_{combined_score:.4f}.pt"
                 )
                 save_checkpoint(
                     best_path,
@@ -3034,15 +3297,15 @@ def train(
                     optimizer,
                     scaler,
                     step,
-                    best_sdr,
+                    best_score,
                     avg_loss,
                 )
-                prune_old_checkpoints(
-                    "best_ckpts", keep=1, config=model.config
-                )
+                prune_old_checkpoints("best_ckpts", 1, model.config)
                 print(f"New best checkpoint: {best_path}\n")
-            elif combined_sdr is not None:
-                print(f"Best combined SDR remains {best_sdr:.4f} dB.\n")
+            elif combined_score is not None:
+                print(
+                    f"Best {validation_metric} remains {best_score:.4f}.\n"
+                )
             # Validation loads full tracks + checkpoints on CPU; ensure
             # memory is returned to OS instead of accumulating overnight.
             gc.collect()
@@ -3074,10 +3337,10 @@ def train(
             optimizer,
             scaler,
             step,
-            best_sdr,
+            best_score,
             avg_loss,
         )
-        prune_old_checkpoints("ckpts", keep=3, config=model.config)
+        prune_old_checkpoints("ckpts", 3, model.config)
         print(f"Training stopped cleanly; checkpoint saved to {stopped_path}.")
 
 
@@ -3103,22 +3366,20 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
     )
 
 
-def inspect_checkpoint_config(
-    checkpoint_path: str,
-    fallback: ModelConfig,
-) -> ModelConfig:
+def inspect_checkpoint_config(checkpoint_path: str) -> ModelConfig:
     checkpoint_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     try:
-        saved_stems = tuple(checkpoint_data.get("stems", STEMS))
+        saved_stems = tuple(checkpoint_data["stems"])
         if saved_stems != STEMS:
             raise ValueError(
                 f"Checkpoint stems {saved_stems} do not match this script's STEMS {STEMS}."
             )
-        config_data = checkpoint_data.get("model_config")
-        if not config_data:
-            return fallback
         valid_fields = ModelConfig.__dataclass_fields__.keys()
-        filtered = {key: value for key, value in config_data.items() if key in valid_fields}
+        filtered = {
+            key: value
+            for key, value in checkpoint_data["model_config"].items()
+            if key in valid_fields
+        }
         return ModelConfig(**filtered)
     finally:
         del checkpoint_data
@@ -3131,10 +3392,7 @@ def load_inference_weights(
 ) -> None:
     checkpoint_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     try:
-        state = checkpoint_data.get("ema_state_dict") or checkpoint_data.get("model_state_dict")
-        if state is None:
-            state = checkpoint_data
-        report = load_matching_state_dict(model, state)
+        report = load_matching_state_dict(model, checkpoint_data["ema_state_dict"])
         if not report.is_exact:
             raise RuntimeError(
                 "Checkpoint architecture mismatch: "
@@ -3164,8 +3422,9 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "124-band regular BS-RoFormer with axial attention, "
-            "foreground-residual separation, and silence-focused training"
+            "124-band regular BS-RoFormer with axial attention that synthesizes "
+            "both stems outright: a complex mask plus a free complex residual, "
+            "trained without SDR so overlapping regions stay full"
         )
     )
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -3295,14 +3554,22 @@ def main() -> None:
                     "Use --fresh to start a new run instead."
                 )
         elif args.infer:
-            checkpoint_path = (
-                find_latest_compatible_checkpoint(config, "ckpts")
-                if args.latest
-                else find_best_checkpoint("best_ckpts", config)
-            )
+            if args.latest:
+                checkpoint_path = find_latest_compatible_checkpoint(config, "ckpts")
+            else:
+                checkpoint_path = find_best_checkpoint(
+                    "best_ckpts",
+                    config,
+                    validation_metric=BLEND_VALIDATION_METRIC,
+                )
+                if checkpoint_path is None:
+                    # No best checkpoint scored on the blend (older runs
+                    # selected on a different metric).  Falling back to the
+                    # best of any metric beats refusing to run.
+                    checkpoint_path = find_best_checkpoint("best_ckpts", config)
 
     if args.infer and checkpoint_path:
-        config = inspect_checkpoint_config(checkpoint_path, config)
+        config = inspect_checkpoint_config(checkpoint_path)
         # Keep chunk timing tied to the checkpoint sample rate.
         args.segment_samples = int(round(args.segment_seconds * config.sample_rate))
         args.inference_overlap = int(

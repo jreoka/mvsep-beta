@@ -143,9 +143,11 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
     if tuple(data.get("stems", ())) != tuple(mvsep.STEMS):
         return False
 
-    expected_metric = getattr(mvsep, "VALIDATION_METRIC", None)
+    expected_metric = getattr(mvsep, "BLEND_VALIDATION_METRIC", None)
     saved_metric = data.get("validation_metric")
     if expected_metric is not None and saved_metric not in (None, expected_metric):
+        return False
+    if data.get("checkpoint_format_version", 0) < getattr(mvsep, "CHECKPOINT_FORMAT_VERSION", 0):
         return False
     return True
 
@@ -174,7 +176,7 @@ def resolve_checkpoint(args: argparse.Namespace, main_dir: Path, mvsep: Any) -> 
         candidates = compatible_checkpoints(main_dir / "best_ckpts", mvsep, "*.pt")
         scored: list[tuple[float, Path]] = []
         for path in candidates:
-            score = mvsep.checkpoint_sdr_from_path(path)
+            score = mvsep.checkpoint_score_from_path(path)
             if score is not None:
                 scored.append((float(score), path))
         checkpoint = max(scored, key=lambda item: item[0])[1].resolve() if scored else Path()
@@ -191,8 +193,7 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
     """Load the reviewed separator module and its inference checkpoint."""
     mvsep, main_dir, model_script = load_mvsep_module()
     checkpoint = resolve_checkpoint(args, main_dir, mvsep)
-    fallback = mvsep.ModelConfig(use_checkpoint=False)
-    config = mvsep.inspect_checkpoint_config(str(checkpoint), fallback)
+    config = mvsep.inspect_checkpoint_config(str(checkpoint))
     config.use_checkpoint = False
 
     if tuple(mvsep.STEMS) != ("vocals", "other"):
