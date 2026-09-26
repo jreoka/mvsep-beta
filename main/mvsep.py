@@ -92,6 +92,16 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
+    # High-frequency emphasis (de-muffling): the vocal mask owns every
+    # uncertain TF bin while the magnitude-weighted losses ignore high bins,
+    # so the accompaniment loses its top end where the voice was. This term
+    # scores only the highpassed signal with relative (energy-normalized)
+    # losses, so missing top-end energy is penalized no matter how quiet it
+    # is. It ramps in from zero anchored at the first step it is seen, so
+    # resuming mid-training does not shock the optimizer.
+    hf_weight: float = 0.5
+    hf_cutoff_hz: float = 4000.0
+    hf_ramp_steps: int = 50000
 
 
 # -----------------------------------------------------------------------------
@@ -1014,6 +1024,20 @@ def frame_mean_square(
     return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
 
 
+def highpass_filter(
+    audio: torch.Tensor, cutoff_hz: float, sample_rate: int
+) -> torch.Tensor:
+    """Zero-phase highpass via FFT with a raised-cosine rolloff over the
+    half-octave below the cutoff. No phase distortion, no new dependencies."""
+    n = audio.shape[-1]
+    spec = torch.fft.rfft(audio, n=n)
+    freqs = torch.fft.rfftfreq(n, d=1.0 / sample_rate).to(spec.device)
+    lo = cutoff_hz / (2**0.5)
+    t = ((freqs - lo) / (cutoff_hz - lo)).clamp(0.0, 1.0)
+    filt = 0.5 - 0.5 * torch.cos(torch.pi * t)
+    return torch.fft.irfft(spec * filt, n=n)
+
+
 class SeparationLoss(nn.Module):
     def __init__(self, model_config: ModelConfig, loss_config: LossConfig):
         super().__init__()
@@ -1021,6 +1045,10 @@ class SeparationLoss(nn.Module):
         self.loss_config = loss_config
         self.mrstft = MultiResolutionSTFTLoss()
         self.activity_threshold = 1e-4
+        # First global step at which the HF term is seen; the ramp anchors
+        # here. Plain attribute (not a buffer): the loss module is rebuilt
+        # every run, so there is nothing to checkpoint.
+        self._hf_anchor_step: int | None = None
         self.register_buffer(
             "window", torch.hann_window(model_config.win_length), persistent=False
         )
@@ -1030,6 +1058,7 @@ class SeparationLoss(nn.Module):
         model: BSRoFormerSeparator,
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
+        global_step: int | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         masks = model(mixture_spec)
         estimates = masks * mixture_spec[:, None]
@@ -1083,6 +1112,56 @@ class SeparationLoss(nn.Module):
         )
 
         cfg = self.loss_config
+
+        # --- high-frequency emphasis: de-muffle the accompaniment ---
+        # The vocal mask owns every uncertain TF bin while the
+        # magnitude-weighted losses ignore high bins, so the accompaniment
+        # loses its top end where the voice was. Scoring only the highpassed
+        # signal with relative (energy-normalized) losses penalizes missing
+        # top-end energy no matter how quiet it is — on both stems, so highs
+        # stolen into the vocal stem are penalized too. The weight ramps in
+        # from zero anchored at the first step the term is seen, so resuming
+        # mid-training does not shock the optimizer.
+        hf_loss = pred_audio.new_tensor(0.0)
+        hf_effective_weight = 0.0
+        if cfg.hf_weight > 0.0:
+            if self._hf_anchor_step is None and global_step is not None:
+                self._hf_anchor_step = global_step
+            anchor = self._hf_anchor_step if self._hf_anchor_step is not None else 0
+            step_now = global_step if global_step is not None else 0
+            if cfg.hf_ramp_steps > 0:
+                ramp = (step_now - anchor) / cfg.hf_ramp_steps
+                ramp = min(1.0, max(0.0, ramp))
+            else:
+                ramp = 1.0
+            hf_effective_weight = cfg.hf_weight * ramp
+            if hf_effective_weight > 0.0:
+                hp_pred = highpass_filter(
+                    pred_audio.float(), cfg.hf_cutoff_hz, self.model_config.sample_rate
+                )
+                hp_target = highpass_filter(
+                    target_audio.float(), cfg.hf_cutoff_hz, self.model_config.sample_rate
+                )
+                hf_wave = normalized_l1(hp_pred, hp_target)
+                hp_pred_spec = make_stft(
+                    hp_pred,
+                    n_fft=self.model_config.n_fft,
+                    hop_length=self.model_config.hop_length,
+                    win_length=self.model_config.win_length,
+                    window=self.window,
+                )
+                hp_target_spec = make_stft(
+                    hp_target,
+                    n_fft=self.model_config.n_fft,
+                    hop_length=self.model_config.hop_length,
+                    win_length=self.model_config.win_length,
+                    window=self.window,
+                )
+                hf_logmag = F.l1_loss(
+                    torch.log1p(hp_pred_spec.abs()), torch.log1p(hp_target_spec.abs())
+                )
+                hf_loss = hf_wave + hf_logmag
+
         total = (
             cfg.waveform_weight * wave_loss
             + cfg.main_stft_weight * main_stft_loss
@@ -1090,6 +1169,7 @@ class SeparationLoss(nn.Module):
             + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
+            + hf_effective_weight * hf_loss
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1114,6 +1194,8 @@ class SeparationLoss(nn.Module):
             "mask": mask_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
+            "hf": hf_loss.detach(),
+            "hf_w": pred_audio.new_tensor(hf_effective_weight),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
         }
@@ -2905,6 +2987,7 @@ def train(
                     model,
                     mixture_spec,
                     target_audio,
+                    global_step=step,
                 )
                 scaled_loss = loss / args.grad_accumulation
 
@@ -2953,11 +3036,13 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
+            wave, main_stft, mrstft, hf, hf_w, vocal_db, mask_mag = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
+                    latest_metrics["hf"],
+                    latest_metrics["hf_w"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
                 )
@@ -2966,6 +3051,8 @@ def train(
                 wave=f"{wave:.3f}",
                 stft=f"{main_stft:.3f}",
                 mr=f"{mrstft:.3f}",
+                hf=f"{hf:.3f}",
+                hfw=f"{hf_w:.2f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
                 refresh=False,
