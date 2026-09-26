@@ -3296,7 +3296,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
-    parser.add_argument("--checkpoint_steps", type=int, default=4_000)
+    parser.add_argument("--checkpoint_steps", type=int, default=8_000)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument(
         "--slice_p",
