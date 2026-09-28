@@ -92,32 +92,6 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
-    # High-frequency emphasis (de-muffling): the vocal mask owns every
-    # uncertain TF bin while the magnitude-weighted losses ignore high bins,
-    # so the accompaniment loses its top end where the voice was. This term
-    # scores only the highpassed signal with relative (energy-normalized)
-    # losses, so missing top-end energy is penalized no matter how quiet it
-    # is. It ramps in from zero anchored at the first step it is seen, so
-    # resuming mid-training does not shock the optimizer.
-    hf_weight: float = 0.5
-    hf_cutoff_hz: float = 4000.0
-    # Multi-band detail emphasis: the HF term above generalizes to full-spectrum
-    # coverage. Each band is scored with relative (energy-normalized) losses, so
-    # the model must render fine detail in every band no matter how quiet it is
-    # — mids that sound muddy, and lows you can't easily judge by ear, get the
-    # same structural supervision the top end got. The low band runs at a
-    # gentler weight on purpose: a relative loss down there would otherwise
-    # spend capacity reproducing rumble and mic noise in loving detail. All
-    # bands share the ramp: weights rise 0 -> full over band_ramp_steps,
-    # anchored per band at the first step the term is seen, so resuming
-    # mid-training does not shock the optimizer.
-    low_weight: float = 0.25
-    low_lo_hz: float = 20.0
-    low_hi_hz: float = 300.0
-    mid_weight: float = 0.5
-    mid_lo_hz: float = 300.0
-    mid_hi_hz: float = 4000.0
-    band_ramp_steps: int = 50000
 
 
 # -----------------------------------------------------------------------------
@@ -1040,41 +1014,6 @@ def frame_mean_square(
     return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
 
 
-def bandpass_filter(
-    audio: torch.Tensor, lo_hz: float, hi_hz: float, sample_rate: int
-) -> torch.Tensor:
-    """Zero-phase bandpass via FFT with raised-cosine rolloffs over the
-    half-octave outside each edge. Same construction as highpass_filter,
-    generalized: the response is the highpass curve for ``lo_hz`` times the
-    mirrored lowpass curve for ``hi_hz``. No phase distortion, no new
-    dependencies. Pass ``hi_hz`` >= Nyquist for a pure highpass."""
-    n = audio.shape[-1]
-    spec = torch.fft.rfft(audio, n=n)
-    freqs = torch.fft.rfftfreq(n, d=1.0 / sample_rate).to(spec.device)
-    nyquist = sample_rate / 2.0
-    # Low skirt: 0 below lo/sqrt(2), raised cosine up to 1 at lo.
-    lo_edge = lo_hz / (2**0.5)
-    t_lo = ((freqs - lo_edge) / max(lo_hz - lo_edge, 1e-6)).clamp(0.0, 1.0)
-    lo_filt = 0.5 - 0.5 * torch.cos(torch.pi * t_lo)
-    # High skirt: 1 up to hi/sqrt(2), raised cosine down to 0 at hi.
-    # Skipped entirely when hi is at/above Nyquist (pure highpass).
-    if hi_hz >= nyquist:
-        hi_filt = torch.ones_like(freqs)
-    else:
-        hi_edge = hi_hz / (2**0.5)
-        t_hi = ((freqs - hi_edge) / max(hi_hz - hi_edge, 1e-6)).clamp(0.0, 1.0)
-        hi_filt = 0.5 + 0.5 * torch.cos(torch.pi * t_hi)
-    return torch.fft.irfft(spec * lo_filt * hi_filt, n=n)
-
-
-def highpass_filter(
-    audio: torch.Tensor, cutoff_hz: float, sample_rate: int
-) -> torch.Tensor:
-    """Zero-phase highpass via FFT with a raised-cosine rolloff over the
-    half-octave below the cutoff. Thin wrapper over bandpass_filter."""
-    return bandpass_filter(audio, cutoff_hz, sample_rate / 2.0, sample_rate)
-
-
 class SeparationLoss(nn.Module):
     def __init__(self, model_config: ModelConfig, loss_config: LossConfig):
         super().__init__()
@@ -1082,14 +1021,6 @@ class SeparationLoss(nn.Module):
         self.loss_config = loss_config
         self.mrstft = MultiResolutionSTFTLoss()
         self.activity_threshold = 1e-4
-        # First global step at which each band-detail term is seen; the ramp
-        # anchors here. Plain attributes (not buffers): the loss module is
-        # rebuilt every run, so there is nothing to checkpoint.
-        self._band_anchor_steps: dict[str, int | None] = {
-            "low": None,
-            "mid": None,
-            "high": None,
-        }
         self.register_buffer(
             "window", torch.hann_window(model_config.win_length), persistent=False
         )
@@ -1099,7 +1030,6 @@ class SeparationLoss(nn.Module):
         model: BSRoFormerSeparator,
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
-        global_step: int | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         masks = model(mixture_spec)
         estimates = masks * mixture_spec[:, None]
@@ -1153,73 +1083,6 @@ class SeparationLoss(nn.Module):
         )
 
         cfg = self.loss_config
-
-        # --- multi-band detail emphasis: full-spectrum coverage ---
-        # Generalizes the HF de-muffling term to every band. Each band is
-        # scored on its own with relative (energy-normalized) losses, so the
-        # model must render fine detail in the band no matter how quiet it is
-        # — muddy mids and hard-to-judge lows get the same structural
-        # supervision the top end got, on both stems (detail stolen into the
-        # wrong stem is penalized too). The recipe per band mirrors the proven
-        # HF term — relative waveform L1 + log-magnitude L1 — plus a
-        # phase-aware complex term, since smeared phase is shared by both
-        # stems and reads as mud. Each band's weight ramps in from zero
-        # anchored at the first step the term is seen, so resuming
-        # mid-training does not shock the optimizer.
-        sample_rate = self.model_config.sample_rate
-        bands = (
-            ("low", cfg.low_lo_hz, cfg.low_hi_hz, cfg.low_weight),
-            ("mid", cfg.mid_lo_hz, cfg.mid_hi_hz, cfg.mid_weight),
-            ("high", cfg.hf_cutoff_hz, sample_rate / 2.0, cfg.hf_weight),
-        )
-        band_losses: dict[str, torch.Tensor] = {}
-        band_weights: dict[str, float] = {}
-        for band_name, lo_hz, hi_hz, band_weight in bands:
-            band_losses[band_name] = pred_audio.new_tensor(0.0)
-            band_weights[band_name] = 0.0
-            if band_weight <= 0.0:
-                continue
-            if self._band_anchor_steps[band_name] is None and global_step is not None:
-                self._band_anchor_steps[band_name] = global_step
-            anchor = self._band_anchor_steps[band_name]
-            anchor = anchor if anchor is not None else 0
-            step_now = global_step if global_step is not None else 0
-            if cfg.band_ramp_steps > 0:
-                ramp = (step_now - anchor) / cfg.band_ramp_steps
-                ramp = min(1.0, max(0.0, ramp))
-            else:
-                ramp = 1.0
-            effective_weight = band_weight * ramp
-            band_weights[band_name] = effective_weight
-            if effective_weight > 0.0:
-                bp_pred = bandpass_filter(
-                    pred_audio.float(), lo_hz, hi_hz, sample_rate
-                )
-                bp_target = bandpass_filter(
-                    target_audio.float(), lo_hz, hi_hz, sample_rate
-                )
-                bp_wave = normalized_l1(bp_pred, bp_target)
-                bp_pred_spec = make_stft(
-                    bp_pred,
-                    n_fft=self.model_config.n_fft,
-                    hop_length=self.model_config.hop_length,
-                    win_length=self.model_config.win_length,
-                    window=self.window,
-                )
-                bp_target_spec = make_stft(
-                    bp_target,
-                    n_fft=self.model_config.n_fft,
-                    hop_length=self.model_config.hop_length,
-                    win_length=self.model_config.win_length,
-                    window=self.window,
-                )
-                bp_logmag = F.l1_loss(
-                    torch.log1p(bp_pred_spec.abs()), torch.log1p(bp_target_spec.abs())
-                )
-                bp_target_mag = bp_target_spec.abs()
-                bp_complex = (bp_pred_spec - bp_target_spec).abs().mean() / bp_target_mag.mean().detach().clamp_min(1e-4)
-                band_losses[band_name] = bp_wave + bp_logmag + 0.5 * bp_complex
-
         total = (
             cfg.waveform_weight * wave_loss
             + cfg.main_stft_weight * main_stft_loss
@@ -1227,9 +1090,6 @@ class SeparationLoss(nn.Module):
             + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
-            + band_weights["low"] * band_losses["low"]
-            + band_weights["mid"] * band_losses["mid"]
-            + band_weights["high"] * band_losses["high"]
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1254,12 +1114,6 @@ class SeparationLoss(nn.Module):
             "mask": mask_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
-            "low": band_losses["low"].detach(),
-            "low_w": pred_audio.new_tensor(band_weights["low"]),
-            "mid": band_losses["mid"].detach(),
-            "mid_w": pred_audio.new_tensor(band_weights["mid"]),
-            "hf": band_losses["high"].detach(),
-            "hf_w": pred_audio.new_tensor(band_weights["high"]),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
         }
@@ -3051,7 +2905,6 @@ def train(
                     model,
                     mixture_spec,
                     target_audio,
-                    global_step=step,
                 )
                 scaled_loss = loss / args.grad_accumulation
 
@@ -3100,15 +2953,11 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, low, mid, hf, hf_w, vocal_db, mask_mag = torch.stack(
+            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
-                    latest_metrics["low"],
-                    latest_metrics["mid"],
-                    latest_metrics["hf"],
-                    latest_metrics["hf_w"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
                 )
@@ -3117,10 +2966,6 @@ def train(
                 wave=f"{wave:.3f}",
                 stft=f"{main_stft:.3f}",
                 mr=f"{mrstft:.3f}",
-                low=f"{low:.3f}",
-                mid=f"{mid:.3f}",
-                hf=f"{hf:.3f}",
-                hfw=f"{hf_w:.2f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
                 refresh=False,
@@ -3364,7 +3209,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
-    parser.add_argument("--checkpoint_steps", type=int, default=8_000)
+    parser.add_argument("--checkpoint_steps", type=int, default=4_000)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument(
         "--slice_p",
