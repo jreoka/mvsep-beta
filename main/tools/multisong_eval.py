@@ -220,7 +220,7 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
 
     model = mvsep.BSRoFormerSeparator(config)
     for module in model.modules():
-        if isinstance(module, mvsep.RoPEAttention):
+        if isinstance(module, mvsep.DifferentialRoPEAttention):
             module.attention_backend = args.attention_backend
     mvsep.load_inference_weights(model, str(checkpoint))
     model.to(device).eval()

@@ -45,7 +45,7 @@ class ModelConfig:
     num_stems: int = len(STEMS)
     num_bands: int = 124
     dim: int = 384
-    depth: int = 14
+    depth: int = 10
     heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
@@ -92,32 +92,6 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
-    # High-frequency emphasis (de-muffling): the vocal mask owns every
-    # uncertain TF bin while the magnitude-weighted losses ignore high bins,
-    # so the accompaniment loses its top end where the voice was. This term
-    # scores only the highpassed signal with relative (energy-normalized)
-    # losses, so missing top-end energy is penalized no matter how quiet it
-    # is. It ramps in from zero anchored at the first step it is seen, so
-    # resuming mid-training does not shock the optimizer.
-    hf_weight: float = 0.5
-    hf_cutoff_hz: float = 4000.0
-    # Multi-band detail emphasis: the HF term above generalizes to full-spectrum
-    # coverage. Each band is scored with relative (energy-normalized) losses, so
-    # the model must render fine detail in every band no matter how quiet it is
-    # — mids that sound muddy, and lows you can't easily judge by ear, get the
-    # same structural supervision the top end got. The low band runs at a
-    # gentler weight on purpose: a relative loss down there would otherwise
-    # spend capacity reproducing rumble and mic noise in loving detail. All
-    # bands share the ramp: weights rise 0 -> full over band_ramp_steps,
-    # anchored per band at the first step the term is seen, so resuming
-    # mid-training does not shock the optimizer.
-    low_weight: float = 0.25
-    low_lo_hz: float = 20.0
-    low_hi_hz: float = 300.0
-    mid_weight: float = 0.5
-    mid_lo_hz: float = 300.0
-    mid_hi_hz: float = 4000.0
-    band_ramp_steps: int = 50000
 
 
 # -----------------------------------------------------------------------------
@@ -399,12 +373,30 @@ class SwiGLU(nn.Module):
         return self.dropout(self.out_proj(F.silu(gate) * value))
 
 
-class RoPEAttention(nn.Module):
+class DifferentialRoPEAttention(nn.Module):
+    """Differential attention with RoPE and QK-Norm.
+
+    Trades extra compute for quality in two ways:
+
+    1. Differential attention: two softmax maps per head are computed and
+       subtracted: (softmax(Q1 K1^T) - λ softmax(Q2 K2^T)) V. The subtraction
+       cancels common-mode attention noise, sharpening focus (Ye et al.,
+       "Differential Transformer", 2024). λ is learned per head.
+    2. QK-Norm: queries and keys are RMS-normalized after RoPE, keeping
+       logits stable so attention can stay sharp without blowing up.
+
+    Uses SDPA (flash attention) for both maps: the n×n scores are never
+    materialized, keeping memory flat. (Talking-heads was removed: it needs
+    the raw logits, forcing manual attention whose n×n matrices explode VRAM
+    on the time path where effective batch = batch × 124 bands.)
+    """
+
     def __init__(
         self,
         dim: int,
         heads: int,
         dropout: float = 0.0,
+        lambda_init: float = 0.8,
     ):
         super().__init__()
         if dim % heads != 0:
@@ -412,8 +404,19 @@ class RoPEAttention(nn.Module):
         self.heads = heads
         self.head_dim = dim // heads
         self.dropout = dropout
+        self.lambda_init = lambda_init
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        # Q and K each get 2x head_dim per head (split into Q1/Q2 and K1/K2);
+        # V keeps the standard single head_dim.
+        self.qkv = nn.Linear(dim, dim * 5, bias=False)
+        self.lambda_q1 = nn.Parameter(torch.zeros(heads, self.head_dim))
+        self.lambda_k1 = nn.Parameter(torch.zeros(heads, self.head_dim))
+        self.lambda_q2 = nn.Parameter(torch.zeros(heads, self.head_dim))
+        self.lambda_k2 = nn.Parameter(torch.zeros(heads, self.head_dim))
+        # QK-Norm: separate norms for queries and keys.
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.head_norm = nn.RMSNorm(self.head_dim)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.out_dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
@@ -423,26 +426,55 @@ class RoPEAttention(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
         batch, length, dim = x.shape
-        qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+
+        # Learned per-head differential weight. Starts at lambda_init
+        # (all lambda_* are zero-initialized) and adapts during training.
+        lamb = (
+            torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1))
+            - torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1))
+            + self.lambda_init
+        )  # (heads,)
+
+        qkv = self.qkv(x)
+        q, k, v = qkv.split([dim * 2, dim * 2, dim], dim=-1)
+
+        q = q.reshape(batch, length, self.heads, 2 * self.head_dim)
+        q1, q2 = q.chunk(2, dim=-1)
+        k = k.reshape(batch, length, self.heads, 2 * self.head_dim)
+        k1, k2 = k.chunk(2, dim=-1)
+        v = v.reshape(batch, length, self.heads, self.head_dim)
+
+        q1 = q1.transpose(1, 2)
+        q2 = q2.transpose(1, 2)
+        k1 = k1.transpose(1, 2)
+        k2 = k2.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        cos, sin = self.rope(length, x.device, q.dtype)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        cos, sin = self.rope(length, x.device, q1.dtype)
+        q1 = apply_rope(q1, cos, sin)
+        q2 = apply_rope(q2, cos, sin)
+        k1 = apply_rope(k1, cos, sin)
+        k2 = apply_rope(k2, cos, sin)
+
+        # QK-Norm after RoPE: bounded, stable logits.
+        q1 = self.q_norm(q1)
+        q2 = self.q_norm(q2)
+        k1 = self.k_norm(k1)
+        k2 = self.k_norm(k2)
 
         attention_dropout = self.dropout if self.training else 0.0
-        # PyTorch SDPA selects the best available kernel per call (flash,
-        # cuDNN, memory-efficient, or math fallback) with no manual tuning.
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=attention_dropout,
-            is_causal=False,
+        # Two SDPA passes: flash attention never materializes n×n scores.
+        a1 = F.scaled_dot_product_attention(
+            q1, k1, v, dropout_p=attention_dropout, is_causal=False,
         )
+        a2 = F.scaled_dot_product_attention(
+            q2, k2, v, dropout_p=attention_dropout, is_causal=False,
+        )
+
+        out = a1 - lamb.view(1, -1, 1, 1) * a2
+        # Per-head norm keeps the differential output stable; the
+        # (1 - lambda_init) factor preserves the original signal scale.
+        out = self.head_norm(out) * (1.0 - self.lambda_init)
         out = out.transpose(1, 2).reshape(batch, length, dim)
         return self.out_dropout(self.out_proj(out))
 
@@ -456,7 +488,7 @@ class TransformerUnit(nn.Module):
     ):
         super().__init__()
         self.attn_norm = nn.RMSNorm(dim)
-        self.attn = RoPEAttention(
+        self.attn = DifferentialRoPEAttention(
             dim,
             heads,
             dropout=dropout,
@@ -1040,41 +1072,6 @@ def frame_mean_square(
     return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
 
 
-def bandpass_filter(
-    audio: torch.Tensor, lo_hz: float, hi_hz: float, sample_rate: int
-) -> torch.Tensor:
-    """Zero-phase bandpass via FFT with raised-cosine rolloffs over the
-    half-octave outside each edge. Same construction as highpass_filter,
-    generalized: the response is the highpass curve for ``lo_hz`` times the
-    mirrored lowpass curve for ``hi_hz``. No phase distortion, no new
-    dependencies. Pass ``hi_hz`` >= Nyquist for a pure highpass."""
-    n = audio.shape[-1]
-    spec = torch.fft.rfft(audio, n=n)
-    freqs = torch.fft.rfftfreq(n, d=1.0 / sample_rate).to(spec.device)
-    nyquist = sample_rate / 2.0
-    # Low skirt: 0 below lo/sqrt(2), raised cosine up to 1 at lo.
-    lo_edge = lo_hz / (2**0.5)
-    t_lo = ((freqs - lo_edge) / max(lo_hz - lo_edge, 1e-6)).clamp(0.0, 1.0)
-    lo_filt = 0.5 - 0.5 * torch.cos(torch.pi * t_lo)
-    # High skirt: 1 up to hi/sqrt(2), raised cosine down to 0 at hi.
-    # Skipped entirely when hi is at/above Nyquist (pure highpass).
-    if hi_hz >= nyquist:
-        hi_filt = torch.ones_like(freqs)
-    else:
-        hi_edge = hi_hz / (2**0.5)
-        t_hi = ((freqs - hi_edge) / max(hi_hz - hi_edge, 1e-6)).clamp(0.0, 1.0)
-        hi_filt = 0.5 + 0.5 * torch.cos(torch.pi * t_hi)
-    return torch.fft.irfft(spec * lo_filt * hi_filt, n=n)
-
-
-def highpass_filter(
-    audio: torch.Tensor, cutoff_hz: float, sample_rate: int
-) -> torch.Tensor:
-    """Zero-phase highpass via FFT with a raised-cosine rolloff over the
-    half-octave below the cutoff. Thin wrapper over bandpass_filter."""
-    return bandpass_filter(audio, cutoff_hz, sample_rate / 2.0, sample_rate)
-
-
 class SeparationLoss(nn.Module):
     def __init__(self, model_config: ModelConfig, loss_config: LossConfig):
         super().__init__()
@@ -1082,14 +1079,6 @@ class SeparationLoss(nn.Module):
         self.loss_config = loss_config
         self.mrstft = MultiResolutionSTFTLoss()
         self.activity_threshold = 1e-4
-        # First global step at which each band-detail term is seen; the ramp
-        # anchors here. Plain attributes (not buffers): the loss module is
-        # rebuilt every run, so there is nothing to checkpoint.
-        self._band_anchor_steps: dict[str, int | None] = {
-            "low": None,
-            "mid": None,
-            "high": None,
-        }
         self.register_buffer(
             "window", torch.hann_window(model_config.win_length), persistent=False
         )
@@ -1099,7 +1088,6 @@ class SeparationLoss(nn.Module):
         model: BSRoFormerSeparator,
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
-        global_step: int | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         masks = model(mixture_spec)
         estimates = masks * mixture_spec[:, None]
@@ -1153,73 +1141,6 @@ class SeparationLoss(nn.Module):
         )
 
         cfg = self.loss_config
-
-        # --- multi-band detail emphasis: full-spectrum coverage ---
-        # Generalizes the HF de-muffling term to every band. Each band is
-        # scored on its own with relative (energy-normalized) losses, so the
-        # model must render fine detail in the band no matter how quiet it is
-        # — muddy mids and hard-to-judge lows get the same structural
-        # supervision the top end got, on both stems (detail stolen into the
-        # wrong stem is penalized too). The recipe per band mirrors the proven
-        # HF term — relative waveform L1 + log-magnitude L1 — plus a
-        # phase-aware complex term, since smeared phase is shared by both
-        # stems and reads as mud. Each band's weight ramps in from zero
-        # anchored at the first step the term is seen, so resuming
-        # mid-training does not shock the optimizer.
-        sample_rate = self.model_config.sample_rate
-        bands = (
-            ("low", cfg.low_lo_hz, cfg.low_hi_hz, cfg.low_weight),
-            ("mid", cfg.mid_lo_hz, cfg.mid_hi_hz, cfg.mid_weight),
-            ("high", cfg.hf_cutoff_hz, sample_rate / 2.0, cfg.hf_weight),
-        )
-        band_losses: dict[str, torch.Tensor] = {}
-        band_weights: dict[str, float] = {}
-        for band_name, lo_hz, hi_hz, band_weight in bands:
-            band_losses[band_name] = pred_audio.new_tensor(0.0)
-            band_weights[band_name] = 0.0
-            if band_weight <= 0.0:
-                continue
-            if self._band_anchor_steps[band_name] is None and global_step is not None:
-                self._band_anchor_steps[band_name] = global_step
-            anchor = self._band_anchor_steps[band_name]
-            anchor = anchor if anchor is not None else 0
-            step_now = global_step if global_step is not None else 0
-            if cfg.band_ramp_steps > 0:
-                ramp = (step_now - anchor) / cfg.band_ramp_steps
-                ramp = min(1.0, max(0.0, ramp))
-            else:
-                ramp = 1.0
-            effective_weight = band_weight * ramp
-            band_weights[band_name] = effective_weight
-            if effective_weight > 0.0:
-                bp_pred = bandpass_filter(
-                    pred_audio.float(), lo_hz, hi_hz, sample_rate
-                )
-                bp_target = bandpass_filter(
-                    target_audio.float(), lo_hz, hi_hz, sample_rate
-                )
-                bp_wave = normalized_l1(bp_pred, bp_target)
-                bp_pred_spec = make_stft(
-                    bp_pred,
-                    n_fft=self.model_config.n_fft,
-                    hop_length=self.model_config.hop_length,
-                    win_length=self.model_config.win_length,
-                    window=self.window,
-                )
-                bp_target_spec = make_stft(
-                    bp_target,
-                    n_fft=self.model_config.n_fft,
-                    hop_length=self.model_config.hop_length,
-                    win_length=self.model_config.win_length,
-                    window=self.window,
-                )
-                bp_logmag = F.l1_loss(
-                    torch.log1p(bp_pred_spec.abs()), torch.log1p(bp_target_spec.abs())
-                )
-                bp_target_mag = bp_target_spec.abs()
-                bp_complex = (bp_pred_spec - bp_target_spec).abs().mean() / bp_target_mag.mean().detach().clamp_min(1e-4)
-                band_losses[band_name] = bp_wave + bp_logmag + 0.5 * bp_complex
-
         total = (
             cfg.waveform_weight * wave_loss
             + cfg.main_stft_weight * main_stft_loss
@@ -1227,9 +1148,6 @@ class SeparationLoss(nn.Module):
             + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
-            + band_weights["low"] * band_losses["low"]
-            + band_weights["mid"] * band_losses["mid"]
-            + band_weights["high"] * band_losses["high"]
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1254,12 +1172,6 @@ class SeparationLoss(nn.Module):
             "mask": mask_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
-            "low": band_losses["low"].detach(),
-            "low_w": pred_audio.new_tensor(band_weights["low"]),
-            "mid": band_losses["mid"].detach(),
-            "mid_w": pred_audio.new_tensor(band_weights["mid"]),
-            "hf": band_losses["high"].detach(),
-            "hf_w": pred_audio.new_tensor(band_weights["high"]),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
         }
@@ -2032,6 +1944,9 @@ class StemDataset(Dataset):
         virtual_size: int = 50_000,
         remix_probability: float = 0.5,
         min_activity_rms: float = 1e-4,
+        real_root_dir: str | None = None,
+        real_weight: float = 1.0,
+        real_track_list: str | None = None,
     ):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
@@ -2040,29 +1955,42 @@ class StemDataset(Dataset):
         self.virtual_size = virtual_size
         self.remix_probability = remix_probability
         self.min_activity_rms = min_activity_rms
-        self.tracks: list[dict[str, tuple[AudioInfo, ...]]] = []
-
-        track_dirs = [
-            os.path.join(root_dir, name)
-            for name in os.listdir(root_dir)
-            if os.path.isdir(os.path.join(root_dir, name))
-        ]
-        print("Scanning track metadata...")
-        for track_dir in tqdm(track_dirs, desc="Caching tracks"):
-            resolved = resolve_target_paths(track_dir)
-            if resolved is None:
-                continue
-            track: dict[str, tuple[AudioInfo, ...]] = {}
-            for stem, paths in resolved.items():
-                infos = tuple(sf.info(path) for path in paths)
-                track[stem] = tuple(
-                    AudioInfo(path, info.frames, info.samplerate)
-                    for path, info in zip(paths, infos)
-                )
-            self.tracks.append(track)
+        self.tracks: list[tuple[str, dict[str, tuple[AudioInfo, ...]]]] = self._scan_tracks(root_dir)
 
         if not self.tracks:
             raise RuntimeError(f"No complete {STEMS} tracks found under {root_dir!r}.")
+        # Optional second directory holding ground-truth (real) tracks. These
+        # get `real_weight` sampling weight vs 1.0 for the main directory, so
+        # e.g. real_weight=4.3 with 300 real / 1300 synthetic tracks gives
+        # roughly 50/50 sampling.
+        self.track_weights: list[float] = [1.0] * len(self.tracks)
+        if real_root_dir:
+            real_tracks = self._scan_tracks(real_root_dir)
+            if not real_tracks:
+                raise RuntimeError(
+                    f"No complete {STEMS} tracks found under {real_root_dir!r}."
+                )
+            self.tracks.extend(real_tracks)
+            self.track_weights.extend([real_weight] * len(real_tracks))
+            print(
+                f"Added {len(real_tracks)} real tracks with weight {real_weight} "
+                f"({len(self.tracks)} total)"
+            )
+        # Alternative: a text file listing folder names (one per line) within
+        # root_dir that should get real_weight. For when real and synthetic
+        # tracks share one directory (e.g. randomized folder names).
+        if real_track_list:
+            with open(real_track_list, "r") as f:
+                real_names = {line.strip() for line in f if line.strip()}
+            matched = 0
+            for i, (name, _track) in enumerate(self.tracks):
+                if name in real_names:
+                    self.track_weights[i] = real_weight
+                    matched += 1
+            print(
+                f"Matched {matched}/{len(real_names)} real track names from "
+                f"{real_track_list} with weight {real_weight}"
+            )
         print(
             f"Cached {len(self.tracks)} complete tracks"
         )
@@ -2113,15 +2041,45 @@ class StemDataset(Dataset):
         duration = self._target_duration(infos)
         return random.uniform(0.0, max(0.0, duration - self.segment_seconds))
 
+    @staticmethod
+    def _scan_tracks(
+        root_dir: str,
+    ) -> list[tuple[str, dict[str, tuple[AudioInfo, ...]]]]:
+        track_dirs = [
+            os.path.join(root_dir, name)
+            for name in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, name))
+        ]
+        tracks: list[tuple[str, dict[str, tuple[AudioInfo, ...]]]] = []
+        print(f"Scanning track metadata under {root_dir}...")
+        for track_dir in tqdm(track_dirs, desc="Caching tracks"):
+            resolved = resolve_target_paths(track_dir)
+            if resolved is None:
+                continue
+            track: dict[str, tuple[AudioInfo, ...]] = {}
+            for stem, paths in resolved.items():
+                infos = tuple(sf.info(path) for path in paths)
+                track[stem] = tuple(
+                    AudioInfo(path, info.frames, info.samplerate)
+                    for path, info in zip(paths, infos)
+                )
+            tracks.append((os.path.basename(track_dir), track))
+        return tracks
+
+    def _sample_track(self) -> dict[str, tuple[AudioInfo, ...]]:
+        """Weighted random track choice (real tracks can be upsampled)."""
+        _name, track = random.choices(self.tracks, weights=self.track_weights, k=1)[0]
+        return track
+
     def _sample_targets(self) -> torch.Tensor:
         targets: list[torch.Tensor] = []
         if random.random() < self.remix_probability:
             for stem in STEMS:
-                track = random.choice(self.tracks)
+                track = self._sample_track()
                 infos = track[stem]
                 targets.append(self._load_target(infos, self._random_start(infos)))
         else:
-            track = random.choice(self.tracks)
+            track = self._sample_track()
             common_duration = min(
                 self._target_duration(track[stem]) for stem in STEMS
             )
@@ -3051,7 +3009,6 @@ def train(
                     model,
                     mixture_spec,
                     target_audio,
-                    global_step=step,
                 )
                 scaled_loss = loss / args.grad_accumulation
 
@@ -3100,15 +3057,11 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, low, mid, hf, hf_w, vocal_db, mask_mag = torch.stack(
+            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
-                    latest_metrics["low"],
-                    latest_metrics["mid"],
-                    latest_metrics["hf"],
-                    latest_metrics["hf_w"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
                 )
@@ -3117,10 +3070,6 @@ def train(
                 wave=f"{wave:.3f}",
                 stft=f"{main_stft:.3f}",
                 mr=f"{mrstft:.3f}",
-                low=f"{low:.3f}",
-                mid=f"{mid:.3f}",
-                hf=f"{hf:.3f}",
-                hfw=f"{hf_w:.2f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
                 refresh=False,
@@ -3328,6 +3277,16 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--infer", action="store_true")
 
     parser.add_argument("--data_dir", type=str, default="train")
+    parser.add_argument("--real_data_dir", type=str, default=None,
+                        help="Optional directory of ground-truth (real) tracks, "
+                        "upsampled by --real_weight.")
+    parser.add_argument("--real_weight", type=float, default=1.0,
+                        help="Sampling weight multiplier for --real_data_dir tracks "
+                        "vs 1.0 for --data_dir tracks.")
+    parser.add_argument("--real_track_list", type=str, default=None,
+                        help="Text file with folder names (one per line) inside "
+                        "--data_dir that are real tracks; they get --real_weight. "
+                        "Use identify_real_tracks.py to generate it.")
     parser.add_argument("--test_dir", type=str, default="test")
     parser.add_argument("--input_file", type=str, default=None)
     parser.add_argument("--checkpoint_path", type=str, default=None)
@@ -3353,8 +3312,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument("--model_dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=14)
+    parser.add_argument("--model_dim", type=int, default=256)
+    parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
@@ -3488,6 +3447,9 @@ def main() -> None:
             segment_samples=args.segment_samples,
             virtual_size=args.dataset_size,
             remix_probability=args.remix_probability,
+            real_root_dir=args.real_data_dir,
+            real_weight=args.real_weight,
+            real_track_list=args.real_track_list,
         )
         generator = torch.Generator()
         generator.manual_seed(args.seed)
