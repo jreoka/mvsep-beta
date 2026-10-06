@@ -2193,6 +2193,113 @@ class StemDataset(Dataset):
         raise RuntimeError(f"Unable to load a valid training example: {last_error}")
 
 
+class WeightedDataset(Dataset):
+    """Draw each training example from a weighted set of source datasets.
+
+    Every ``__getitem__`` picks one source dataset at random with probability
+    proportional to its weight, then samples an example from it. This keeps
+    the data mixture at the requested ratio (default 4:1 train1:train2)
+    regardless of how many tracks each folder holds, without concatenating
+    or rebalancing track lists.
+    """
+
+    def __init__(
+        self,
+        datasets: Sequence[Dataset],
+        weights: Sequence[float],
+    ):
+        if not datasets:
+            raise ValueError("WeightedDataset needs at least one source dataset.")
+        if len(datasets) != len(weights):
+            raise ValueError(
+                f"Got {len(datasets)} datasets but {len(weights)} weights."
+            )
+        if any(weight <= 0.0 for weight in weights):
+            raise ValueError("WeightedDataset weights must be positive.")
+        self.datasets = list(datasets)
+        total = float(sum(weights))
+        self.probabilities = [float(weight) / total for weight in weights]
+        # Mirror the attributes the training worker init expects so the
+        # per-worker pink-noise cache warm-up keeps working through the
+        # wrapper. All sources share sample rate and segment length.
+        first = self.datasets[0]
+        self.sample_rate = first.sample_rate
+        self.segment_samples = first.segment_samples
+
+    def __len__(self) -> int:
+        return sum(len(dataset) for dataset in self.datasets)
+
+    def __getitem__(self, _: int) -> tuple[torch.Tensor, torch.Tensor]:
+        choice = random.choices(
+            range(len(self.datasets)), weights=self.probabilities, k=1
+        )[0]
+        dataset = self.datasets[choice]
+        return dataset[random.randrange(len(dataset))]
+
+
+def parse_weighted_dirs(args: argparse.Namespace) -> list[tuple[str, float]]:
+    """Resolve the training data sources and their sampling weights.
+
+    Checkpoint resume is unaffected by this: checkpoints record model,
+    optimizer, EMA, scaler, and training-progress state only -- never the
+    data sources -- so the directory mix may change between runs and an old
+    checkpoint still resumes exactly.
+    """
+    if args.data_dir:
+        return [(args.data_dir, 1.0)]
+    dirs = [part.strip() for part in args.data_dirs.split(",") if part.strip()]
+    raw_weights = [
+        part.strip() for part in args.data_weights.split(",") if part.strip()
+    ]
+    if len(dirs) != len(raw_weights):
+        raise ValueError(
+            f"Got {len(dirs)} --data_dirs entries but {len(raw_weights)} "
+            "--data_weights entries; the counts must match."
+        )
+    try:
+        weights = [float(text) for text in raw_weights]
+    except ValueError:
+        raise ValueError(
+            "--data_weights must be comma-separated numbers, got "
+            f"{args.data_weights!r}."
+        ) from None
+    if any(weight <= 0.0 for weight in weights):
+        raise ValueError("--data_weights entries must be positive.")
+    return list(zip(dirs, weights))
+
+
+def build_training_dataset(
+    args: argparse.Namespace,
+    config: ModelConfig,
+) -> Dataset:
+    sources = parse_weighted_dirs(args)
+    stem_datasets = [
+        StemDataset(
+            root_dir=root_dir,
+            sample_rate=config.sample_rate,
+            segment_samples=args.segment_samples,
+            virtual_size=args.dataset_size,
+            remix_probability=args.remix_probability,
+        )
+        for root_dir, _weight in sources
+    ]
+    if len(stem_datasets) == 1:
+        print(f"Training from data directory: {sources[0][0]}")
+        return stem_datasets[0]
+    total_weight = sum(weight for _root_dir, weight in sources)
+    summary = ", ".join(
+        f"{root_dir} (weight {weight:g}, "
+        f"{weight / total_weight * 100.0:.1f}% of samples)"
+        for root_dir, weight in sources
+    )
+    print(f"Training from weighted data sources: {summary}")
+    return WeightedDataset(
+        stem_datasets,
+        [weight for _root_dir, weight in sources],
+    )
+
+
+
 # -----------------------------------------------------------------------------
 # EMA, optimizer, checkpointing
 # -----------------------------------------------------------------------------
@@ -3172,7 +3279,35 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--train", action="store_true")
     mode.add_argument("--infer", action="store_true")
 
-    parser.add_argument("--data_dir", type=str, default="train")
+    parser.add_argument(
+        "--data_dirs",
+        type=str,
+        default="train1,train2",
+        help=(
+            "Comma-separated training data directories. Each entry is a track "
+            "folder like --data_dir used to be. Defaults to 'train1,train2'."
+        ),
+    )
+    parser.add_argument(
+        "--data_weights",
+        type=str,
+        default="3,1",
+        help=(
+            "Comma-separated per-directory sampling weights matching "
+            "--data_dirs. Each training example is drawn from a directory "
+            "with probability proportional to its weight, so the default "
+            "'4,1' trains 80%% on train1 and 20%% on train2."
+        ),
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help=(
+            "Legacy single training data directory. When set, it is used "
+            "alone and --data_dirs/--data_weights are ignored."
+        ),
+    )
     parser.add_argument("--test_dir", type=str, default="test")
     parser.add_argument("--input_file", type=str, default=None)
     parser.add_argument("--checkpoint_path", type=str, default=None)
@@ -3327,13 +3462,7 @@ def main() -> None:
     if args.train:
         if checkpoint_path:
             print(f"Checkpoint selected: {checkpoint_path}")
-        dataset = StemDataset(
-            root_dir=args.data_dir,
-            sample_rate=config.sample_rate,
-            segment_samples=args.segment_samples,
-            virtual_size=args.dataset_size,
-            remix_probability=args.remix_probability,
-        )
+        dataset = build_training_dataset(args, config)
         generator = torch.Generator()
         generator.manual_seed(args.seed)
         # pin_memory + persistent_workers on Windows (spawn) is the #1
