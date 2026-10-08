@@ -44,8 +44,8 @@ class ModelConfig:
     audio_channels: int = 2
     num_stems: int = len(STEMS)
     num_bands: int = 124
-    dim: int = 384
-    depth: int = 14
+    dim: int = 256
+    depth: int = 16
     heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
@@ -361,16 +361,16 @@ def apply_rope(
     return x * cos + rotate_half(x) * sin
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+class GELUMlp(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.0):
         super().__init__()
-        self.in_proj = nn.Linear(dim, hidden_dim * 2, bias=False)
-        self.out_proj = nn.Linear(hidden_dim, dim, bias=False)
+        hidden_dim = dim * 4
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, value = self.in_proj(x).chunk(2, dim=-1)
-        return self.dropout(self.out_proj(F.silu(gate) * value))
+        return self.dropout(self.fc2(F.gelu(self.fc1(x))))
 
 
 class RoPEAttention(nn.Module):
@@ -435,12 +435,11 @@ class TransformerUnit(nn.Module):
             heads,
             dropout=dropout,
         )
-        hidden_dim = int(math.ceil((dim * 2.5) / 64.0) * 64)
         self.ff_norm = nn.RMSNorm(dim)
-        self.ff = SwiGLU(dim, hidden_dim, dropout=dropout)
+        self.ff = GELUMlp(dim, dropout=dropout)
         # Zero-init the FF output projection so the feed-forward residual path
         # starts neutral and is learned on top of the attention function.
-        nn.init.zeros_(self.ff.out_proj.weight)
+        nn.init.zeros_(self.ff.fc2.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x))
@@ -3333,8 +3332,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument("--model_dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=14)
+    parser.add_argument("--model_dim", type=int, default=256)
+    parser.add_argument("--depth", type=int, default=16)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
