@@ -46,6 +46,7 @@ class ModelConfig:
     num_bands: int = 124
     dim: int = 256
     depth: int = 16
+    heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
     architecture: str = "bs124_roformer_axial_v6_direct_mask"
@@ -65,8 +66,12 @@ class ModelConfig:
             raise ValueError(
                 f"num_stems must match STEMS ({len(STEMS)}), got {self.num_stems}."
             )
-        if self.dim <= 0 or self.depth <= 0:
-            raise ValueError("dim and depth must be positive.")
+        if self.dim <= 0 or self.depth <= 0 or self.heads <= 0:
+            raise ValueError("dim, depth, and heads must be positive.")
+        if self.dim % self.heads != 0:
+            raise ValueError("dim must be divisible by heads.")
+        if (self.dim // self.heads) % 2 != 0:
+            raise ValueError("The attention head dimension must be even for RoPE.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
@@ -321,79 +326,39 @@ def make_istft(
 # -----------------------------------------------------------------------------
 
 
-class GlobalConv(nn.Module):
-    """Depthwise global convolution replacing attention.
-
-    Each output position mixes information across the full input sequence via
-    a learnable depthwise kernel sized to the sequence length at runtime.
-    Uses input gating for expressiveness, mirroring the QKV gating pattern
-    of attention. The kernel is initialized close to identity (delta) so the
-    residual path starts neutral.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        dropout: float = 0.0,
-        max_length: int = 2048,
-    ):
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, base: float = 10_000.0):
         super().__init__()
-        self.dim = dim
-        self.max_length = max_length
+        if head_dim % 2 != 0:
+            raise ValueError("RoPE head dimension must be even.")
+        inv_freq = base ** (-torch.arange(0, head_dim, 2).float() / head_dim)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Gated input projection (analogous to QKV in attention)
-        self.in_proj = nn.Linear(dim, dim * 2, bias=False)
+    def forward(
+        self,
+        length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(length, device=device, dtype=self.inv_freq.dtype)
+        angles = torch.outer(positions, self.inv_freq)
+        angles = torch.cat((angles, angles), dim=-1)
+        return angles.cos().to(dtype=dtype), angles.sin().to(dtype=dtype)
 
-        # Learnable depthwise kernel, sliced to sequence length at runtime.
-        # Shape: (dim, 1, max_length) for depthwise conv1d.
-        self.kernel = nn.Parameter(torch.empty(dim, 1, max_length))
 
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.out_dropout = nn.Dropout(dropout)
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
 
-        self.reset_parameters()
-        # Zero-init output so the residual path starts as identity.
-        nn.init.zeros_(self.out_proj.weight)
 
-    def reset_parameters(self) -> None:
-        with torch.no_grad():
-            self.kernel.zero_()
-            # Center tap = 1 for identity-like init.
-            self.kernel[:, :, self.max_length // 2] = 1.0
-            # Small noise for symmetry breaking.
-            self.kernel.add_(torch.randn_like(self.kernel) * 0.01)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, length, dim = x.shape
-        if length > self.max_length:
-            raise ValueError(
-                f"Sequence length {length} exceeds GlobalConv max_length "
-                f"{self.max_length}."
-            )
-
-        # Gated projection.
-        projected = self.in_proj(x)
-        a, b = projected.chunk(2, dim=-1)
-        gate = F.silu(b)
-
-        # Global depthwise convolution over the sequence dimension.
-        # a: (batch, length, dim) -> (batch, dim, length) for conv1d.
-        a_t = a.transpose(1, 2)
-
-        # Slice kernel to current length for full sequence coverage.
-        k = self.kernel[:, :, :length]
-
-        # Centered padding for non-causal (bidirectional) global mixing.
-        pad_left = (length - 1) // 2
-        pad_right = length - 1 - pad_left
-        a_padded = F.pad(a_t, (pad_left, pad_right))
-
-        conv_out = F.conv1d(a_padded, k, groups=dim)
-        conv_out = conv_out.transpose(1, 2)  # (batch, length, dim)
-
-        # Gate and project.
-        out = conv_out * gate
-        return self.out_dropout(self.out_proj(out))
+def apply_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    return x * cos + rotate_half(x) * sin
 
 
 class GELUMlp(nn.Module):
@@ -408,26 +373,76 @@ class GELUMlp(nn.Module):
         return self.dropout(self.fc2(F.gelu(self.fc1(x))))
 
 
-class ConvUnit(nn.Module):
+class RoPEAttention(nn.Module):
     def __init__(
         self,
         dim: int,
+        heads: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError("Model dimension must be divisible by the number of heads.")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.out_dropout = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, length, dim = x.shape
+        qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        cos, sin = self.rope(length, x.device, q.dtype)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        attention_dropout = self.dropout if self.training else 0.0
+        # PyTorch SDPA selects the best available kernel per call (flash,
+        # cuDNN, memory-efficient, or math fallback) with no manual tuning.
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=attention_dropout,
+            is_causal=False,
+        )
+        out = out.transpose(1, 2).reshape(batch, length, dim)
+        return self.out_dropout(self.out_proj(out))
+
+
+class TransformerUnit(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
         dropout: float,
     ):
         super().__init__()
-        self.conv_norm = nn.RMSNorm(dim)
-        self.conv = GlobalConv(
+        self.attn_norm = nn.RMSNorm(dim)
+        self.attn = RoPEAttention(
             dim,
+            heads,
             dropout=dropout,
         )
         self.ff_norm = nn.RMSNorm(dim)
         self.ff = GELUMlp(dim, dropout=dropout)
         # Zero-init the FF output projection so the feed-forward residual path
-        # starts neutral and is learned on top of the conv function.
+        # starts neutral and is learned on top of the attention function.
         nn.init.zeros_(self.ff.fc2.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.conv(self.conv_norm(x))
+        x = x + self.attn(self.attn_norm(x))
         return x + self.ff(self.ff_norm(x))
 
 
@@ -436,13 +451,14 @@ class DualPathEncoder(nn.Module):
         super().__init__()
         unit_kwargs = dict(
             dim=config.dim,
+            heads=config.heads,
             dropout=config.dropout,
         )
         self.time_layers = nn.ModuleList(
-            ConvUnit(**unit_kwargs) for _ in range(config.depth)
+            TransformerUnit(**unit_kwargs) for _ in range(config.depth)
         )
         self.freq_layers = nn.ModuleList(
-            ConvUnit(**unit_kwargs) for _ in range(config.depth)
+            TransformerUnit(**unit_kwargs) for _ in range(config.depth)
         )
         self.output_norm = nn.RMSNorm(config.dim)
         self.use_checkpoint = config.use_checkpoint
@@ -702,7 +718,7 @@ class BandMaskGroup(nn.Module):
 
         # Each band token is decoded to its complex stereo mask by a single
         # band-specific gated linear projection. There is no shared predictor
-        # network on top of the encoder; the encoder representation is
+        # network on top of the transformer; the encoder representation is
         # mapped straight to mask coefficients.
         output_width = self.num_predicted_stems * self.feature_width
         self.output_weight = nn.Parameter(
@@ -749,9 +765,9 @@ class BandMaskGroup(nn.Module):
 
 
 class MaskHead(nn.Module):
-    """Decode final encoder tokens into the foreground vocal mask.
+    """Decode final transformer tokens into the foreground vocal mask.
 
-    Mask prediction happens entirely inside the encoder's output stage:
+    Mask prediction happens entirely inside the transformer's output stage:
     each normalized band token is mapped to its band's complex stereo mask by
     a per-band gated linear projection, with no dedicated predictor network
     between the encoder and the mask output.
@@ -2930,7 +2946,7 @@ def train(
         model.encoder.compile_layers(mode="default")
         print(
             f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
-            "conv units; activation checkpoint boundaries remain eager."
+            "transformer units; activation checkpoint boundaries remain eager."
         )
 
     stft_window = torch.hann_window(model.config.win_length, device=device)
@@ -3077,10 +3093,10 @@ def train(
             prune_old_checkpoints("ckpts", keep=3, config=model.config)
 
             with ema.average_parameters():
-                # The conv units are compiled for training with gradients
+                # The transformer units are compiled for training with gradients
                 # enabled.  Validation runs under inference_mode, which requires
                 # different Dynamo guards and can exhaust the shared recompile
-                # cache for ConvUnit.forward.  Keep infrequent validation
+                # cache for TransformerUnit.forward.  Keep infrequent validation
                 # eager so it cannot evict or disable the compiled training path.
                 compiler_context = (
                     torch.compiler.set_stance("force_eager")
@@ -3187,6 +3203,7 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         num_bands=124,
         dim=args.model_dim,
         depth=args.depth,
+        heads=args.heads,
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
     )
@@ -3253,7 +3270,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "124-band BS-ConvFormer with axial global convolution, "
+            "124-band regular BS-RoFormer with axial attention, "
             "foreground-residual separation, and silence-focused training"
         )
     )
@@ -3317,6 +3334,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=16)
+    parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
