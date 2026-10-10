@@ -51,8 +51,6 @@ class ModelConfig:
     use_checkpoint: bool = True
     use_time_branch: bool = True
     time_branch_width: int = 128
-    predict_both_stems: bool = True
-    deep_supervision: bool = True
     architecture: str = "bs124_roformer_axial_v8_joint_deepsup"
 
     def __post_init__(self) -> None:
@@ -932,13 +930,8 @@ class BSRoFormerSeparator(nn.Module):
         self.band_split = BandSplit(config, self.bands)
         self.time_branch = TimeBranch(config) if config.use_time_branch else None
         self.encoder = DualPathEncoder(config)
-        head_stems = config.num_stems if config.predict_both_stems else 1
-        self.mask_head = MaskHead(config, self.bands, num_stems=head_stems)
-        self.aux_head = (
-            MaskHead(config, self.bands, num_stems=head_stems)
-            if config.deep_supervision
-            else None
-        )
+        self.mask_head = MaskHead(config, self.bands, num_stems=config.num_stems)
+        self.aux_head = MaskHead(config, self.bands, num_stems=config.num_stems)
         self.tap_index = max(0, config.depth // 2 - 1)
 
     def forward_real(
@@ -951,25 +944,14 @@ class BSRoFormerSeparator(nn.Module):
         if self.time_branch is not None and mixture_audio is not None:
             time_tokens = self.time_branch(mixture_audio, tokens.shape[1])
             tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2)
-        want_aux = return_aux and self.aux_head is not None
+        want_aux = return_aux
         if want_aux:
             tokens, mid_tokens = self.encoder(tokens, tap_layer=self.tap_index)
             aux_masks = self.aux_head.forward_real(mid_tokens)
         else:
             tokens = self.encoder(tokens)
             aux_masks = None
-        if self.config.predict_both_stems:
-            masks = self.mask_head.forward_real(tokens)
-        else:
-            vocal_mask = self.mask_head.forward_real(tokens)
-
-            # No vocal activity gate: the separator's foreground mask is used directly.
-            # The accompaniment remains the exact residual complement, so reconstruction
-            # consistency never injects residual mixture energy back into the vocal stem.
-            one = torch.zeros_like(vocal_mask)
-            one[..., 0] = 1.0
-            other_mask = one - vocal_mask
-            masks = torch.cat((vocal_mask, other_mask), dim=1)
+        masks = self.mask_head.forward_real(tokens)
         if want_aux:
             return masks, aux_masks
         return masks
@@ -1178,9 +1160,7 @@ class SeparationLoss(nn.Module):
         target_audio: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        want_aux = (
-            self.loss_config.aux_weight > 0.0 and model.aux_head is not None
-        )
+        want_aux = self.loss_config.aux_weight > 0.0
         if want_aux:
             masks, aux_masks = model(mixture_spec, mixture_audio, return_aux=True)
         else:
@@ -3379,8 +3359,6 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
         use_time_branch=args.time_branch,
-        predict_both_stems=args.both_stems,
-        deep_supervision=args.deep_supervision,
     )
 
 
@@ -3513,8 +3491,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--time_branch", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--both_stems", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--deep_supervision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accumulation", type=int, default=1)
