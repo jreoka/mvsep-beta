@@ -27,7 +27,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 10
 
 
 # -----------------------------------------------------------------------------
@@ -51,7 +51,9 @@ class ModelConfig:
     use_checkpoint: bool = True
     use_time_branch: bool = True
     time_branch_width: int = 128
-    architecture: str = "bs124_roformer_axial_v7_timebranch"
+    predict_both_stems: bool = True
+    deep_supervision: bool = True
+    architecture: str = "bs124_roformer_axial_v8_joint_deepsup"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -81,11 +83,12 @@ class ModelConfig:
         if self.architecture not in (
             "bs124_roformer_axial_v6_direct_mask",
             "bs124_roformer_axial_v7_timebranch",
+            "bs124_roformer_axial_v8_joint_deepsup",
         ):
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_roformer_axial_v7_timebranch."
+                "bs124_roformer_axial_v8_joint_deepsup."
             )
         if self.time_branch_width <= 0:
             raise ValueError("time_branch_width must be positive.")
@@ -99,6 +102,7 @@ class LossConfig:
     mask_weight: float = 0.15
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
+    aux_weight: float = 0.30
 
 
 # -----------------------------------------------------------------------------
@@ -489,12 +493,17 @@ class DualPathEncoder(nn.Module):
             return module(x)
         return checkpoint(module, x, use_reentrant=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, tap_layer: int | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # x: [batch, frames, bands, dim]
         batch, frames, bands, dim = x.shape
         should_checkpoint = self.use_checkpoint and self.training
+        mid: torch.Tensor | None = None
 
-        for time_layer, freq_layer in zip(self.time_layers, self.freq_layers):
+        for index, (time_layer, freq_layer) in enumerate(
+            zip(self.time_layers, self.freq_layers)
+        ):
             time_x = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
             time_x = self._run_module(time_layer, time_x, should_checkpoint)
             x = time_x.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
@@ -502,8 +511,14 @@ class DualPathEncoder(nn.Module):
             freq_x = x.reshape(batch * frames, bands, dim)
             freq_x = self._run_module(freq_layer, freq_x, should_checkpoint)
             x = freq_x.reshape(batch, frames, bands, dim)
+            if tap_layer is not None and index == tap_layer:
+                mid = x
 
-        return self.output_norm(x)
+        output = self.output_norm(x)
+        if tap_layer is None:
+            return output
+        tapped = x if mid is None else mid
+        return output, self.output_norm(tapped)
 
 
 def next_power_of_two(value: int) -> int:
@@ -692,9 +707,10 @@ class BandMaskGroup(nn.Module):
         bands: Sequence[tuple[int, int]],
         band_ids: Sequence[int],
         bucket_width: int,
+        num_predicted_stems: int = 1,
     ):
         super().__init__()
-        self.num_predicted_stems = 1
+        self.num_predicted_stems = num_predicted_stems
         self.audio_channels = config.audio_channels
         self.bucket_width = bucket_width
         self.feature_width = bucket_width * config.audio_channels * 2
@@ -784,8 +800,10 @@ class MaskHead(nn.Module):
         self,
         config: ModelConfig,
         bands: Sequence[tuple[int, int]],
+        num_stems: int = 1,
     ):
         super().__init__()
+        self.num_stems = num_stems
         self.audio_channels = config.audio_channels
         self.freq_bins = config.n_fft // 2 + 1
 
@@ -794,7 +812,7 @@ class MaskHead(nn.Module):
             bucket = next_power_of_two(end - start)
             grouped_ids.setdefault(bucket, []).append(band_id)
         self.groups = nn.ModuleList(
-            BandMaskGroup(config, bands, ids, bucket)
+            BandMaskGroup(config, bands, ids, bucket, num_stems)
             for bucket, ids in sorted(grouped_ids.items())
         )
 
@@ -807,13 +825,23 @@ class MaskHead(nn.Module):
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, bands, D]
         output = x.new_zeros(
-            x.shape[0], 1, self.audio_channels, x.shape[1], self.freq_bins, 2
+            x.shape[0],
+            self.num_stems,
+            self.audio_channels,
+            x.shape[1],
+            self.freq_bins,
+            2,
         )
         for group in self.groups:
             group_x = x.index_select(2, group.band_ids)
             source, flat_indices = group(group_x)
             scatter_index = flat_indices.view(1, 1, 1, 1, -1, 1).expand(
-                x.shape[0], 1, self.audio_channels, x.shape[1], -1, 2
+                x.shape[0],
+                self.num_stems,
+                self.audio_channels,
+                x.shape[1],
+                -1,
+                2,
             )
             output.scatter_add_(dim=4, index=scatter_index, src=source)
 
@@ -904,34 +932,66 @@ class BSRoFormerSeparator(nn.Module):
         self.band_split = BandSplit(config, self.bands)
         self.time_branch = TimeBranch(config) if config.use_time_branch else None
         self.encoder = DualPathEncoder(config)
-        self.mask_head = MaskHead(config, self.bands)
+        head_stems = config.num_stems if config.predict_both_stems else 1
+        self.mask_head = MaskHead(config, self.bands, num_stems=head_stems)
+        self.aux_head = (
+            MaskHead(config, self.bands, num_stems=head_stems)
+            if config.deep_supervision
+            else None
+        )
+        self.tap_index = max(0, config.depth // 2 - 1)
 
     def forward_real(
         self,
         mixture_real_imag: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         tokens = self.band_split.forward_real(mixture_real_imag)
         if self.time_branch is not None and mixture_audio is not None:
             time_tokens = self.time_branch(mixture_audio, tokens.shape[1])
             tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2)
-        tokens = self.encoder(tokens)
-        vocal_mask = self.mask_head.forward_real(tokens)
+        want_aux = return_aux and self.aux_head is not None
+        if want_aux:
+            tokens, mid_tokens = self.encoder(tokens, tap_layer=self.tap_index)
+            aux_masks = self.aux_head.forward_real(mid_tokens)
+        else:
+            tokens = self.encoder(tokens)
+            aux_masks = None
+        if self.config.predict_both_stems:
+            masks = self.mask_head.forward_real(tokens)
+        else:
+            vocal_mask = self.mask_head.forward_real(tokens)
 
-        # No vocal activity gate: the separator's foreground mask is used directly.
-        # The accompaniment remains the exact residual complement, so reconstruction
-        # consistency never injects residual mixture energy back into the vocal stem.
-        one = torch.zeros_like(vocal_mask)
-        one[..., 0] = 1.0
-        other_mask = one - vocal_mask
-        return torch.cat((vocal_mask, other_mask), dim=1)
+            # No vocal activity gate: the separator's foreground mask is used directly.
+            # The accompaniment remains the exact residual complement, so reconstruction
+            # consistency never injects residual mixture energy back into the vocal stem.
+            one = torch.zeros_like(vocal_mask)
+            one[..., 0] = 1.0
+            other_mask = one - vocal_mask
+            masks = torch.cat((vocal_mask, other_mask), dim=1)
+        if want_aux:
+            return masks, aux_masks
+        return masks
 
     def forward(
-        self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self,
+        mixture_spec: torch.Tensor,
+        mixture_audio: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         mixture_real_imag = torch.view_as_real(mixture_spec.to(torch.complex64))
-        masks_real_imag = self.forward_real(mixture_real_imag, mixture_audio)
-        return torch.view_as_complex(masks_real_imag)
+        result = self.forward_real(mixture_real_imag, mixture_audio, return_aux)
+        if isinstance(result, tuple):
+            masks_real_imag, aux_real_imag = result
+            masks = torch.view_as_complex(masks_real_imag)
+            aux = (
+                torch.view_as_complex(aux_real_imag)
+                if aux_real_imag is not None
+                else None
+            )
+            return masks, aux
+        return torch.view_as_complex(result)
 
     def estimate_specs(
         self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
@@ -1118,7 +1178,14 @@ class SeparationLoss(nn.Module):
         target_audio: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        masks = model(mixture_spec, mixture_audio)
+        want_aux = (
+            self.loss_config.aux_weight > 0.0 and model.aux_head is not None
+        )
+        if want_aux:
+            masks, aux_masks = model(mixture_spec, mixture_audio, return_aux=True)
+        else:
+            masks = model(mixture_spec, mixture_audio)
+            aux_masks = None
         estimates = masks * mixture_spec[:, None]
         residual = mixture_spec - estimates.sum(dim=1)
         estimates[:, 1] = estimates[:, 1] + residual
@@ -1162,6 +1229,18 @@ class SeparationLoss(nn.Module):
         )
         mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
 
+        aux_loss = mask_loss.new_zeros(())
+        if aux_masks is not None:
+            aux_estimates = aux_masks * mixture_spec[:, None]
+            aux_effective = (
+                aux_estimates
+                * mixture_spec[:, None].conj()
+                / (mix_power[:, None] + 1e-5)
+            )
+            aux_loss = (
+                (aux_effective - ideal_masks).abs() * tf_weight[:, None]
+            ).mean()
+
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
         true_mid, true_side = mid_side(target_audio)
@@ -1177,6 +1256,7 @@ class SeparationLoss(nn.Module):
             + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
+            + cfg.aux_weight * aux_loss
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1199,6 +1279,7 @@ class SeparationLoss(nn.Module):
             "main_stft": main_stft_loss.detach(),
             "mrstft": mrstft_loss.detach(),
             "mask": mask_loss.detach(),
+            "aux": aux_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
             "vocal_level_db": vocal_level_db.detach(),
@@ -3148,13 +3229,14 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
+            wave, main_stft, mrstft, vocal_db, mask_mag, aux = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
+                    latest_metrics["aux"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
@@ -3163,6 +3245,7 @@ def train(
                 mr=f"{mrstft:.3f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
+                aux=f"{aux:.3f}",
                 refresh=False,
             )
         progress.update(1)
@@ -3296,6 +3379,8 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
         use_time_branch=args.time_branch,
+        predict_both_stems=args.both_stems,
+        deep_supervision=args.deep_supervision,
     )
 
 
@@ -3428,6 +3513,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--time_branch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--both_stems", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--deep_supervision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accumulation", type=int, default=1)
