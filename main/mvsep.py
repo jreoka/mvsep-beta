@@ -27,7 +27,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 8
+CHECKPOINT_FORMAT_VERSION = 9
 
 
 # -----------------------------------------------------------------------------
@@ -49,7 +49,9 @@ class ModelConfig:
     heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
-    architecture: str = "bs124_roformer_axial_v6_direct_mask"
+    use_time_branch: bool = True
+    time_branch_width: int = 128
+    architecture: str = "bs124_roformer_axial_v7_timebranch"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -76,12 +78,17 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture != "bs124_roformer_axial_v6_direct_mask":
+        if self.architecture not in (
+            "bs124_roformer_axial_v6_direct_mask",
+            "bs124_roformer_axial_v7_timebranch",
+        ):
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
-                "bs124_roformer_axial_v6_direct_mask."
+                "bs124_roformer_axial_v7_timebranch."
             )
+        if self.time_branch_width <= 0:
+            raise ValueError("time_branch_width must be positive.")
 
 
 @dataclass
@@ -822,17 +829,92 @@ class MaskHead(nn.Module):
 
 
 
+class ResidualDilatedBlock(nn.Module):
+    """Two-layer residual TCN block operating at the STFT frame rate."""
+
+    def __init__(self, width: int, dilation: int):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            width, width, kernel_size=3, padding=dilation, dilation=dilation
+        )
+        self.proj = nn.Conv1d(width, width, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.proj(self.act(self.conv(x)))
+
+
+class TimeBranch(nn.Module):
+    """Lightweight waveform branch fused into the band tokens pre-encoder.
+
+    Three strided conv blocks downsample stereo audio to roughly the STFT
+    frame rate (total stride 512 = hop_length), a short stack of dilated
+    residual blocks adds temporal context (attacks, transients, phase cues
+    the spectral branch smears), then the features are resampled to the
+    exact STFT frame count and projected to ``dim``.
+
+    The output projection and fusion gate are zero-initialized, so a fresh
+    branch adds exactly nothing: forward behavior matches the branchless
+    model until training moves the gate.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        width = config.time_branch_width
+        channels = config.audio_channels
+        self.entry = nn.Sequential(
+            nn.Conv1d(channels, width, kernel_size=15, stride=8, padding=7),
+            nn.GELU(),
+            nn.Conv1d(width, width * 2, kernel_size=15, stride=8, padding=7),
+            nn.GELU(),
+            nn.Conv1d(width * 2, width * 4, kernel_size=15, stride=8, padding=7),
+            nn.GELU(),
+        )
+        self.body = nn.Sequential(
+            ResidualDilatedBlock(width * 4, dilation=1),
+            ResidualDilatedBlock(width * 4, dilation=2),
+            ResidualDilatedBlock(width * 4, dilation=4),
+        )
+        self.proj = nn.Linear(width * 4, config.dim)
+        # Near-zero (not exact-zero) init: the fresh branch is a ~1e-3 scale
+        # perturbation, i.e. effectively an identity addition, while gradients
+        # still flow into the branch from the very first step. An exact-zero
+        # projection would additionally zero every upstream gradient at step 0
+        # (the branch would only start learning from step 1).
+        nn.init.normal_(self.proj.weight, std=1e-3)
+        nn.init.zeros_(self.proj.bias)
+        # Gate starts at one; the tiny projection above is what keeps a fresh
+        # branch neutral.
+        self.gate = nn.Parameter(torch.ones(config.dim))
+
+    def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
+        # waveform: [B, channels, samples] -> [B, frames, dim]
+        features = self.body(self.entry(waveform))
+        features = F.interpolate(
+            features, size=frames, mode="linear", align_corners=False
+        )
+        return self.proj(features.transpose(1, 2)) * self.gate
+
+
 class BSRoFormerSeparator(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
+        self.time_branch = TimeBranch(config) if config.use_time_branch else None
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, self.bands)
 
-    def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
+    def forward_real(
+        self,
+        mixture_real_imag: torch.Tensor,
+        mixture_audio: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         tokens = self.band_split.forward_real(mixture_real_imag)
+        if self.time_branch is not None and mixture_audio is not None:
+            time_tokens = self.time_branch(mixture_audio, tokens.shape[1])
+            tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2)
         tokens = self.encoder(tokens)
         vocal_mask = self.mask_head.forward_real(tokens)
 
@@ -844,15 +926,17 @@ class BSRoFormerSeparator(nn.Module):
         other_mask = one - vocal_mask
         return torch.cat((vocal_mask, other_mask), dim=1)
 
-    def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
+    ) -> torch.Tensor:
         mixture_real_imag = torch.view_as_real(mixture_spec.to(torch.complex64))
-        masks_real_imag = self.forward_real(mixture_real_imag)
+        masks_real_imag = self.forward_real(mixture_real_imag, mixture_audio)
         return torch.view_as_complex(masks_real_imag)
 
     def estimate_specs(
-        self, mixture_spec: torch.Tensor
+        self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        masks = self(mixture_spec)
+        masks = self(mixture_spec, mixture_audio)
         estimates = masks * mixture_spec[:, None]
         # Masks are complementary by construction. Route only floating-point
         # reconstruction residue to the accompaniment so vocals are never polluted.
@@ -869,11 +953,14 @@ class BSRoFormerSeparator(nn.Module):
 class MultiResolutionSTFTLoss(nn.Module):
     def __init__(
         self,
+        # Hop scales with the window (n_fft / 4). A constant hop across
+        # resolutions oversamples coarse windows (~93% overlap at n_fft=2048)
+        # while undersampling fine ones, and wastes compute on redundant frames.
         resolutions: Sequence[tuple[int, int, int]] = (
-            (2048, 147, 2048),
-            (1024, 147, 1024),
-            (512, 147, 512),
-            (256, 147, 256),
+            (2048, 512, 2048),
+            (1024, 256, 1024),
+            (512, 128, 512),
+            (256, 64, 256),
         ),
         activity_threshold: float = 1e-4,
     ):
@@ -1029,8 +1116,9 @@ class SeparationLoss(nn.Module):
         model: BSRoFormerSeparator,
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
+        mixture_audio: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        masks = model(mixture_spec)
+        masks = model(mixture_spec, mixture_audio)
         estimates = masks * mixture_spec[:, None]
         residual = mixture_spec - estimates.sum(dim=1)
         estimates[:, 1] = estimates[:, 1] + residual
@@ -2653,7 +2741,7 @@ def separate_tensor(
             window=stft_window,
         )
         with autocast_context(device, precision):
-            estimated_specs, _ = model.estimate_specs(spec)
+            estimated_specs, _ = model.estimate_specs(spec, chunk.unsqueeze(0))
         estimated = make_istft(
             estimated_specs,
             length=chunk_size,
@@ -3011,6 +3099,7 @@ def train(
                     model,
                     mixture_spec,
                     target_audio,
+                    mixture_audio,
                 )
                 scaled_loss = loss / args.grad_accumulation
 
@@ -3206,6 +3295,7 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         heads=args.heads,
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
+        use_time_branch=args.time_branch,
     )
 
 
@@ -3337,6 +3427,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--time_branch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accumulation", type=int, default=1)
