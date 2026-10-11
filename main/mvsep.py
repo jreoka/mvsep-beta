@@ -49,7 +49,6 @@ class ModelConfig:
     heads: int = 8
     dropout: float = 0.0
     use_checkpoint: bool = True
-    use_time_branch: bool = True
     time_branch_width: int = 128
     architecture: str = "bs124_roformer_axial_v7_timebranch"
 
@@ -902,7 +901,7 @@ class BSRoFormerSeparator(nn.Module):
         self.config = config
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
-        self.time_branch = TimeBranch(config) if config.use_time_branch else None
+        self.time_branch = TimeBranch(config)
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, self.bands)
 
@@ -912,7 +911,7 @@ class BSRoFormerSeparator(nn.Module):
         mixture_audio: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = self.band_split.forward_real(mixture_real_imag)
-        if self.time_branch is not None and mixture_audio is not None:
+        if mixture_audio is not None:
             time_tokens = self.time_branch(mixture_audio, tokens.shape[1])
             tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2)
         tokens = self.encoder(tokens)
@@ -3295,7 +3294,6 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         heads=args.heads,
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
-        use_time_branch=args.time_branch,
     )
 
 
@@ -3427,7 +3425,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--time_branch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accumulation", type=int, default=1)
