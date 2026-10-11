@@ -27,7 +27,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 10
 
 
 # -----------------------------------------------------------------------------
@@ -828,11 +828,28 @@ class MaskHead(nn.Module):
 
 
 
+class ChannelRMSNorm(nn.Module):
+    """Per-frame RMS normalization over channels for [batch, channels, frames]."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
 class ResidualDilatedBlock(nn.Module):
-    """Two-layer residual TCN block operating at the STFT frame rate."""
+    """Pre-norm residual TCN block at the STFT frame rate.
+
+    The norm bounds the block input whatever the conv weights have grown to.
+    Without it the unnormalized conv stack compounds under Prodigy's per-weight
+    updates: the time-branch activations grew ~1e8x within 30 steps.
+    """
 
     def __init__(self, width: int, dilation: int):
         super().__init__()
+        self.norm = ChannelRMSNorm(width)
         self.conv = nn.Conv1d(
             width, width, kernel_size=3, padding=dilation, dilation=dilation
         )
@@ -840,7 +857,7 @@ class ResidualDilatedBlock(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.proj(self.act(self.conv(x)))
+        return x + self.proj(self.act(self.conv(self.norm(x))))
 
 
 class TimeBranch(nn.Module):
@@ -852,9 +869,11 @@ class TimeBranch(nn.Module):
     the spectral branch smears), then the features are resampled to the
     exact STFT frame count and projected to ``dim``.
 
-    The output projection and fusion gate are zero-initialized, so a fresh
-    branch adds exactly nothing: forward behavior matches the branchless
-    model until training moves the gate.
+    Stability: the input is RMS-normalized, every residual block is pre-norm,
+    and the projected tokens are RMS-normalized before the gate. The gate
+    (init 0.1) alone sets the branch's scale relative to the band tokens, so
+    weight drift under Prodigy cannot blow up the branch (it previously grew
+    ~1e8x in 30 steps). Checkpoint format v10: v9 checkpoints do not load.
     """
 
     def __init__(self, config: ModelConfig):
@@ -874,25 +893,28 @@ class TimeBranch(nn.Module):
             ResidualDilatedBlock(width * 4, dilation=2),
             ResidualDilatedBlock(width * 4, dilation=4),
         )
+        self.out_norm = nn.RMSNorm(width * 4)
         self.proj = nn.Linear(width * 4, config.dim)
-        # Near-zero (not exact-zero) init: the fresh branch is a ~1e-3 scale
-        # perturbation, i.e. effectively an identity addition, while gradients
-        # still flow into the branch from the very first step. An exact-zero
-        # projection would additionally zero every upstream gradient at step 0
-        # (the branch would only start learning from step 1).
-        nn.init.normal_(self.proj.weight, std=1e-3)
+        self.token_norm = nn.RMSNorm(config.dim)
+        nn.init.normal_(self.proj.weight, std=1.0 / math.sqrt(width * 4))
         nn.init.zeros_(self.proj.bias)
-        # Gate starts at one; the tiny projection above is what keeps a fresh
-        # branch neutral.
-        self.gate = nn.Parameter(torch.ones(config.dim))
+        # The gate alone sets the branch's contribution to the band tokens: the
+        # projected output is RMS-normalized to unit scale per token, so the
+        # branch cannot grow past the band-token scale however far its weights
+        # drift. Starts at 0.1 (a small but nonzero contribution from step 0).
+        self.gate = nn.Parameter(torch.full((config.dim,), 0.1))
 
     def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
         # waveform: [B, channels, samples] -> [B, frames, dim]
-        features = self.body(self.entry(waveform))
+        # Scale-invariant input: divide by each example's RMS so the branch sees
+        # the same level regardless of the mix's loudness.
+        rms = waveform.square().mean(dim=(-2, -1), keepdim=True).sqrt()
+        features = self.body(self.entry(waveform / rms.clamp_min(1e-4)))
         features = F.interpolate(
             features, size=frames, mode="linear", align_corners=False
         )
-        return self.proj(features.transpose(1, 2)) * self.gate
+        tokens = self.token_norm(self.proj(self.out_norm(features.transpose(1, 2))))
+        return tokens * self.gate
 
 
 class BSRoFormerSeparator(nn.Module):
