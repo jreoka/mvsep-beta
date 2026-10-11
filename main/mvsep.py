@@ -97,10 +97,11 @@ class LossConfig:
     waveform_weight: float = 1.0
     main_stft_weight: float = 0.65
     mrstft_weight: float = 0.9
-    mask_weight: float = 0.15
+    mask_weight: float = 0.60
     sdr_weight: float = 0.30
     midside_weight: float = 0.05
     aux_weight: float = 0.30
+    consistency_weight: float = 0.30
 
 
 # -----------------------------------------------------------------------------
@@ -1209,6 +1210,13 @@ class SeparationLoss(nn.Module):
         )
         mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
 
+        # Soft sum-to-one: v6's hard residual complement forced selective
+        # masks; free joint heads collapse to smooth scalars without an
+        # equivalent pressure. Penalize the pair for not partitioning the
+        # mixture (complex 1+0j broadcasts). The output residual routing
+        # stays exact — this only shapes gradients.
+        consistency_loss = (masks[:, 0] + masks[:, 1] - 1.0).abs().mean()
+
         aux_loss = mask_loss.new_zeros(())
         if aux_masks is not None:
             aux_estimates = aux_masks * mixture_spec[:, None]
@@ -1237,6 +1245,7 @@ class SeparationLoss(nn.Module):
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
             + cfg.aux_weight * aux_loss
+            + cfg.consistency_weight * consistency_loss
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1260,6 +1269,7 @@ class SeparationLoss(nn.Module):
             "mrstft": mrstft_loss.detach(),
             "mask": mask_loss.detach(),
             "aux": aux_loss.detach(),
+            "consistency": consistency_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
             "vocal_level_db": vocal_level_db.detach(),
@@ -3209,7 +3219,7 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, vocal_db, mask_mag, aux = torch.stack(
+            wave, main_stft, mrstft, vocal_db, mask_mag, aux, cons = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
@@ -3217,6 +3227,7 @@ def train(
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
                     latest_metrics["aux"],
+                    latest_metrics["consistency"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
@@ -3226,6 +3237,7 @@ def train(
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
                 aux=f"{aux:.3f}",
+                cons=f"{cons:.3f}",
                 refresh=False,
             )
         progress.update(1)
