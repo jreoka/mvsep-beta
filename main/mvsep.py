@@ -27,7 +27,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 10
+CHECKPOINT_FORMAT_VERSION = 11
 
 
 # -----------------------------------------------------------------------------
@@ -77,10 +77,7 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture not in (
-            "bs124_roformer_axial_v6_direct_mask",
-            "bs124_roformer_axial_v7_timebranch",
-        ):
+        if self.architecture not in ("bs124_roformer_axial_v7_timebranch",):
             raise ValueError(
                 "Unsupported architecture "
                 f"{self.architecture!r}; expected "
@@ -873,11 +870,18 @@ class TimeBranch(nn.Module):
     and the projected tokens are RMS-normalized before the gate. The gate
     (init 0.1) alone sets the branch's scale relative to the band tokens, so
     weight drift under Prodigy cannot blow up the branch (it previously grew
-    ~1e8x in 30 steps). Checkpoint format v10: v9 checkpoints do not load.
+    ~1e8x in 30 steps). Checkpoint format v11: v10 checkpoints do not load
+    (per-band time gate added; stride asserted; RMS uses valid samples).
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        if config.hop_length != 8 * 8 * 8:
+            raise ValueError(
+                f"TimeBranch entry stride is fixed at 8x8x8=512; got "
+                f"hop_length={config.hop_length}. Pass hop_length=512 or "
+                "adjust the entry strides."
+            )
         width = config.time_branch_width
         channels = config.audio_channels
         self.entry = nn.Sequential(
@@ -904,11 +908,23 @@ class TimeBranch(nn.Module):
         # drift. Starts at 0.1 (a small but nonzero contribution from step 0).
         self.gate = nn.Parameter(torch.full((config.dim,), 0.1))
 
-    def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
+    def forward(
+        self,
+        waveform: torch.Tensor,
+        frames: int,
+        valid_samples: int | None = None,
+    ) -> torch.Tensor:
         # waveform: [B, channels, samples] -> [B, frames, dim]
         # Scale-invariant input: divide by each example's RMS so the branch sees
-        # the same level regardless of the mix's loudness.
-        rms = waveform.square().mean(dim=(-2, -1), keepdim=True).sqrt()
+        # the same level regardless of the mix's loudness. When the caller pads
+        # a short final chunk up to the full chunk size, valid_samples excludes
+        # the padding so the scale matches every other chunk.
+        if valid_samples is not None:
+            valid_samples = max(1, min(int(valid_samples), waveform.shape[-1]))
+            reference = waveform[..., :valid_samples]
+        else:
+            reference = waveform
+        rms = reference.square().mean(dim=(-2, -1), keepdim=True).sqrt()
         features = self.body(self.entry(waveform / rms.clamp_min(1e-4)))
         features = F.interpolate(
             features, size=frames, mode="linear", align_corners=False
@@ -924,6 +940,11 @@ class BSRoFormerSeparator(nn.Module):
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
         self.time_branch = TimeBranch(config)
+        # Per-band gate on the time-branch injection (init 1 = identical to the
+        # old unsqueeze-add at step 0, then learned per frequency region).
+        self.time_band_gate = nn.Parameter(
+            torch.ones(config.num_bands, config.dim)
+        )
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, self.bands)
 
@@ -931,11 +952,24 @@ class BSRoFormerSeparator(nn.Module):
         self,
         mixture_real_imag: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
+        mixture_valid_samples: int | None = None,
     ) -> torch.Tensor:
         tokens = self.band_split.forward_real(mixture_real_imag)
-        if mixture_audio is not None:
-            time_tokens = self.time_branch(mixture_audio, tokens.shape[1])
-            tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2)
+        if mixture_audio is None:
+            raise ValueError(
+                "mixture_audio is required: the time branch is always on, "
+                "and running without it would silently degrade the model."
+            )
+        if tokens.shape[2] != self.config.num_bands:
+            raise ValueError(
+                f"Expected {self.config.num_bands} band tokens, got "
+                f"{tokens.shape[2]}; time_band_gate would misalign."
+            )
+        time_tokens = self.time_branch(
+            mixture_audio, tokens.shape[1], valid_samples=mixture_valid_samples
+        )
+        gate = self.time_band_gate.to(dtype=tokens.dtype, device=tokens.device)
+        tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2) * gate
         tokens = self.encoder(tokens)
         vocal_mask = self.mask_head.forward_real(tokens)
 
@@ -948,16 +982,24 @@ class BSRoFormerSeparator(nn.Module):
         return torch.cat((vocal_mask, other_mask), dim=1)
 
     def forward(
-        self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
+        self,
+        mixture_spec: torch.Tensor,
+        mixture_audio: torch.Tensor | None = None,
+        mixture_valid_samples: int | None = None,
     ) -> torch.Tensor:
         mixture_real_imag = torch.view_as_real(mixture_spec.to(torch.complex64))
-        masks_real_imag = self.forward_real(mixture_real_imag, mixture_audio)
+        masks_real_imag = self.forward_real(
+            mixture_real_imag, mixture_audio, mixture_valid_samples
+        )
         return torch.view_as_complex(masks_real_imag)
 
     def estimate_specs(
-        self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
+        self,
+        mixture_spec: torch.Tensor,
+        mixture_audio: torch.Tensor | None = None,
+        mixture_valid_samples: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        masks = self(mixture_spec, mixture_audio)
+        masks = self(mixture_spec, mixture_audio, mixture_valid_samples)
         estimates = masks * mixture_spec[:, None]
         # Masks are complementary by construction. Route only floating-point
         # reconstruction residue to the accompaniment so vocals are never polluted.
@@ -2762,7 +2804,9 @@ def separate_tensor(
             window=stft_window,
         )
         with autocast_context(device, precision):
-            estimated_specs, _ = model.estimate_specs(spec, chunk.unsqueeze(0))
+            estimated_specs, _ = model.estimate_specs(
+                spec, chunk.unsqueeze(0), mixture_valid_samples=usable
+            )
         estimated = make_istft(
             estimated_specs,
             length=chunk_size,
