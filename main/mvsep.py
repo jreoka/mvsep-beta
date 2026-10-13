@@ -23,24 +23,19 @@ from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 11
-
-
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+CHECKPOINT_FORMAT_VERSION = 12
+RUNTIME_CONFIG_FIELDS = frozenset({"use_checkpoint"})
 
 
 @dataclass
 class ModelConfig:
     sample_rate: int = 44_100
-    n_fft: int = 2048
+    n_fft: int = 4096
     hop_length: int = 512
-    win_length: int = 2048
+    win_length: int = 4096
     audio_channels: int = 2
     num_stems: int = len(STEMS)
     num_bands: int = 124
@@ -50,7 +45,7 @@ class ModelConfig:
     dropout: float = 0.0
     use_checkpoint: bool = True
     time_branch_width: int = 128
-    architecture: str = "bs124_roformer_axial_v7_timebranch"
+    architecture: str = "bs124_roformer_axial_v8"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -64,9 +59,7 @@ class ModelConfig:
         if self.audio_channels != 2:
             raise ValueError("This trainer currently requires stereo audio_channels=2.")
         if self.num_stems != len(STEMS):
-            raise ValueError(
-                f"num_stems must match STEMS ({len(STEMS)}), got {self.num_stems}."
-            )
+            raise ValueError(f"num_stems must match STEMS ({len(STEMS)}), got {self.num_stems}.")
         if self.dim <= 0 or self.depth <= 0 or self.heads <= 0:
             raise ValueError("dim, depth, and heads must be positive.")
         if self.dim % self.heads != 0:
@@ -77,12 +70,8 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture not in ("bs124_roformer_axial_v7_timebranch",):
-            raise ValueError(
-                "Unsupported architecture "
-                f"{self.architecture!r}; expected "
-                "bs124_roformer_axial_v7_timebranch."
-            )
+        if self.architecture != "bs124_roformer_axial_v8":
+            raise ValueError(f"Unsupported architecture {self.architecture!r}.")
         if self.time_branch_width <= 0:
             raise ValueError("time_branch_width must be positive.")
 
@@ -90,16 +79,10 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     waveform_weight: float = 1.0
-    main_stft_weight: float = 0.65
-    mrstft_weight: float = 0.9
-    mask_weight: float = 0.15
-    sdr_weight: float = 0.30
-    midside_weight: float = 0.05
-
-
-# -----------------------------------------------------------------------------
-# Small utilities
-# -----------------------------------------------------------------------------
+    sdr_weight: float = 0.35
+    main_stft_weight: float = 0.55
+    mrstft_weight: float = 0.55
+    midside_weight: float = 0.10
 
 
 def seed_everything(seed: int) -> None:
@@ -134,14 +117,10 @@ def clean_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Ten
     return cleaned
 
 
-RUNTIME_CONFIG_FIELDS = frozenset({"use_checkpoint"})
-
-
 def model_configs_compatible(
     saved_config: dict | None,
     current_config: ModelConfig,
 ) -> bool:
-    """Compare checkpoint-sensitive model fields, excluding runtime switches."""
     if not isinstance(saved_config, dict):
         return False
     current = asdict(current_config)
@@ -175,11 +154,6 @@ def load_matching_state_dict(
     module: nn.Module,
     state_dict: dict[str, torch.Tensor],
 ) -> StateLoadReport:
-    """Load keys whose names and shapes match and report exact coverage.
-
-    Callers must check ``is_exact``: a partial load means the checkpoint does
-    not match this architecture and must be rejected.
-    """
     current = module.state_dict()
     incoming = clean_state_dict(state_dict)
     matched: dict[str, torch.Tensor] = {}
@@ -208,13 +182,6 @@ def build_bs_bands(
     n_fft: int,
     num_bands: int,
 ) -> list[tuple[int, int]]:
-    """Build the regular disjoint BS-RoFormer frequency bands.
-
-    The 2048-FFT / 124-band preset refines the established 62-band BS-RoFormer
-    layout by splitting every original band in two. Every real-STFT bin is
-    assigned to exactly one band; there is no Mel spacing, overlap, duplicated
-    coverage, or cross-band mask averaging.
-    """
     freq_bins = n_fft // 2 + 1
     if num_bands <= 0:
         raise ValueError("num_bands must be positive.")
@@ -223,26 +190,21 @@ def build_bs_bands(
             f"Cannot create {num_bands} non-empty bands from {freq_bins} bins."
         )
 
-    if n_fft == 2048 and num_bands in (62, 124):
+    if n_fft == 4096 and num_bands == 124:
         base_widths = (
-            [2] * 24
-            + [4] * 12
-            + [12] * 8
+            [4] * 24
+            + [8] * 12
             + [24] * 8
             + [48] * 8
-            + [128, 129]
+            + [96] * 8
+            + [256, 257]
         )
-        if num_bands == 124:
-            widths = [
-                part
-                for width in base_widths
-                for part in (width // 2, width - width // 2)
-            ]
-        else:
-            widths = base_widths
+        widths = [
+            part
+            for width in base_widths
+            for part in (width // 2, width - width // 2)
+        ]
     else:
-        # Deterministic non-Mel fallback: many narrow low-frequency bands and
-        # progressively wider high-frequency bands, with strict disjoint coverage.
         positions = torch.linspace(0.0, 1.0, num_bands + 1)
         boundaries = torch.round(positions.square() * freq_bins).long()
         boundaries[0] = 0
@@ -286,7 +248,6 @@ def make_stft(
     win_length: int,
     window: torch.Tensor,
 ) -> torch.Tensor:
-    """STFT for tensors shaped [..., samples]."""
     original_shape = audio.shape[:-1]
     audio_flat = audio.reshape(-1, audio.shape[-1]).float()
     spec = torch.stft(
@@ -309,7 +270,6 @@ def make_istft(
     win_length: int,
     window: torch.Tensor,
 ) -> torch.Tensor:
-    """ISTFT for tensors shaped [..., frequency, frames]."""
     original_shape = spec.shape[:-2]
     spec_flat = spec.reshape(-1, spec.shape[-2], spec.shape[-1]).to(torch.complex64)
     audio = torch.istft(
@@ -322,11 +282,6 @@ def make_istft(
         length=length,
     )
     return audio.reshape(*original_shape, length)
-
-
-# -----------------------------------------------------------------------------
-# Model
-# -----------------------------------------------------------------------------
 
 
 class RotaryEmbedding(nn.Module):
@@ -411,8 +366,6 @@ class RoPEAttention(nn.Module):
         k = apply_rope(k, cos, sin)
 
         attention_dropout = self.dropout if self.training else 0.0
-        # PyTorch SDPA selects the best available kernel per call (flash,
-        # cuDNN, memory-efficient, or math fallback) with no manual tuning.
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -440,8 +393,6 @@ class TransformerUnit(nn.Module):
         )
         self.ff_norm = nn.RMSNorm(dim)
         self.ff = GELUMlp(dim, dropout=dropout)
-        # Zero-init the FF output projection so the feed-forward residual path
-        # starts neutral and is learned on top of the attention function.
         nn.init.zeros_(self.ff.fc2.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -486,7 +437,6 @@ class DualPathEncoder(nn.Module):
         return checkpoint(module, x, use_reentrant=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, frames, bands, dim]
         batch, frames, bands, dim = x.shape
         should_checkpoint = self.use_checkpoint and self.training
 
@@ -507,8 +457,6 @@ def next_power_of_two(value: int) -> int:
 
 
 class BandInputGroup(nn.Module):
-    """A batch of bands padded only to the next power-of-two width."""
-
     def __init__(
         self,
         config: ModelConfig,
@@ -571,7 +519,6 @@ class BandInputGroup(nn.Module):
             self.gamma.masked_fill_(~self.feature_valid, 0.0)
 
     def forward(self, real_imag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # real_imag: [B, T, F, C, 2]
         gathered = real_imag[:, :, self.freq_indices]
         features = gathered.reshape(
             gathered.shape[0],
@@ -589,8 +536,6 @@ class BandInputGroup(nn.Module):
 
 
 class BandSplit(nn.Module):
-    """Project each disjoint complex stereo BS band into one token."""
-
     def __init__(self, config: ModelConfig, bands: Sequence[tuple[int, int]]):
         super().__init__()
         self.num_bands = len(bands)
@@ -635,15 +580,12 @@ class BandSplit(nn.Module):
             nn.SiLU(),
             nn.Linear(config.dim, config.dim, bias=False),
         )
-        # Keep the new constant band metadata path neutral at initialization so
-        # the learned band projections stay dominant at the start of training.
         nn.init.zeros_(self.metadata_proj[-1].weight)
-
         self.energy_weight = nn.Parameter(torch.empty(self.num_bands, 2, config.dim))
         nn.init.normal_(self.energy_weight, std=0.02)
 
     def forward_real(self, real_imag: torch.Tensor) -> torch.Tensor:
-        real_imag = real_imag.permute(0, 3, 2, 1, 4)  # [B, T, F, C, 2]
+        real_imag = real_imag.permute(0, 3, 2, 1, 4)
         output = real_imag.new_zeros(
             real_imag.shape[0],
             real_imag.shape[1],
@@ -676,9 +618,6 @@ class BandSplit(nn.Module):
             self.band_metadata.to(device=output.device, dtype=output.dtype)
         )[None, None]
         return output + energy_tokens.to(dtype=output.dtype) + metadata_tokens
-
-    def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
-        return self.forward_real(torch.view_as_real(mixture_spec.to(torch.complex64)))
 
 
 class BandMaskGroup(nn.Module):
@@ -719,25 +658,31 @@ class BandMaskGroup(nn.Module):
         self.register_buffer("freq_indices", freq_indices, persistent=False)
         self.register_buffer("feature_valid", feature_valid, persistent=False)
 
-        # Each band token is decoded to its complex stereo mask by a single
-        # band-specific gated linear projection. There is no shared predictor
-        # network on top of the transformer; the encoder representation is
-        # mapped straight to mask coefficients.
+        hidden_dim = config.dim * 2
         output_width = self.num_predicted_stems * self.feature_width
+        self.norm = nn.RMSNorm(config.dim)
+        self.fc1_weight = nn.Parameter(
+            torch.empty(self.num_group_bands, config.dim, hidden_dim)
+        )
+        self.fc1_bias = nn.Parameter(
+            torch.zeros(self.num_group_bands, hidden_dim)
+        )
         self.output_weight = nn.Parameter(
-            torch.empty(self.num_group_bands, config.dim, output_width * 2)
+            torch.empty(self.num_group_bands, hidden_dim, output_width * 2)
         )
         self.output_bias = nn.Parameter(
             torch.zeros(self.num_group_bands, output_width * 2)
         )
+        nn.init.normal_(self.fc1_weight, std=1.0 / math.sqrt(config.dim))
         nn.init.normal_(self.output_weight, std=1e-3)
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: [B, T, group_bands, D]
-        raw = torch.einsum("btnd,ndq->btnq", x, self.output_weight)
+        h = self.norm(x)
+        h = F.silu(torch.einsum("btnd,ndh->btnh", h, self.fc1_weight) + self.fc1_bias[None, None])
+        raw = torch.einsum("btnh,nhq->btnq", h, self.output_weight)
         raw = F.glu(raw + self.output_bias[None, None], dim=-1)
         raw = raw.reshape(
             x.shape[0],
@@ -768,14 +713,6 @@ class BandMaskGroup(nn.Module):
 
 
 class MaskHead(nn.Module):
-    """Decode final transformer tokens into the foreground vocal mask.
-
-    Mask prediction happens entirely inside the transformer's output stage:
-    each normalized band token is mapped to its band's complex stereo mask by
-    a per-band gated linear projection, with no dedicated predictor network
-    between the encoder and the mask output.
-    """
-
     def __init__(
         self,
         config: ModelConfig,
@@ -801,7 +738,6 @@ class MaskHead(nn.Module):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, bands, D]
         output = x.new_zeros(
             x.shape[0], 1, self.audio_channels, x.shape[1], self.freq_bins, 2
         )
@@ -814,20 +750,11 @@ class MaskHead(nn.Module):
             output.scatter_add_(dim=4, index=scatter_index, src=source)
 
         output = output.permute(0, 1, 2, 4, 3, 5).contiguous().float()
-        # Keep a neutral two-source prior. It does not force leakage: the learned
-        # raw mask can move all the way to zero, while retaining 0.5 keeps the
-        # vocal head centered at the outset of training.
         mask_bias = output.new_tensor((0.5, 0.0))
         return output + mask_bias
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.view_as_complex(self.forward_real(x))
-
-
 
 class ChannelRMSNorm(nn.Module):
-    """Per-frame RMS normalization over channels for [batch, channels, frames]."""
-
     def __init__(self, channels: int):
         super().__init__()
         self.norm = nn.RMSNorm(channels)
@@ -837,13 +764,6 @@ class ChannelRMSNorm(nn.Module):
 
 
 class ResidualDilatedBlock(nn.Module):
-    """Pre-norm residual TCN block at the STFT frame rate.
-
-    The norm bounds the block input whatever the conv weights have grown to.
-    Without it the unnormalized conv stack compounds under Prodigy's per-weight
-    updates: the time-branch activations grew ~1e8x within 30 steps.
-    """
-
     def __init__(self, width: int, dilation: int):
         super().__init__()
         self.norm = ChannelRMSNorm(width)
@@ -858,38 +778,21 @@ class ResidualDilatedBlock(nn.Module):
 
 
 class TimeBranch(nn.Module):
-    """Lightweight waveform branch fused into the band tokens pre-encoder.
-
-    Three strided conv blocks downsample stereo audio to roughly the STFT
-    frame rate (total stride 512 = hop_length), a short stack of dilated
-    residual blocks adds temporal context (attacks, transients, phase cues
-    the spectral branch smears), then the features are resampled to the
-    exact STFT frame count and projected to ``dim``.
-
-    Stability: the input is RMS-normalized, every residual block is pre-norm,
-    and the projected tokens are RMS-normalized before the gate. The gate
-    (init 0.1) alone sets the branch's scale relative to the band tokens, so
-    weight drift under Prodigy cannot blow up the branch (it previously grew
-    ~1e8x in 30 steps). Checkpoint format v11: v10 checkpoints do not load
-    (per-band time gate added; stride asserted).
-    """
-
     def __init__(self, config: ModelConfig):
         super().__init__()
-        if config.hop_length != 8 * 8 * 8:
+        if config.hop_length % 64 != 0:
             raise ValueError(
-                f"TimeBranch entry stride is fixed at 8x8x8=512; got "
-                f"hop_length={config.hop_length}. Pass hop_length=512 or "
-                "adjust the entry strides."
+                f"TimeBranch requires hop_length divisible by 64, got {config.hop_length}."
             )
         width = config.time_branch_width
         channels = config.audio_channels
+        stride3 = config.hop_length // 64
         self.entry = nn.Sequential(
             nn.Conv1d(channels, width, kernel_size=15, stride=8, padding=7),
             nn.GELU(),
             nn.Conv1d(width, width * 2, kernel_size=15, stride=8, padding=7),
             nn.GELU(),
-            nn.Conv1d(width * 2, width * 4, kernel_size=15, stride=8, padding=7),
+            nn.Conv1d(width * 2, width * 4, kernel_size=15, stride=stride3, padding=7),
             nn.GELU(),
         )
         self.body = nn.Sequential(
@@ -902,21 +805,16 @@ class TimeBranch(nn.Module):
         self.token_norm = nn.RMSNorm(config.dim)
         nn.init.normal_(self.proj.weight, std=1.0 / math.sqrt(width * 4))
         nn.init.zeros_(self.proj.bias)
-        # The gate alone sets the branch's contribution to the band tokens: the
-        # projected output is RMS-normalized to unit scale per token, so the
-        # branch cannot grow past the band-token scale however far its weights
-        # drift. Starts at 0.1 (a small but nonzero contribution from step 0).
         self.gate = nn.Parameter(torch.full((config.dim,), 0.1))
 
     def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
-        # waveform: [B, channels, samples] -> [B, frames, dim]
-        # Scale-invariant input: divide by each example's RMS so the branch sees
-        # the same level regardless of the mix's loudness.
         rms = waveform.square().mean(dim=(-2, -1), keepdim=True).sqrt()
-        features = self.body(self.entry(waveform / rms.clamp_min(1e-4)))
-        features = F.interpolate(
-            features, size=frames, mode="linear", align_corners=False
-        )
+        normed = waveform / rms.clamp_min(1e-4)
+        features = self.body(self.entry(normed))
+        if features.shape[-1] < frames:
+            features = F.pad(features, (0, frames - features.shape[-1]), mode="replicate")
+        elif features.shape[-1] > frames:
+            features = features[..., :frames]
         tokens = self.token_norm(self.proj(self.out_norm(features.transpose(1, 2))))
         return tokens * self.gate
 
@@ -928,8 +826,6 @@ class BSRoFormerSeparator(nn.Module):
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
         self.time_branch = TimeBranch(config)
-        # Per-band gate on the time-branch injection (init 1 = identical to the
-        # old unsqueeze-add at step 0, then learned per frequency region).
         self.time_band_gate = nn.Parameter(
             torch.ones(config.num_bands, config.dim)
         )
@@ -958,9 +854,6 @@ class BSRoFormerSeparator(nn.Module):
         tokens = self.encoder(tokens)
         vocal_mask = self.mask_head.forward_real(tokens)
 
-        # No vocal activity gate: the separator's foreground mask is used directly.
-        # The accompaniment remains the exact residual complement, so reconstruction
-        # consistency never injects residual mixture energy back into the vocal stem.
         one = torch.zeros_like(vocal_mask)
         one[..., 0] = 1.0
         other_mask = one - vocal_mask
@@ -978,25 +871,16 @@ class BSRoFormerSeparator(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         masks = self(mixture_spec, mixture_audio)
         estimates = masks * mixture_spec[:, None]
-        # Masks are complementary by construction. Route only floating-point
-        # reconstruction residue to the accompaniment so vocals are never polluted.
         residual = mixture_spec - estimates.sum(dim=1)
         estimates[:, 1] = estimates[:, 1] + residual
         return estimates, masks
 
 
-# -----------------------------------------------------------------------------
-# Losses
-# -----------------------------------------------------------------------------
-
-
 class MultiResolutionSTFTLoss(nn.Module):
     def __init__(
         self,
-        # Hop scales with the window (n_fft / 4). A constant hop across
-        # resolutions oversamples coarse windows (~93% overlap at n_fft=2048)
-        # while undersampling fine ones, and wastes compute on redundant frames.
         resolutions: Sequence[tuple[int, int, int]] = (
+            (4096, 1024, 4096),
             (2048, 512, 2048),
             (1024, 256, 1024),
             (512, 128, 512),
@@ -1049,11 +933,6 @@ class MultiResolutionSTFTLoss(nn.Module):
                 (pred_mag - target_mag).flatten(1), dim=1
             )
             target_norm = torch.linalg.vector_norm(target_mag.flatten(1), dim=1)
-            # Spectral convergence is a relative error and is undefined for a
-            # silent target. Dividing leakage by a tiny epsilon made silent stem
-            # channels produce losses in the hundreds of millions. The absolute
-            # log-magnitude and complex terms below still train those channels
-            # toward silence.
             active_diff_norm = diff_norm[active_targets]
             active_target_norm = target_norm[active_targets]
             spectral_convergence = (
@@ -1066,31 +945,27 @@ class MultiResolutionSTFTLoss(nn.Module):
             )
             complex_normalizer = target_mag.mean().detach().clamp_min(1e-4)
             complex_loss = (pred_spec - target_spec).abs().mean() / complex_normalizer
-            total = total + spectral_convergence + log_magnitude + 0.25 * complex_loss
+            total = total + spectral_convergence + log_magnitude + 0.35 * complex_loss
 
         return total / len(self.resolutions)
 
 
-def normalized_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Relative L1 without letting fully silent stems dominate the batch.
-
-    A fixed 1e-4 denominator makes a deliberately zeroed vocal target hundreds of
-    times more important than an ordinary active source.  That creates a strong
-    collapse incentive for a foreground/residual separator: predicting no vocals
-    anywhere cheaply solves those rare examples.  Floor each source denominator
-    at 5% of the strongest target level in the same example instead.  Active
-    sources keep their normal relative scaling while silent sources remain
-    supervised, just not catastrophically overweighted.
-    """
-    error = (prediction - target).abs().mean(dim=-1)
+def mixture_normalized_wave_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    diff = prediction - target
+    l1_error = diff.abs().mean(dim=-1)
+    l2_error = diff.square().mean(dim=-1).add(1e-8).sqrt()
     scale = target.abs().mean(dim=-1)
     if scale.ndim > 1:
         reduce_dims = tuple(range(1, scale.ndim))
-        reference = scale.amax(dim=reduce_dims, keepdim=True)
+        reference = scale.amax(dim=reduce_dims, keepdim=True).clamp_min(1e-4)
     else:
-        reference = scale
-    scale_floor = (0.05 * reference).clamp_min(1e-4)
-    return (error / torch.maximum(scale, scale_floor)).mean()
+        reference = scale.clamp_min(1e-4)
+    scale_floor = (0.10 * reference).clamp_min(1e-4)
+    denom = torch.maximum(scale, scale_floor)
+    return (0.6 * (l1_error / denom) + 0.4 * (l2_error / reference)).mean()
 
 
 def scale_dependent_sdr_loss(
@@ -1099,7 +974,7 @@ def scale_dependent_sdr_loss(
 ) -> torch.Tensor:
     error_power = (prediction - target).square().mean(dim=(-2, -1))
     target_power = target.square().mean(dim=(-2, -1))
-    valid = target_power > 1e-7
+    valid = target_power > 1e-6
     ratio_db = 10.0 * torch.log10(
         (target_power + 1e-8) / (error_power + 1e-8)
     )
@@ -1113,31 +988,6 @@ def mid_side(audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     mid = (audio[..., 0, :] + audio[..., 1, :]) * 0.5
     side = (audio[..., 0, :] - audio[..., 1, :]) * 0.5
     return mid, side
-
-
-def frame_mean_square(
-    audio: torch.Tensor,
-    win_length: int,
-    hop_length: int,
-) -> torch.Tensor:
-    """Frame-local mean-square envelope aligned to center=True STFT frames.
-
-    ``audio`` is [..., samples] and the result is [..., n_frames]; leading
-    dimensions are preserved so a batch of mixes is pooled independently (the
-    previous mean over dim -2 merged batch entries together).
-
-    Keeping this in the power domain avoids the singular derivative of sqrt(0),
-    which matters because silence augmentation intentionally creates exact zeros.
-    """
-    flat = audio.square().reshape(-1, audio.shape[-1]).unsqueeze(1)
-    pooled = F.avg_pool1d(
-        flat,
-        kernel_size=win_length,
-        stride=hop_length,
-        padding=win_length // 2,
-        count_include_pad=False,
-    )
-    return pooled.squeeze(1).reshape(*audio.shape[:-1], pooled.shape[-1])
 
 
 class SeparationLoss(nn.Module):
@@ -1179,7 +1029,7 @@ class SeparationLoss(nn.Module):
             window=self.window,
         )
 
-        wave_loss = normalized_l1(pred_audio, target_audio)
+        wave_loss = mixture_normalized_wave_loss(pred_audio, target_audio)
         mrstft_loss = self.mrstft(pred_audio, target_audio)
 
         target_mag = target_specs.abs()
@@ -1188,25 +1038,12 @@ class SeparationLoss(nn.Module):
         main_logmag = F.l1_loss(torch.log1p(estimates.abs()), torch.log1p(target_mag))
         main_stft_loss = main_complex + main_logmag
 
-        mix_power = mixture_spec.abs().square()
-        ideal_masks = (
-            target_specs * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
-        )
-        ideal_mag = ideal_masks.abs().clamp_max(8.0)
-        ideal_masks = torch.polar(ideal_mag, torch.angle(ideal_masks))
-        tf_weight = mixture_spec.abs()
-        tf_weight = tf_weight / tf_weight.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-4)
-        tf_weight = tf_weight.clamp(max=5.0)
-        effective_masks = (
-            estimates * mixture_spec[:, None].conj() / (mix_power[:, None] + 1e-5)
-        )
-        mask_loss = ((effective_masks - ideal_masks).abs() * tf_weight[:, None]).mean()
-
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
         true_mid, true_side = mid_side(target_audio)
         midside_loss = 0.5 * (
-            normalized_l1(pred_mid, true_mid) + normalized_l1(pred_side, true_side)
+            mixture_normalized_wave_loss(pred_mid, true_mid)
+            + mixture_normalized_wave_loss(pred_side, true_side)
         )
 
         cfg = self.loss_config
@@ -1214,7 +1051,6 @@ class SeparationLoss(nn.Module):
             cfg.waveform_weight * wave_loss
             + cfg.main_stft_weight * main_stft_loss
             + cfg.mrstft_weight * mrstft_loss
-            + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
         )
@@ -1238,18 +1074,12 @@ class SeparationLoss(nn.Module):
             "wave": wave_loss.detach(),
             "main_stft": main_stft_loss.detach(),
             "mrstft": mrstft_loss.detach(),
-            "mask": mask_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
         }
         return total, metrics
-
-
-# -----------------------------------------------------------------------------
-# Dataset and augmentation
-# -----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -1274,13 +1104,6 @@ def find_optional_audio_file(directory: str, stem: str) -> str | None:
 
 
 def resolve_target_paths(directory: str) -> dict[str, tuple[str, ...]] | None:
-    """Resolve a track to the logical two-stem training contract.
-
-    Native two-stem datasets may provide ``vocals`` plus ``other``,
-    ``instrumental``, or ``accompaniment``. Standard MUSDB tracks instead store
-    bass, drums, and other separately; those three files must be summed or the
-    training mixture would silently omit most of the accompaniment.
-    """
     vocals = find_optional_audio_file(directory, "vocals")
     if vocals is None:
         return None
@@ -1291,8 +1114,6 @@ def resolve_target_paths(directory: str) -> dict[str, tuple[str, ...]] | None:
     if bass is not None and drums is not None and other is not None:
         accompaniment = (bass, drums, other)
     elif bass is not None or drums is not None:
-        # A partially populated MUSDB track is unsafe: falling back to other
-        # would create a mixture with missing accompaniment components.
         return None
     else:
         accompaniment_path = (
@@ -1306,13 +1127,7 @@ def resolve_target_paths(directory: str) -> dict[str, tuple[str, ...]] | None:
     return {"vocals": (vocals,), "other": accompaniment}
 
 
-# -----------------------------------------------------------------------------
-# Wet / backwards / wide vocal augmentation
-# -----------------------------------------------------------------------------
-
-
 def fft_convolve(signal: torch.Tensor, impulse: torch.Tensor) -> torch.Tensor:
-    """Convolve [channels, samples] signal with a 1-D impulse via FFT."""
     total = signal.shape[-1] + impulse.shape[-1] - 1
     fft_size = 1
     while fft_size < total:
@@ -1326,17 +1141,11 @@ def fft_convolve(signal: torch.Tensor, impulse: torch.Tensor) -> torch.Tensor:
 
 
 def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
-    """Random exponentially decaying noise IR with a short pre-delay.
-
-    The tail is low-passed at a random 3-9 kHz corner.  A white-noise IR
-    sounds like a bright hiss and trains the separator to smear broadband
-    energy around the voice; real rooms roll the highs off.
-    """
-    length = min(int(random.uniform(0.4, 2.0) * sample_rate), max_length)
-    pre_delay = int(random.uniform(0.0, 0.12) * sample_rate)
+    length = min(int(random.uniform(0.3, 1.2) * sample_rate), max_length)
+    pre_delay = int(random.uniform(0.0, 0.05) * sample_rate)
     tail = max(1, length - pre_delay)
     time = torch.arange(tail, dtype=torch.float32)
-    tau = random.uniform(0.08, 0.4) * sample_rate
+    tau = random.uniform(0.08, 0.3) * sample_rate
     impulse = torch.randn(tail, dtype=torch.float32) * torch.exp(-time / tau)
     if pre_delay > 0:
         impulse = torch.cat((torch.zeros(pre_delay, dtype=torch.float32), impulse))
@@ -1349,254 +1158,20 @@ def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
 
 
 def apply_reverb(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Mix a synthetic reverb tail into a stem so wet vocals stay extractable.
-
-    The wet mix is deliberately modest: a loud diffuse tail in the vocal
-    target overlaps the instrumental's high band (cymbals, hats) for seconds
-    after the voice stops, and a mask separator answers by leaving its mask
-    open there -- the "static instrumental riding the vocals" artifact.
-    """
     impulse = make_reverb_impulse(sample_rate, audio.shape[-1])
     wet = fft_convolve(audio, impulse)
-    mix = random.uniform(0.1, 0.3)
+    mix = random.uniform(0.08, 0.22)
     return (1.0 - mix) * audio + mix * wet
 
 
-def apply_reverse_echo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Add a reversed, swelling vocal window that flows into the following voice.
-
-    This mimics the production trick where a reversed reverb of the upcoming
-    phrase swells up right before the downbeat.  The reversed copy is part of
-    the generated vocal target, so the model learns to attribute backwards-
-    smeared vocal energy to the vocals instead of leaking it to accompaniment.
-    """
-    samples = audio.shape[-1]
-    window = min(int(random.uniform(0.4, 1.6) * sample_rate), samples // 2)
-    if random.random() < 0.75:
-        # Bias the window end toward a frame with vocal energy so the swell
-        # flows into the voice, like a reverse-reverb pre-echo.
-        energy = audio.square().mean(dim=0)
-        weight = energy.clamp_min(1e-6).sqrt()
-        weight = weight * 0.7 + weight.mean() * 0.3
-        candidates = weight[window:]
-        total_weight = candidates.sum()
-        if total_weight > 0:
-            end = (
-                int(torch.multinomial(candidates.double() / total_weight, 1).item())
-                + window
-            )
-        else:
-            end = random.randint(window, samples)
-    else:
-        end = random.randint(window, samples)
-    start = end - window
-
-    echo = audio[:, start:end].flip(dims=(-1,))
-    if random.random() < 0.6:
-        impulse = make_reverb_impulse(sample_rate, window)
-        echo = fft_convolve(echo, impulse)
-    swell = torch.linspace(0.05, 1.0, window) ** random.uniform(1.0, 2.5)
-    gain = random.uniform(0.12, 0.4)
-    augmented = audio.clone()
-    augmented[:, start:end] += gain * swell[None] * echo
-    return augmented
-
-
 def apply_air_boost(audio: torch.Tensor) -> torch.Tensor:
-    """Random first-order pre-emphasis: a gentle high-frequency "air" lift.
-
-    The coefficient is kept moderate: y[n] = x[n] - c*x[n-1] is a high-freq
-    differentiator, and at c=0.95 it pushes +6 dB at Nyquist while turning any
-    residual stem noise into audible hiss.
-    """
-    coefficient = random.uniform(0.3, 0.6)
+    coefficient = random.uniform(0.15, 0.35)
     boosted = audio.clone()
     boosted[:, 1:] = audio[:, 1:] - coefficient * audio[:, :-1]
     return boosted
 
 
-def make_synth_lead(sample_rate: int, duration: int) -> torch.Tensor:
-    """A vocal-ish sustained synth tone: harmonics, vibrato, slow envelope.
-
-    Clean harmonic timbre with no formant structure and no breath noise --
-    the opposite of a real voice.  Placed in the accompaniment, it teaches the
-    model that a prominent sustained pitched tone is not automatically vocals.
-    """
-    f0 = math.exp(random.uniform(math.log(80.0), math.log(880.0)))
-    t = torch.arange(duration, dtype=torch.float32) / sample_rate
-    vibrato_depth = random.uniform(0.0, 0.004)
-    vibrato_rate = random.uniform(3.0, 6.5)
-    freq = f0 * (1.0 + vibrato_depth * torch.sin(2 * math.pi * vibrato_rate * t))
-    phase = 2 * math.pi * torch.cumsum(freq, dim=0) / sample_rate
-    harmonics = random.randint(8, 28)
-    harmonics = min(harmonics, int(sample_rate / (2 * f0)) - 1)
-    harmonics = max(1, harmonics)
-    # Rolloff kept >= 1.0: slower rolloffs make the lead buzzy, and a bright
-    # harmonic stack in the accompaniment is exactly what leaks into the
-    # vocal output as high-frequency shimmer.
-    rolloff = random.uniform(1.0, 1.5)
-    wave = torch.zeros(duration, dtype=torch.float32)
-    for k in range(1, harmonics + 1):
-        amp = (k ** -rolloff) * random.uniform(0.7, 1.3)
-        wave += amp * torch.sin(k * phase)
-    attack = int(random.uniform(0.05, 0.4) * sample_rate)
-    release = int(random.uniform(0.1, 0.6) * sample_rate)
-    env = torch.ones(duration)
-    if attack > 1:
-        env[:attack] = torch.linspace(0.0, 1.0, attack)
-    if release > 1:
-        env[-release:] = torch.linspace(1.0, 0.0, release)
-    tremolo = 1.0 + random.uniform(0.05, 0.2) * torch.sin(
-        2 * math.pi * random.uniform(2.0, 5.0) * t
-    )
-    return wave * env * tremolo
-
-
-def add_synth_lead(
-    other: torch.Tensor,
-    vocal: torch.Tensor,
-    sample_rate: int,
-) -> torch.Tensor:
-    """Drop a prominent vocal-sounding synth lead into the accompaniment.
-
-    Placement is biased toward windows where the vocal is quiet, recreating
-    the hard case of a vocal-like lead synth playing on its own (e.g. the
-    intro of a pop track).
-    """
-    samples = other.shape[-1]
-    duration = min(int(random.uniform(1.5, 6.0) * sample_rate), samples)
-    if random.random() < 0.6 and duration < samples:
-        energy = vocal.square().mean(dim=0)
-        weight = energy.clamp_min(1e-6).sqrt()
-        weight = weight * 0.7 + weight.mean() * 0.3
-        weight = weight.max() - weight + weight.mean() * 0.5
-        candidates = weight[: samples - duration]
-        total_weight = candidates.sum()
-        if total_weight > 0:
-            start = int(torch.multinomial(candidates.double() / total_weight, 1).item())
-        else:
-            start = random.randint(0, samples - duration)
-    else:
-        start = random.randint(0, samples - duration)
-
-    lead = make_synth_lead(sample_rate, duration)
-    lead = lead / lead.square().mean().sqrt().clamp_min(1e-8)
-    rms_scale = max(
-        float(other.square().mean().sqrt()) * random.uniform(0.25, 2.0), 0.02
-    )
-    width = random.uniform(0.0, 0.6)
-    augmented = other.clone()
-    augmented[0, start : start + duration] += rms_scale * lead * (1.0 + width)
-    augmented[1, start : start + duration] += rms_scale * lead * (1.0 - width)
-    return augmented
-
-
-VOWEL_FORMANTS = (
-    (800.0, 1150.0, 2900.0),  # ah
-    (400.0, 2200.0, 2900.0),  # eh
-    (300.0, 2100.0, 2800.0),  # ee
-    (500.0, 800.0, 2800.0),  # oh
-    (350.0, 700.0, 2700.0),  # oo
-)
-
-
-def make_sustained_vowel(sample_rate: int, duration: int) -> torch.Tensor:
-    """A long synthetic sung vowel: glottal source through formant filters.
-
-    Strong formant structure, vibrato, and breath noise -- the cues that
-    separate a real sustained voice from a synth.  Placed in the vocal stem,
-    it teaches the model to keep long sustained notes (like a held "oo")
-    voiced and free of leaked background.
-    """
-    f0 = math.exp(random.uniform(math.log(90.0), math.log(300.0)))
-    f1, f2, f3 = random.choice(VOWEL_FORMANTS)
-    f1 *= random.uniform(0.85, 1.15)
-    f2 *= random.uniform(0.85, 1.15)
-    f3 *= random.uniform(0.85, 1.15)
-    t = torch.arange(duration, dtype=torch.float32) / sample_rate
-    vibrato_depth = random.uniform(0.004, 0.012)
-    vibrato_rate = random.uniform(4.0, 6.5)
-    freq = f0 * (1.0 + vibrato_depth * torch.sin(2 * math.pi * vibrato_rate * t))
-    phase = 2 * math.pi * torch.cumsum(freq, dim=0) / sample_rate
-
-    # Glottal source spectrum: harmonics at k * f0 with 1/k amplitudes and
-    # random phases (phase is irrelevant; the model reproduces it via masking).
-    # Harmonics are capped at ~8 kHz: a sustained vowel that manufactures
-    # energy in the air band teaches the separator to emit high-frequency
-    # shimmer around the voice.
-    n = duration
-    spec = torch.zeros(n // 2 + 1, dtype=torch.complex64)
-    kmax = min(int(sample_rate / (2 * f0)), 160, int(8_000.0 / f0))
-    for k in range(1, kmax + 1):
-        bin_index = int(round(k * f0 * n / sample_rate))
-        if bin_index <= n // 2:
-            angle = random.uniform(0.0, 2 * math.pi)
-            spec[bin_index] = torch.polar(
-                torch.tensor(1.0 / k, dtype=torch.float32),
-                torch.tensor(angle, dtype=torch.float32),
-            )
-    freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate)
-    for formant in (f1, f2, f3):
-        q = random.uniform(5.0, 10.0)
-        ratio = freqs / formant
-        # clamp the 1/ratio term: the glottal source has no DC energy, so
-        # clamping the DC bin is harmless and avoids inf/nan at freq=0.
-        ratio_inv = 1.0 / ratio.clamp_min(1e-6)
-        response = 1.0 / (1.0 + 1j * q * (ratio - ratio_inv))
-        spec = spec * response
-    vowel = torch.fft.irfft(spec, n)
-
-    # Quiet breath noise and a slow sung envelope with tremolo.  Breath is
-    # pink and quiet: white hiss in the vocal target is unrecoverable by the
-    # mask separator (it reads as static), and real breath is darker than 1/f.
-    breath = _pink_noise(n, sample_rate)
-    breath *= random.uniform(0.003, 0.010) * vowel.square().mean().sqrt().clamp_min(1e-8)
-    vowel = vowel + breath
-    attack = int(random.uniform(0.03, 0.15) * sample_rate)
-    release = int(random.uniform(0.15, 0.8) * sample_rate)
-    env = torch.ones(n)
-    if attack > 1:
-        env[:attack] = torch.linspace(0.0, 1.0, attack)
-    if release > 1:
-        env[-release:] = torch.linspace(1.0, 0.0, release)
-    tremolo = 1.0 + random.uniform(0.03, 0.12) * torch.sin(
-        2 * math.pi * random.uniform(2.0, 4.5) * t
-    )
-    return vowel * env * tremolo
-
-
-def add_sustained_vowel(vocal: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Add a long synthetic sustained vowel to the vocal stem."""
-    samples = vocal.shape[-1]
-    duration = min(int(random.uniform(1.5, 6.0) * sample_rate), samples)
-    start = random.randint(0, samples - duration)
-    vowel = make_sustained_vowel(sample_rate, duration)
-    vowel = vowel / vowel.square().mean().sqrt().clamp_min(1e-8)
-    level = max(
-        float(vocal.square().mean().sqrt()) * random.uniform(0.4, 1.5), 0.01
-    )
-    width = random.uniform(0.0, 0.8)
-    augmented = vocal.clone()
-    augmented[0, start : start + duration] += level * vowel * (1.0 + width)
-    augmented[1, start : start + duration] += level * vowel * (1.0 - width)
-    return augmented
-
-
-# -----------------------------------------------------------------------------
-# Broad-spectrum augmentation: pitch, EQ, noise, drive, dynamics, delay, space
-# -----------------------------------------------------------------------------
-# Everything here is cheap for an 8 s crop: vectorized ops, a handful of FFTs
-# only when triggered, and small frame-level loops.  Every effect preserves the
-# sum-to-mixture contract by construction (stems are augmented, then summed).
-
-
 def fft_resample(audio: torch.Tensor, factor: float) -> torch.Tensor:
-    """Bandlimited linear-phase resampling, RMS-preserving, [..., samples].
-
-    Linear-phase resampling via FFT is the cheap stand-in for a polyphase FIR:
-    one forward and one inverse FFT, all vectorized.  Callers truncate or pad
-    the result back to the fixed segment length.
-    """
     n = audio.shape[-1]
     new_len = max(1, int(round(n * factor)))
     spec = torch.fft.rfft(audio, n, dim=-1)
@@ -1612,31 +1187,24 @@ def fft_resample(audio: torch.Tensor, factor: float) -> torch.Tensor:
 
 
 def pitch_shift_crop(targets: torch.Tensor) -> torch.Tensor:
-    """Pitch-shift the whole crop by resampling (+-2 semitones).
-
-    Applied to every stem so the key stays internally consistent (a real track
-    does not detune the vocal against the band).  Resampling also moves the
-    tempo, mirroring how different recordings of the same song sit in
-    different keys *and* tempos; the resampled crop is truncated or zero-padded
-    back to the fixed segment length.
-    """
-    factor = 2.0 ** (random.uniform(-2.0, 2.0) / 12.0)
+    factor = 2.0 ** (random.uniform(-1.5, 1.5) / 12.0)
     n = targets.shape[-1]
     shifted = fft_resample(targets, factor)
     if shifted.shape[-1] >= n:
         return shifted[..., :n]
-    return F.pad(shifted, (0, n - shifted.shape[-1]))
+    pad = n - shifted.shape[-1]
+    fade_len = min(512, shifted.shape[-1] // 8)
+    if fade_len > 1:
+        ramp = torch.linspace(1.0, 0.0, fade_len, device=shifted.device, dtype=shifted.dtype)
+        shifted = shifted.clone()
+        shifted[..., :fade_len] *= ramp.flip(0)
+        shifted[..., -fade_len:] *= ramp
+    if shifted.shape[-1] > 1 and pad < shifted.shape[-1]:
+        return F.pad(shifted, (0, pad), mode="reflect")
+    return F.pad(shifted, (0, pad))
 
 
 def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Random smooth EQ curve in the FFT domain (shelves, bells, rolloffs).
-
-    Covers the real-mix spectral shape family: muffled radio vocals, bright
-    airy pop, telephone band-pass, nasal notches, thin low-cut mixes.  The
-    response is real and non-negative, so phase is untouched and the filter is
-    zero-phase; at these intensities it reads as "different microphone / EQ",
-    not as an artifact.  Loudness is restored so EQ changes timbre, not level.
-    """
     n = audio.shape[-1]
     freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
     log_f = torch.log(freqs)
@@ -1657,33 +1225,17 @@ def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
             * (1.0 + torch.tanh((log_f - math.log(center_hz)) / (math.log(10.0) * width_decades)))
         )
 
-    def lowpass(corner_hz: float, order: float = 2.0) -> None:
-        nonlocal response
-        response *= (1.0 + (freqs / corner_hz) ** (2.0 * order)).rsqrt()
-
-    def highpass(corner_hz: float, order: float = 2.0) -> None:
-        nonlocal response
-        response *= (1.0 + (corner_hz / freqs) ** (2.0 * order)).rsqrt()
-
-    for _ in range(random.randint(1, 3)):
+    for _ in range(random.randint(1, 2)):
         choice = random.random()
-        if choice < 0.25:
+        if choice < 0.5:
             bell(
-                random.uniform(200.0, 8000.0),
-                random.uniform(0.5, 4.0),
-                random.uniform(-10.0, 6.0),
+                random.uniform(300.0, 6000.0),
+                random.uniform(0.8, 2.5),
+                random.uniform(-5.0, 4.0),
             )
-        elif choice < 0.5:
-            shelf(random.uniform(200.0, 600.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 6.0))
-        elif choice < 0.75:
-            shelf(random.uniform(2500.0, 9000.0), random.uniform(0.5, 1.5), random.uniform(-8.0, 6.0))
         else:
-            corner = random.uniform(150.0, 2500.0)
-            order = random.uniform(1.0, 3.0)
-            if random.random() < 0.5:
-                lowpass(corner, order)
-            else:
-                highpass(corner, order)
+            shelf(random.uniform(3000.0, 9000.0), random.uniform(0.6, 1.2), random.uniform(-4.0, 4.0))
+
     spec = torch.fft.rfft(audio, n, dim=-1)
     filtered = torch.fft.irfft(spec * response.to(spec.dtype), n, dim=-1)
     rms = audio.square().mean().sqrt().clamp_min(1e-8)
@@ -1695,15 +1247,6 @@ _PINK_NOISE_CACHE: dict[int, torch.Tensor] = {}
 
 
 def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
-    """Bounded per-sample-rate pink-noise buffer.
-
-    The previous implementation keyed the cache by (length, sample_rate).
-    make_sustained_vowel() passes a random duration, so every new duration
-    inserted a new multi-MB buffer into each DataLoader worker.
-
-    This version keeps only one buffer per sample rate and slices random
-    windows from it.
-    """
     if length <= 0:
         return torch.zeros(0)
     needed = max(2 ** 20, 4 * length)
@@ -1723,35 +1266,24 @@ def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
         _PINK_NOISE_CACHE.clear()
         _PINK_NOISE_CACHE[sample_rate] = buffer
     offset = random.randint(0, buffer.shape[-1] - length)
-    # Clone so returned tensors do not keep views into the cached buffer.
     return buffer[offset : offset + length].clone()
 
 
 def add_noise_floor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Add a pink-noise floor (tape hiss / room tone) at -56..-40 dB."""
     length = audio.shape[-1]
-    level_db = random.uniform(-56.0, -40.0)
+    level_db = random.uniform(-65.0, -48.0)
     level = 10.0 ** (level_db / 20.0) * audio.square().mean().sqrt().clamp_min(1e-8)
     return audio + level * _pink_noise(length, sample_rate)
 
 
 def apply_saturation(audio: torch.Tensor) -> torch.Tensor:
-    """Soft-knee tanh drive (tube / tape) with a dry/wet mix.
-
-    Drive stays low.  tanh intermodulation manufactures energy above the
-    voice's natural bandwidth (measured +15-25 dB in the >8 kHz band at
-    drive 3) and the mask separator smears that back out as fuzz riding the
-    vocal.  Drive 1.2-2 is gentle tube warmth: harmonics appear, but the
-    top end is not manufactured from nothing.
-    """
-    drive = random.uniform(1.2, 2.0)
-    mix = random.uniform(0.3, 1.0)
+    drive = random.uniform(1.1, 1.4)
+    mix = random.uniform(0.2, 0.6)
     wet = torch.tanh(drive * audio) / math.tanh(drive)
     return mix * wet + (1.0 - mix) * audio
 
 
 def _frame_rms(audio: torch.Tensor, frame: int = 512) -> torch.Tensor:
-    """Per-frame RMS envelope of [channels, samples], returns [n_frames]."""
     power = audio.square().mean(dim=0)
     n = power.shape[-1]
     pad = frame - (n % frame)
@@ -1761,23 +1293,14 @@ def _frame_rms(audio: torch.Tensor, frame: int = 512) -> torch.Tensor:
 
 
 def apply_bus_compression(targets: torch.Tensor, frame: int = 512) -> torch.Tensor:
-    """Side-chain "mix bus" compression applied identically to every stem.
-
-    The gain envelope is derived from the mixture, exactly like a real bus
-    compressor, and the same gain is applied to the stems and the mixture so
-    the sum-to-mixture contract survives.  This is the last big realism gap in
-    a pipeline that otherwise only varies levels with linear gains: real mixes
-    are heavily compressed, with pumping and ducking that flat gains never
-    reproduce.  Frame-level envelope + 1-pole smoothing keeps it vectorized.
-    """
     mixture = targets.sum(dim=0)
     env = _frame_rms(mixture, frame)
     env_db = 20.0 * torch.log10(env)
-    threshold_db = random.uniform(-38.0, -12.0)
-    ratio = random.uniform(2.0, 8.0)
-    mix = random.uniform(0.3, 1.0)
+    threshold_db = random.uniform(-30.0, -16.0)
+    ratio = random.uniform(1.5, 4.0)
+    mix = random.uniform(0.25, 0.7)
     gain_db = torch.clamp((env_db - threshold_db) * (1.0 - 1.0 / ratio), max=0.0)
-    alpha = random.uniform(0.25, 0.6)
+    alpha = random.uniform(0.3, 0.6)
     smoothed = torch.empty_like(gain_db)
     acc = gain_db[0].clone()
     for i in range(gain_db.shape[0]):
@@ -1791,217 +1314,6 @@ def apply_bus_compression(targets: torch.Tensor, frame: int = 512) -> torch.Tens
         align_corners=False,
     ).view(-1)
     return targets * gain_full.view(1, 1, -1)
-
-
-def _delay(audio: torch.Tensor, samples: int) -> torch.Tensor:
-    """Zero-padded delay of [..., samples]; safe for out-of-range delays."""
-    if samples <= 0 or samples >= audio.shape[-1]:
-        return torch.zeros_like(audio)
-    out = torch.zeros_like(audio)
-    out[..., samples:] = audio[..., :-samples]
-    return out
-
-
-def apply_echo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Multi-tap slapback / delay echo (FIR: no feedback recursion, no pre-echo)."""
-    taps = random.randint(1, 3)
-    delay_ms = random.uniform(40.0, 320.0)
-    gain = random.uniform(0.15, 0.45)
-    out = audio.clone()
-    for tap in range(1, taps + 1):
-        d = int(
-            delay_ms * tap * (1.0 + random.uniform(-0.1, 0.1)) / 1000.0 * sample_rate
-        )
-        out = out + gain / tap * _delay(audio, d)
-    return out
-
-
-def apply_chorus(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Static chorus / Haas decorrelation: short per-channel delays.
-
-    A real chorus sweeps a delay LFO; a static short delay with a darkened
-    copy is a faithful-enough stand-in that costs only a few shifted adds.
-    """
-    out = audio.clone()
-    for ch in range(audio.shape[0]):
-        d = int(random.uniform(5.0, 30.0) / 1000.0 * sample_rate)
-        g = random.uniform(0.15, 0.4)
-        delayed = _delay(audio[ch], d)
-        # Darken the delayed copy with a cheap 3-tap moving average.
-        delayed = (delayed + torch.roll(delayed, 1) + torch.roll(delayed, 2)) / 3.0
-        out[ch] = audio[ch] + g * delayed
-    return out
-
-
-def apply_pan_sweep(audio: torch.Tensor) -> torch.Tensor:
-    """Slow mid/side pan movement: the stereo image drifts over the segment."""
-    n = audio.shape[-1]
-    mid = (audio[0] + audio[1]) * 0.5
-    side = (audio[0] - audio[1]) * 0.5
-    start = random.uniform(0.5, 1.2)
-    end = random.uniform(0.5, 1.2)
-    ramp = torch.linspace(start, end, n)
-    out = audio.clone()
-    out[0] = mid + side * ramp
-    out[1] = mid - side * ramp
-    return out
-
-
-def apply_vocal_tremolo(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Slow amplitude modulation on the vocal stem (sung tremolo)."""
-    n = audio.shape[-1]
-    t = torch.arange(n, dtype=torch.float32) / sample_rate
-    depth = random.uniform(0.03, 0.12)
-    rate = random.uniform(1.0, 5.0)
-    phase = random.uniform(0.0, 2.0 * math.pi)
-    mod = 1.0 + depth * torch.sin(2.0 * math.pi * rate * t + phase)
-    return audio * mod.view(1, -1)
-
-
-def apply_vocal_doubling(vocal: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Double-tracked vocal: a slightly detuned, few-ms-delayed copy layered in.
-
-    Pop vocals are double-tracked constantly; a resampled copy (+-1.5 %) plus
-    a short delay gives the thickened chorus sound without a second take.
-    """
-    factor = 1.0 + random.uniform(-0.015, 0.015)
-    n = vocal.shape[-1]
-    copy = fft_resample(vocal, factor)
-    if copy.shape[-1] >= n:
-        copy = copy[..., :n]
-    else:
-        copy = F.pad(copy, (0, n - copy.shape[-1]))
-    d = int(random.uniform(0.0, 15.0) / 1000.0 * sample_rate)
-    gain = random.uniform(0.4, 0.9)
-    return vocal + gain * _delay(copy, d)
-
-
-# -----------------------------------------------------------------------------
-# Lightweight zero-FFT augmentations (all O(n) vectorized, ~0.2-0.5 ms / 8s)
-# -----------------------------------------------------------------------------
-
-def apply_cheap_lowpass(audio: torch.Tensor) -> torch.Tensor:
-    """3-7 tap box low-pass (moving average) via reflect padding.
-
-    Cheap stand-in for a muffled mic / dull tape. No FFT, one avg_pool1d.
-    """
-    k = random.choice([3, 5, 7])
-    # avg_pool1d is highly optimized; reflect pad avoids edge clicks.
-    padded = F.pad(audio.unsqueeze(0), (k // 2, k // 2), mode="reflect").squeeze(0)
-    # F.avg_pool1d expects [N,C,L]; treat channels as batch
-    filtered = F.avg_pool1d(padded.unsqueeze(0), kernel_size=k, stride=1).squeeze(0)
-    # blend so it reads as tone, not total loss of air
-    mix = random.uniform(0.5, 1.0)
-    return mix * filtered + (1.0 - mix) * audio
-
-
-def apply_cheap_highpass(audio: torch.Tensor) -> torch.Tensor:
-    """Thin high-pass: original minus 3-tap moving average.
-
-    Simulates cheap laptop mic / aggressive low-cut. Zero FFT.
-    """
-    low = F.avg_pool1d(
-        F.pad(audio.unsqueeze(0), (1, 1), mode="reflect").squeeze(0).unsqueeze(0),
-        kernel_size=3, stride=1,
-    ).squeeze(0)
-    hp = audio - low
-    mix = random.uniform(0.4, 0.9)
-    return mix * hp + (1.0 - mix) * audio
-
-
-def apply_telephone_bandlimit(audio: torch.Tensor) -> torch.Tensor:
-    """Narrow telephone band: high-pass + low-pass via two box filters."""
-    # high-pass first, then dull the top - both via avg_pool, still no FFT
-    hp = audio - F.avg_pool1d(
-        F.pad(audio.unsqueeze(0), (2, 2), mode="reflect").squeeze(0).unsqueeze(0),
-        kernel_size=5, stride=1,
-    ).squeeze(0)
-    lp = F.avg_pool1d(F.pad(hp.unsqueeze(0), (2, 2), mode="reflect").squeeze(0).unsqueeze(0), kernel_size=5, stride=1).squeeze(0)
-    mix = random.uniform(0.6, 1.0)
-    return mix * lp + (1.0 - mix) * audio
-
-
-def apply_bitcrush(audio: torch.Tensor) -> torch.Tensor:
-    """Uniform quantization noise: 10-14 bit crush. One round(), no FFT."""
-    bits = random.randint(10, 14)
-    scale = float(1 << bits)
-    # peak-normalized so step size is relative, not absolute
-    peak = audio.abs().amax().clamp_min(1e-4)
-    norm = audio / peak
-    crushed = torch.round(norm * scale) / scale
-    return crushed * peak
-
-
-def apply_soft_clip(audio: torch.Tensor) -> torch.Tensor:
-    """Hard digital clipping at 0.5..0.95 (cheap limiter simulation)."""
-    gain = random.uniform(1.2, 2.2)
-    thresh = random.uniform(0.5, 0.95)
-    return torch.clamp(audio * gain, min=-thresh, max=thresh) / gain
-
-
-def apply_mono_fold(audio: torch.Tensor) -> torch.Tensor:
-    """Fold to mono: copy one channel to both (mono radio / phone)."""
-    idx = random.randint(0, 1)
-    mono = audio[idx : idx + 1].repeat(2, 1)
-    return mono
-
-
-def apply_micro_delay(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
-    """Per-channel micro delay +-12 ms via _delay (no FFT, just shift).
-
-    Simulates mic-bleed timing / small alignment drift.
-    """
-    out = audio.clone()
-    for ch in range(audio.shape[0]):
-        if random.random() < 0.7:
-            d = int(random.uniform(-12.0, 12.0) / 1000.0 * sample_rate)
-            if d == 0:
-                continue
-            if d > 0:
-                out[ch] = _delay(audio[ch : ch + 1], d).squeeze(0)
-            else:
-                # negative delay = advance (roll left then zero pad tail)
-                adv = -d
-                tmp = torch.zeros_like(audio[ch])
-                if adv < audio.shape[-1]:
-                    tmp[..., :-adv] = audio[ch, adv:]
-                out[ch] = tmp
-    return out
-
-
-def apply_static_pan(audio: torch.Tensor) -> torch.Tensor:
-    """Constant pan law gain: independent L/R scalar (one multiply)."""
-    g_l = random.uniform(0.7, 1.3)
-    g_r = random.uniform(0.7, 1.3)
-    out = audio.clone()
-    out[0] *= g_l
-    out[1] *= g_r
-    # keep loudness roughly constant
-    out *= (2.0 / (g_l + g_r))
-    return out
-
-
-def apply_fade_edges(audio: torch.Tensor) -> torch.Tensor:
-    """Short linear fade in/out 5-40 ms at a random edge."""
-    n = audio.shape[-1]
-    out = audio.clone()
-    if random.random() < 0.5:
-        fade_len = int(random.uniform(0.005, 0.040) * 44100)  # sample_rate agnostic enough
-        fade_len = min(fade_len, n // 4)
-        ramp = torch.linspace(0.0, 1.0, fade_len, device=audio.device)
-        out[:, :fade_len] *= ramp
-    else:
-        fade_len = int(random.uniform(0.005, 0.040) * 44100)
-        fade_len = min(fade_len, n // 4)
-        ramp = torch.linspace(1.0, 0.0, fade_len, device=audio.device)
-        out[:, -fade_len:] *= ramp
-    return out
-
-
-def apply_channel_gain_jitter(audio: torch.Tensor) -> torch.Tensor:
-    """Independent per-channel gain +-1.5 dB (cable / preamp trim)."""
-    g = torch.empty(2, 1, device=audio.device).uniform_(0.84, 1.19)  # +-1.5 dB
-    return audio * g
 
 
 class StemDataset(Dataset):
@@ -2044,9 +1356,7 @@ class StemDataset(Dataset):
 
         if not self.tracks:
             raise RuntimeError(f"No complete {STEMS} tracks found under {root_dir!r}.")
-        print(
-            f"Cached {len(self.tracks)} complete tracks"
-        )
+        print(f"Cached {len(self.tracks)} complete tracks")
 
     def __len__(self) -> int:
         return self.virtual_size
@@ -2113,7 +1423,7 @@ class StemDataset(Dataset):
 
     @staticmethod
     def _augment(targets: torch.Tensor, sample_rate: int) -> torch.Tensor:
-        gains_db = torch.empty(targets.shape[0]).uniform_(-8.0, 4.0)
+        gains_db = torch.empty(targets.shape[0]).uniform_(-6.0, 4.0)
         gains = torch.pow(10.0, gains_db / 20.0).view(-1, 1, 1)
         targets = targets * gains
 
@@ -2121,55 +1431,22 @@ class StemDataset(Dataset):
             if random.random() < 0.5:
                 targets[stem_index] = -targets[stem_index]
             if stem_index == 0:
-                # Vocals may be pushed far out to the sides or squashed to
-                # near-mono (phone / live / mono-synth mixes); accompaniment
-                # keeps a more conservative width range.
-                if random.random() < 0.3:
-                    width = random.uniform(0.0, 0.4)
-                else:
-                    width = random.uniform(0.5, 1.6)
+                width = random.uniform(0.3, 1.4)
             else:
-                width = random.uniform(0.75, 1.25)
+                width = random.uniform(0.7, 1.3)
             mid = (targets[stem_index, 0] + targets[stem_index, 1]) * 0.5
             side = (targets[stem_index, 0] - targets[stem_index, 1]) * 0.5 * width
             targets[stem_index, 0] = mid + side
             targets[stem_index, 1] = mid - side
 
-        # Whole-crop key/tempo variation, before any per-stem effects.
-        if random.random() < 0.20:
+        if random.random() < 0.5:
+            targets = targets.flip(dims=(1,))
+
+        if random.random() < 0.15:
             targets = pitch_shift_crop(targets)
 
-        # --- Lightweight global color (all O(n), no FFT) ---
-        # These are intentionally low-probability and vectorized so 8 workers
-        # stay well under CPU budget. Each is a single multiply / shift / pool.
-        if random.random() < 0.08:
-            # independent L/R trim on whole mix (keeps sum-to-mixture)
-            g = torch.empty(targets.shape[0], 2, 1).uniform_(0.84, 1.19)
-            targets = targets * g
-        if random.random() < 0.06:
-            # whole-crop mono fold (mono compatibility)
-            c = random.randint(0, 1)
-            targets = targets[:, c : c + 1, :].repeat(1, 2, 1) if random.random() < 0.5 else targets
-        if random.random() < 0.08:
-            # whole-crop micro-alignment drift +-6 ms (same shift on all stems)
-            d = int(random.uniform(-6.0, 6.0) / 1000.0 * sample_rate)
-            if d != 0:
-                if d > 0:
-                    targets = torch.stack([_delay(t, d) for t in targets])
-                else:
-                    adv = -d
-                    tmp = torch.zeros_like(targets)
-                    if adv < targets.shape[-1]:
-                        tmp[..., :-adv] = targets[..., adv:]
-                    targets = tmp
-
-        # Add occasional *local* vocal gaps, but never manufacture an entire
-        # six-second no-vocal example.  Whole-segment erasure combined with
-        # relative source losses strongly rewards the degenerate solution
-        # "vocals = 0, other = mixture".  Natural fully silent crops are still
-        # preserved by the dataset, while these short gaps teach low leakage.
         vocal = targets[0]
-        if random.random() < 0.15:
+        if random.random() < 0.10:
             samples = vocal.shape[-1]
             for _ in range(random.randint(1, 2)):
                 span = random.randint(max(64, samples // 50), max(65, samples // 10))
@@ -2183,120 +1460,38 @@ class StemDataset(Dataset):
                     left = max(0, start - ramp)
                     if left < start:
                         envelope[left:start] = torch.minimum(
-                            envelope[left:start], fade[-(start-left):]
+                            envelope[left:start], fade[-(start - left):]
                         )
                     right = min(samples, end + ramp)
                     if end < right:
                         envelope[end:right] = torch.minimum(
-                            envelope[end:right], fade[: right-end].flip(0)
+                            envelope[end:right], fade[: right - end].flip(0)
                         )
                 vocal.mul_(envelope)
 
-        # --- Vocal signal chain ---
-        # Signal-flow order: timbre (EQ, drive) first, then time-based effects
-        # (chorus, echo, reverb), then level effects (doubling, tremolo) and
-        # the synthetic vowel.  The mixture is built after augmentation, so the
-        # model sees every effect as part of the vocal stem it must recover.
-        # Note: no noise floor here.  Independent per-stem hiss is unrecoverable
-        # by a mask separator (two uncorrelated broadband noises cannot be told
-        # apart), so the model answered with a high-frequency static riding the
-        # voice.  Hiss is a recording-chain property: it lives in the
-        # accompaniment, and the model should learn to push it there, keeping
-        # the vocal clean.
-        vocal = targets[0]
-        if random.random() < 0.25:
+        if random.random() < 0.20:
             vocal = random_spectral_eq(vocal, sample_rate)
-        if random.random() < 0.09:
-            vocal = apply_cheap_lowpass(vocal)
-        if random.random() < 0.09:
-            vocal = apply_cheap_highpass(vocal)
-        if random.random() < 0.06:
-            vocal = apply_telephone_bandlimit(vocal)
-        if random.random() < 0.25:
+        if random.random() < 0.15:
             vocal = apply_saturation(vocal)
-        if random.random() < 0.08:
-            vocal = apply_soft_clip(vocal)
-        if random.random() < 0.07:
-            vocal = apply_bitcrush(vocal)
-        if random.random() < 0.20:
-            vocal = apply_chorus(vocal, sample_rate)
-        if random.random() < 0.25:
-            vocal = apply_echo(vocal, sample_rate)
-        if random.random() < 0.25:
+        if random.random() < 0.15:
             vocal = apply_reverb(vocal, sample_rate)
-        if random.random() < 0.20:
-            vocal = apply_reverse_echo(vocal, sample_rate)
-        if random.random() < 0.20:
+        if random.random() < 0.15:
             vocal = apply_air_boost(vocal)
-        if random.random() < 0.10:
-            vocal = apply_micro_delay(vocal, sample_rate)
-        if random.random() < 0.10:
-            vocal = apply_static_pan(vocal)
-        if random.random() < 0.08:
-            vocal = apply_channel_gain_jitter(vocal)
-        if random.random() < 0.07:
-            vocal = apply_fade_edges(vocal)
-        if random.random() < 0.15:
-            vocal = apply_vocal_doubling(vocal, sample_rate)
-        if random.random() < 0.15:
-            vocal = apply_vocal_tremolo(vocal, sample_rate)
-        if random.random() < 0.22:
-            vocal = add_sustained_vowel(vocal, sample_rate)
-        if random.random() < 0.06:
-            vocal = apply_mono_fold(vocal)
         targets[0] = vocal
 
-        # --- Accompaniment signal chain ---
-        # Wet instruments are just as common as wet vocals; EQ, drive, noise
-        # and pan movement widen the instrument timbre space too.  The noise
-        # floor lives here: a single correlated hiss in the instrumental is
-        # physically believable (tape hiss / room tone) and the model learns
-        # to route it to the accompaniment instead of smearing it on the
-        # vocal as static.
         other = targets[1]
-        if random.random() < 0.30:
-            other = random_spectral_eq(other, sample_rate)
-        if random.random() < 0.10:
-            other = apply_cheap_lowpass(other)
-        if random.random() < 0.10:
-            other = apply_cheap_highpass(other)
-        if random.random() < 0.07:
-            other = apply_telephone_bandlimit(other)
         if random.random() < 0.20:
+            other = random_spectral_eq(other, sample_rate)
+        if random.random() < 0.15:
             other = apply_saturation(other)
-        if random.random() < 0.09:
-            other = apply_soft_clip(other)
-        if random.random() < 0.07:
-            other = apply_bitcrush(other)
-        if random.random() < 0.10:
-            other = apply_micro_delay(other, sample_rate)
-        if random.random() < 0.12:
-            other = apply_channel_gain_jitter(other)
-        if random.random() < 0.07:
-            other = apply_fade_edges(other)
-        if random.random() < 0.25:
+        if random.random() < 0.15:
             other = apply_reverb(other, sample_rate)
         if random.random() < 0.15:
-            other = apply_pan_sweep(other)
-        if random.random() < 0.12:
-            other = apply_static_pan(other)
-        if random.random() < 0.30:
-            other = add_synth_lead(other, vocal, sample_rate)
-        if random.random() < 0.20:
             other = add_noise_floor(other, sample_rate)
         targets[1] = other
 
-        # Mix-bus dynamics: the same gain curve on every stem, so real-world
-        # compression/pumping is present without breaking sum-to-mixture.
-        if random.random() < 0.25:
+        if random.random() < 0.20:
             targets = apply_bus_compression(targets)
-
-        if random.random() < 0.5:
-            targets = targets.flip(dims=(1,))
-        if random.random() < 0.5:
-            # Time reversal: free (no FFT), and a strong regularizer -- the
-            # network cannot lean on direction-of-time cues.
-            targets = targets.flip(dims=(2,))
 
         global_gain = db_to_gain(random.uniform(-4.0, 3.0))
         targets = targets * global_gain
@@ -2304,7 +1499,6 @@ class StemDataset(Dataset):
         if peak > 1.0:
             targets = targets * (0.98 / peak)
         return targets
-
 
     def __getitem__(self, _: int) -> tuple[torch.Tensor, torch.Tensor]:
         last_error: Exception | None = None
@@ -2315,21 +1509,12 @@ class StemDataset(Dataset):
                 if mixture.square().mean().sqrt() < self.min_activity_rms:
                     continue
                 return mixture, targets
-            except Exception as error:  # corrupted files should not kill workers
+            except Exception as error:
                 last_error = error
         raise RuntimeError(f"Unable to load a valid training example: {last_error}")
 
 
 class WeightedDataset(Dataset):
-    """Draw each training example from a weighted set of source datasets.
-
-    Every ``__getitem__`` picks one source dataset at random with probability
-    proportional to its weight, then samples an example from it. This keeps
-    the data mixture at the requested ratio (default 4:1 train1:train2)
-    regardless of how many tracks each folder holds, without concatenating
-    or rebalancing track lists.
-    """
-
     def __init__(
         self,
         datasets: Sequence[Dataset],
@@ -2346,9 +1531,6 @@ class WeightedDataset(Dataset):
         self.datasets = list(datasets)
         total = float(sum(weights))
         self.probabilities = [float(weight) / total for weight in weights]
-        # Mirror the attributes the training worker init expects so the
-        # per-worker pink-noise cache warm-up keeps working through the
-        # wrapper. All sources share sample rate and segment length.
         first = self.datasets[0]
         self.sample_rate = first.sample_rate
         self.segment_samples = first.segment_samples
@@ -2365,13 +1547,6 @@ class WeightedDataset(Dataset):
 
 
 def parse_weighted_dirs(args: argparse.Namespace) -> list[tuple[str, float]]:
-    """Resolve the training data sources and their sampling weights.
-
-    Checkpoint resume is unaffected by this: checkpoints record model,
-    optimizer, EMA, scaler, and training-progress state only -- never the
-    data sources -- so the directory mix may change between runs and an old
-    checkpoint still resumes exactly.
-    """
     if args.data_dir:
         return [(args.data_dir, 1.0)]
     dirs = [part.strip() for part in args.data_dirs.split(",") if part.strip()]
@@ -2426,12 +1601,6 @@ def build_training_dataset(
     )
 
 
-
-# -----------------------------------------------------------------------------
-# EMA, optimizer, checkpointing
-# -----------------------------------------------------------------------------
-
-
 class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.9999):
         if not 0.0 <= decay < 1.0:
@@ -2449,8 +1618,6 @@ class EMA:
     @torch.no_grad()
     def update(self) -> None:
         self.updates += 1
-        # Warm the decay up so early validation is not dominated by the random
-        # initialization. It approaches the requested long-horizon decay.
         warm_decay = (1.0 + self.updates) / (10.0 + self.updates)
         decay = min(self.decay, warm_decay)
         trainable = [
@@ -2500,17 +1667,15 @@ class EMA:
 
 
 class _EMAStateView(nn.Module):
-    """Minimal adapter that lets EMA tensors use the strict state-load report."""
-
     def __init__(self, shadow: dict[str, torch.Tensor]):
         super().__init__()
         self.shadow = shadow
 
-    def state_dict(self, *args, **kwargs):  # type: ignore[override]
+    def state_dict(self, *args, **kwargs):
         del args, kwargs
         return self.shadow.copy()
 
-    def load_state_dict(self, state_dict, strict=False):  # type: ignore[override]
+    def load_state_dict(self, state_dict, strict=False):
         del strict
         for name, value in state_dict.items():
             self.shadow[name].copy_(value)
@@ -2679,11 +1844,6 @@ def prune_old_checkpoints(
         path.unlink(missing_ok=True)
 
 
-# -----------------------------------------------------------------------------
-# Inference and validation
-# -----------------------------------------------------------------------------
-
-
 def crossfade_window(
     length: int,
     overlap: int,
@@ -2733,6 +1893,7 @@ def separate_tensor(
     overlap: int,
     device: torch.device,
     precision: str = "bf16",
+    tta: bool = True,
     show_progress: bool = False,
 ) -> list[torch.Tensor]:
     if mixture.ndim != 2:
@@ -2782,6 +1943,19 @@ def separate_tensor(
         )
         with autocast_context(device, precision):
             estimated_specs, _ = model.estimate_specs(spec, chunk.unsqueeze(0))
+            if tta:
+                chunk_flipped = -chunk.flip(0).unsqueeze(0)
+                spec_flipped = make_stft(
+                    chunk_flipped,
+                    n_fft=model.config.n_fft,
+                    hop_length=model.config.hop_length,
+                    win_length=model.config.win_length,
+                    window=stft_window,
+                )
+                est_flipped, _ = model.estimate_specs(spec_flipped, chunk_flipped)
+                est_flipped = -est_flipped.flip(2)
+                estimated_specs = 0.5 * (estimated_specs + est_flipped)
+
         estimated = make_istft(
             estimated_specs,
             length=chunk_size,
@@ -2805,9 +1979,6 @@ def separate_tensor(
         weight_sum[start : start + usable] += window
 
     output = output / weight_sum.clamp_min(1e-8)
-
-    # Enforce exact waveform mixture consistency after overlap-add. Do not
-    # clamp; clipping predictions changes SDR and belongs only at export.
     residual = mixture - output.sum(dim=0)
     output[1] = output[1] + residual
     return [output[index] for index in range(model.config.num_stems)]
@@ -2819,7 +1990,6 @@ def calculate_track_sdr(
     accumulation_samples: int,
     activity_threshold: float = 1e-4,
 ) -> float | None:
-    """Scale-dependent SDR over the entire track."""
     signal_power = torch.zeros((), device=target.device, dtype=torch.float64)
     error_power = torch.zeros((), device=target.device, dtype=torch.float64)
     for start in range(0, target.shape[-1], accumulation_samples):
@@ -2846,6 +2016,7 @@ def validate(
     chunk_size: int,
     overlap: int,
     precision: str,
+    tta: bool = False,
 ) -> tuple[list[float], float | None]:
     model.eval()
     track_dirs = [
@@ -2902,6 +2073,7 @@ def validate(
                 overlap=overlap,
                 device=device,
                 precision=precision,
+                tta=tta,
                 show_progress=False,
             )
             scores = [
@@ -2941,11 +2113,6 @@ def validate(
     return means, combined
 
 
-# -----------------------------------------------------------------------------
-# Training
-# -----------------------------------------------------------------------------
-
-
 def train(
     model: BSRoFormerSeparator,
     dataloader: DataLoader,
@@ -2977,8 +2144,6 @@ def train(
                 "match the current ModelConfig. Only exact-continuation checkpoints "
                 "of the current architecture are supported."
             )
-        # A true continuation must resume the raw trainable weights alongside
-        # optimizer/EMA state, not replace them with averaged weights.
         model_state = checkpoint_data.get("model_state_dict", checkpoint_data)
         report = load_matching_state_dict(model, model_state)
         if not report.is_exact:
@@ -2990,7 +2155,6 @@ def train(
             )
         print(f"Loaded all {report.matched} model tensors from {checkpoint_path}.")
 
-    # Initialize after model loading so any loaded checkpoint also seeds EMA.
     ema = EMA(model, decay=args.ema_decay)
 
     if checkpoint_data is not None:
@@ -3038,9 +2202,6 @@ def train(
 
         if "scaler_state_dict" in checkpoint_data:
             scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
-        # Free the large checkpoint dict (model+ema+optimizer ~1GB on CPU)
-        # to avoid overnight RSS growth. Without this the dict stays alive
-        # for the entire training run.
         del checkpoint_data
         checkpoint_data = None
         gc.collect()
@@ -3111,12 +2272,9 @@ def train(
             try:
                 mixture_audio, target_audio = next(data_iterator)
             except StopIteration:
-                # Properly discard the exhausted iterator so its prefetch
-                # queue + pin_memory buffers are freed. Overwriting without
-                # del caused the old queue to stay alive and leak CPU RAM.
                 try:
                     if hasattr(data_iterator, "_shutdown_workers"):
-                        data_iterator._shutdown_workers()  # type: ignore[attr-defined]
+                        data_iterator._shutdown_workers()
                 except Exception:
                     pass
                 del data_iterator
@@ -3222,11 +2380,6 @@ def train(
             prune_old_checkpoints("ckpts", keep=3, config=model.config)
 
             with ema.average_parameters():
-                # The transformer units are compiled for training with gradients
-                # enabled.  Validation runs under inference_mode, which requires
-                # different Dynamo guards and can exhaust the shared recompile
-                # cache for TransformerUnit.forward.  Keep infrequent validation
-                # eager so it cannot evict or disable the compiled training path.
                 compiler_context = (
                     torch.compiler.set_stance("force_eager")
                     if args.compile
@@ -3240,6 +2393,7 @@ def train(
                         chunk_size=args.segment_samples,
                         overlap=args.inference_overlap,
                         precision=args.precision,
+                        tta=False,
                     )
 
             improved = combined_sdr is not None and combined_sdr > best_sdr
@@ -3278,19 +2432,15 @@ def train(
                 print(f"New best checkpoint: {best_path}\n")
             elif combined_sdr is not None:
                 print(f"Best combined SDR remains {best_sdr:.4f} dB.\n")
-            # Validation loads full tracks + checkpoints on CPU; ensure
-            # memory is returned to OS instead of accumulating overnight.
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
     progress.close()
     signal.signal(signal.SIGINT, previous_sigint_handler)
-    # Ensure DataLoader workers + pin_memory thread are terminated and
-    # not counted as leaked RAM in Task Manager.
     try:
         if "data_iterator" in locals() and hasattr(data_iterator, "_shutdown_workers"):
-            data_iterator._shutdown_workers()  # type: ignore[attr-defined]
+            data_iterator._shutdown_workers()
     except Exception:
         pass
     try:
@@ -3314,11 +2464,6 @@ def train(
         )
         prune_old_checkpoints("ckpts", keep=3, config=model.config)
         print(f"Training stopped cleanly; checkpoint saved to {stopped_path}.")
-
-
-# -----------------------------------------------------------------------------
-# Command line entry point
-# -----------------------------------------------------------------------------
 
 
 def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
@@ -3392,16 +2537,13 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
     elif audio.shape[0] > 2:
         audio = audio[:2]
     if source_sr != sample_rate:
-        audio = torchaudio.functional.resample(audio, source_sr, sample_rate)
+        audio = torchaudio.functional.resample(audio, source_sr, self.sample_rate)
     return audio
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "124-band regular BS-RoFormer with axial attention, "
-            "foreground-residual separation, and silence-focused training"
-        )
+        description="High SD-SDR 124-band BS-RoFormer separator for MVSEP"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -3411,30 +2553,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--data_dirs",
         type=str,
         default="train1,train2",
-        help=(
-            "Comma-separated training data directories. Each entry is a track "
-            "folder like --data_dir used to be. Defaults to 'train1,train2'."
-        ),
     )
     parser.add_argument(
         "--data_weights",
         type=str,
         default="3,1",
-        help=(
-            "Comma-separated per-directory sampling weights matching "
-            "--data_dirs. Each training example is drawn from a directory "
-            "with probability proportional to its weight, so the default "
-            "'4,1' trains 80%% on train1 and 20%% on train2."
-        ),
     )
     parser.add_argument(
         "--data_dir",
         type=str,
         default=None,
-        help=(
-            "Legacy single training data directory. When set, it is used "
-            "alone and --data_dirs/--data_weights are ignored."
-        ),
     )
     parser.add_argument("--test_dir", type=str, default="test")
     parser.add_argument("--input_file", type=str, default=None)
@@ -3444,21 +2572,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Start a new run instead of auto-resuming the latest compatible checkpoint.",
     )
 
     parser.add_argument("--sample_rate", type=int, default=44_100)
-    parser.add_argument("--n_fft", type=int, default=2048)
+    parser.add_argument("--n_fft", type=int, default=4096)
     parser.add_argument("--hop_length", type=int, default=512)
-    parser.add_argument("--win_length", type=int, default=2048)
+    parser.add_argument("--win_length", type=int, default=4096)
     parser.add_argument("--segment_seconds", type=float, default=8)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
         default=3,
-        help=(
-            "Chunk overlap in seconds."
-        ),
+    )
+    parser.add_argument(
+        "--tta",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
 
     parser.add_argument("--model_dim", type=int, default=256)
@@ -3478,7 +2607,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--slice_p",
         type=int,
         default=1,
-        help="Prodigy memory-saving update slicing; use 11 when memory is limited.",
     )
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
@@ -3566,7 +2694,6 @@ def main() -> None:
 
     if args.infer and checkpoint_path:
         config = inspect_checkpoint_config(checkpoint_path, config)
-        # Keep chunk timing tied to the checkpoint sample rate.
         args.segment_samples = int(round(args.segment_seconds * config.sample_rate))
         args.inference_overlap = int(
             round(args.inference_overlap_seconds * config.sample_rate)
@@ -3593,12 +2720,6 @@ def main() -> None:
         dataset = build_training_dataset(args, config)
         generator = torch.Generator()
         generator.manual_seed(args.seed)
-        # pin_memory + persistent_workers on Windows (spawn) is the #1
-        # cause of overnight CPU RAM leaks: the pin_memory thread caches
-        # cudaHostAlloc blocks forever and persistent workers keep their
-        # prefetch queues alive even after the iterator is overwritten.
-        # Disable both for stable long runs. Re-enable only if you
-        # explicitly need the ~5% speedup and can monitor RAM.
         use_pin_memory = False
         use_persistent = False
         dataloader = DataLoader(
@@ -3645,11 +2766,11 @@ def main() -> None:
         overlap=args.inference_overlap,
         device=device,
         precision=args.precision,
+        tta=args.tta,
         show_progress=True,
     )
     for stem, prediction in zip(STEMS, predictions):
         output_path = os.path.join("outputs", f"{stem}.wav")
-        # WAV encoders may clip at export, but internal inference remains unclamped.
         sf.write(output_path, prediction.cpu().numpy().T, config.sample_rate, subtype="FLOAT")
         print(f"Saved {output_path}")
 
