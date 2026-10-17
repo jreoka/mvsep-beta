@@ -886,28 +886,37 @@ class MultiResolutionSTFTLoss(nn.Module):
             (512, 128, 512),
             (256, 64, 256),
         ),
+        sample_rate: int = 44_100,
         activity_threshold: float = 1e-4,
     ):
         super().__init__()
         self.resolutions = tuple(resolutions)
+        self.sample_rate = sample_rate
         self.activity_threshold = activity_threshold
-        for index, (_, _, win_length) in enumerate(self.resolutions):
+        for index, (n_fft, _, win_length) in enumerate(self.resolutions):
+            window = torch.hann_window(win_length)
             self.register_buffer(
                 f"window_{index}",
-                torch.hann_window(win_length),
+                window,
+                persistent=False,
+            )
+            freqs = torch.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+            freq_weight = 1.0 + 2.5 * torch.exp(-((freqs / 280.0) ** 2))
+            freq_weight = freq_weight / freq_weight.mean()
+            self.register_buffer(
+                f"freq_weight_{index}",
+                freq_weight.view(1, -1, 1),
                 persistent=False,
             )
 
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_flat = prediction.reshape(-1, prediction.shape[-1]).float()
         target_flat = target.reshape(-1, target.shape[-1]).float()
-        active_targets = (
-            target_flat.square().mean(dim=1).sqrt() >= self.activity_threshold
-        )
         total = pred_flat.new_tensor(0.0)
 
         for index, (n_fft, hop_length, win_length) in enumerate(self.resolutions):
             window = getattr(self, f"window_{index}")
+            freq_weight = getattr(self, f"freq_weight_{index}")
             pred_spec = torch.stft(
                 pred_flat,
                 n_fft=n_fft,
@@ -933,18 +942,28 @@ class MultiResolutionSTFTLoss(nn.Module):
                 (pred_mag - target_mag).flatten(1), dim=1
             )
             target_norm = torch.linalg.vector_norm(target_mag.flatten(1), dim=1)
-            active_diff_norm = diff_norm[active_targets]
-            active_target_norm = target_norm[active_targets]
-            spectral_convergence = (
-                active_diff_norm / active_target_norm.clamp_min(1e-6)
-            ).sum() / active_targets.count_nonzero().clamp_min(1)
+            if prediction.ndim >= 3:
+                grouped_norm = target_norm.view(prediction.shape[0], -1)
+                ref_norm = (
+                    grouped_norm.amax(dim=1, keepdim=True)
+                    .expand_as(grouped_norm)
+                    .reshape(-1)
+                )
+            else:
+                ref_norm = target_norm.amax().expand_as(target_norm)
+            denom_norm = torch.maximum(target_norm, 0.08 * ref_norm).clamp_min(1e-5)
+            spectral_convergence = (diff_norm / denom_norm).mean()
 
-            log_magnitude = F.l1_loss(
-                torch.log1p(pred_mag),
-                torch.log1p(target_mag),
-            )
+            mag_scale = 32.0 / (0.5 * window.sum()).clamp_min(1.0)
+            log_diff = (
+                torch.log1p(pred_mag * mag_scale)
+                - torch.log1p(target_mag * mag_scale)
+            ).abs()
+            log_magnitude = (log_diff * freq_weight).mean()
+
             complex_normalizer = target_mag.mean().detach().clamp_min(1e-4)
-            complex_loss = (pred_spec - target_spec).abs().mean() / complex_normalizer
+            complex_err = (pred_spec - target_spec).abs() * freq_weight
+            complex_loss = complex_err.mean() / complex_normalizer
             total = total + spectral_convergence + log_magnitude + 0.35 * complex_loss
 
         return total / len(self.resolutions)
@@ -963,7 +982,7 @@ def mixture_normalized_wave_loss(
         reference = scale.amax(dim=reduce_dims, keepdim=True).clamp_min(1e-4)
     else:
         reference = scale.clamp_min(1e-4)
-    scale_floor = (0.10 * reference).clamp_min(1e-4)
+    scale_floor = (0.05 * reference).clamp_min(1e-4)
     denom = torch.maximum(scale, scale_floor)
     return (0.6 * (l1_error / denom) + 0.4 * (l2_error / reference)).mean()
 
@@ -974,11 +993,16 @@ def scale_dependent_sdr_loss(
 ) -> torch.Tensor:
     error_power = (prediction - target).square().mean(dim=(-2, -1))
     target_power = target.square().mean(dim=(-2, -1))
-    valid = target_power > 1e-6
+    if target_power.ndim > 1:
+        ref_power = target_power.amax(dim=-1, keepdim=True)
+    else:
+        ref_power = target_power
+    valid = ref_power.expand_as(target_power) > 1e-6
+    effective_target_power = torch.maximum(target_power, 0.01 * ref_power)
     ratio_db = 10.0 * torch.log10(
-        (target_power + 1e-8) / (error_power + 1e-8)
+        (effective_target_power + 1e-8) / (error_power + 1e-8)
     )
-    ratio_db = ratio_db.clamp(-50.0, 50.0)
+    ratio_db = 50.0 * torch.tanh(ratio_db / 50.0)
     if valid.any():
         return -ratio_db[valid].mean()
     return prediction.new_tensor(0.0)
@@ -995,10 +1019,20 @@ class SeparationLoss(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.loss_config = loss_config
-        self.mrstft = MultiResolutionSTFTLoss()
+        self.mrstft = MultiResolutionSTFTLoss(sample_rate=model_config.sample_rate)
         self.activity_threshold = 1e-4
+        window = torch.hann_window(model_config.win_length)
+        self.register_buffer("window", window, persistent=False)
+        freqs = torch.fft.rfftfreq(model_config.n_fft, 1.0 / model_config.sample_rate)
+        freq_weight = 1.0 + 3.0 * torch.exp(-((freqs / 260.0) ** 2))
+        freq_weight = freq_weight / freq_weight.mean()
         self.register_buffer(
-            "window", torch.hann_window(model_config.win_length), persistent=False
+            "freq_weight",
+            freq_weight.view(1, 1, 1, -1, 1),
+            persistent=False,
+        )
+        self.low_freq_bins = max(
+            1, int(round(320.0 * model_config.n_fft / model_config.sample_rate))
         )
 
     def forward(
@@ -1032,11 +1066,30 @@ class SeparationLoss(nn.Module):
         wave_loss = mixture_normalized_wave_loss(pred_audio, target_audio)
         mrstft_loss = self.mrstft(pred_audio, target_audio)
 
+        pred_mag = estimates.abs()
         target_mag = target_specs.abs()
         spec_normalizer = target_mag.mean().detach().clamp_min(1e-4)
-        main_complex = (estimates - target_specs).abs().mean() / spec_normalizer
-        main_logmag = F.l1_loss(torch.log1p(estimates.abs()), torch.log1p(target_mag))
-        main_stft_loss = main_complex + main_logmag
+        main_complex = (
+            ((estimates - target_specs).abs() * self.freq_weight).mean()
+            / spec_normalizer
+        )
+        mag_scale = 32.0 / (0.5 * self.window.sum()).clamp_min(1.0)
+        log_diff = (
+            torch.log1p(pred_mag * mag_scale)
+            - torch.log1p(target_mag * mag_scale)
+        ).abs()
+        main_logmag = (log_diff * self.freq_weight).mean()
+
+        low_bins = self.low_freq_bins
+        pred_vocal_low = pred_mag[:, 0, :, :low_bins]
+        true_vocal_low = target_mag[:, 0, :, :low_bins]
+        low_normalizer = (
+            target_mag[:, :, :, :low_bins].mean().detach().clamp_min(1e-4)
+        )
+        vocal_low_bleed = (
+            F.relu(pred_vocal_low - true_vocal_low).mean() / low_normalizer
+        )
+        main_stft_loss = main_complex + main_logmag + 0.35 * vocal_low_bleed
 
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
@@ -1151,8 +1204,12 @@ def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
         impulse = torch.cat((torch.zeros(pre_delay, dtype=torch.float32), impulse))
     n = impulse.shape[-1]
     freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
-    cutoff = random.uniform(3_000.0, 7_000.0)
-    response = (1.0 + (freqs / cutoff) ** 2).rsqrt()
+    hp_cutoff = random.uniform(200.0, 360.0)
+    lp_cutoff = random.uniform(3_000.0, 7_000.0)
+    hp_response = 1.0 / (1.0 + (hp_cutoff / freqs).square())
+    lp_response = (1.0 + (freqs / lp_cutoff) ** 2).rsqrt()
+    response = hp_response * lp_response
+    response[0] = 0.0
     impulse = torch.fft.irfft(torch.fft.rfft(impulse, n) * response, n)
     return impulse / impulse.square().sum().sqrt().clamp_min(1e-8)
 
@@ -1204,7 +1261,26 @@ def pitch_shift_crop(targets: torch.Tensor) -> torch.Tensor:
     return F.pad(shifted, (0, pad))
 
 
-def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+def clean_vocal_sub_rumble(
+    audio: torch.Tensor,
+    sample_rate: int,
+    cutoff_hz: float = 55.0,
+) -> torch.Tensor:
+    n = audio.shape[-1]
+    if n < 64:
+        return audio
+    freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1e-3)
+    hp = 1.0 / (1.0 + (cutoff_hz / freqs).pow(4))
+    hp[0] = 0.0
+    spec = torch.fft.rfft(audio, n, dim=-1)
+    return torch.fft.irfft(spec * hp.to(spec.dtype), n, dim=-1)
+
+
+def random_spectral_eq(
+    audio: torch.Tensor,
+    sample_rate: int,
+    is_vocal: bool = False,
+) -> torch.Tensor:
     n = audio.shape[-1]
     freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
     log_f = torch.log(freqs)
@@ -1231,16 +1307,27 @@ def random_spectral_eq(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
             bell(
                 random.uniform(300.0, 6000.0),
                 random.uniform(0.8, 2.5),
-                random.uniform(-5.0, 4.0),
+                random.uniform(-4.0, 4.0),
             )
         else:
             shelf(random.uniform(3000.0, 9000.0), random.uniform(0.6, 1.2), random.uniform(-4.0, 4.0))
 
+    if is_vocal:
+        hp_cutoff = random.uniform(60.0, 95.0)
+        response *= 1.0 / (1.0 + (hp_cutoff / freqs).pow(4))
+        response[0] = 0.0
+
     spec = torch.fft.rfft(audio, n, dim=-1)
-    filtered = torch.fft.irfft(spec * response.to(spec.dtype), n, dim=-1)
-    rms = audio.square().mean().sqrt().clamp_min(1e-8)
-    filtered_rms = filtered.square().mean().sqrt().clamp_min(1e-8)
-    return filtered * (rms / filtered_rms)
+    filtered_spec = spec * response.to(spec.dtype)
+    mid_mask = (freqs >= 250.0) & (freqs <= 8000.0)
+    if mid_mask.any():
+        orig_mid = spec[..., mid_mask].abs().square().mean().sqrt().clamp_min(1e-8)
+        filt_mid = filtered_spec[..., mid_mask].abs().square().mean().sqrt().clamp_min(1e-8)
+        gain = float((orig_mid / filt_mid).clamp(0.75, 1.30))
+    else:
+        gain = 1.0
+    filtered = torch.fft.irfft(filtered_spec, n, dim=-1)
+    return filtered * gain
 
 
 _PINK_NOISE_CACHE: dict[int, torch.Tensor] = {}
@@ -1274,6 +1361,60 @@ def add_noise_floor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
     level_db = random.uniform(-65.0, -48.0)
     level = 10.0 ** (level_db / 20.0) * audio.square().mean().sqrt().clamp_min(1e-8)
     return audio + level * _pink_noise(length, sample_rate)
+
+
+def add_low_swoosh_fx(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    samples = audio.shape[-1]
+    if samples < sample_rate // 4:
+        return audio
+    base_rms = audio.square().mean().sqrt()
+    if base_rms < 1e-4:
+        return audio
+
+    out = audio.clone()
+    for _ in range(random.randint(1, 2)):
+        duration = random.uniform(0.35, min(2.5, samples / sample_rate * 0.6))
+        span = max(256, min(samples, int(round(duration * sample_rate))))
+        start = random.randint(0, max(0, samples - span))
+
+        noise_l = _pink_noise(span, sample_rate)
+        noise_r = _pink_noise(span, sample_rate)
+        mid = 0.5 * (noise_l + noise_r)
+        side = 0.5 * (noise_l - noise_r) * random.uniform(0.2, 1.1)
+        stereo_noise = torch.stack((mid + side, mid - side), dim=0)
+
+        freqs = torch.fft.rfftfreq(span, 1.0 / sample_rate).clamp_min(1.0)
+        log_f = torch.log(freqs)
+        center_start = random.uniform(45.0, 260.0)
+        center_end = random.uniform(45.0, 260.0)
+        q = random.uniform(1.2, 3.5)
+        sigma = math.log(2.0) / q
+
+        spec = torch.fft.rfft(stereo_noise, span, dim=-1)
+        resp_a = torch.exp(-0.5 * ((log_f - math.log(center_start)) / sigma) ** 2)
+        resp_b = torch.exp(-0.5 * ((log_f - math.log(center_end)) / sigma) ** 2)
+        resp_a[0] = 0.0
+        resp_b[0] = 0.0
+        band_a = torch.fft.irfft(spec * resp_a.to(spec.dtype), span, dim=-1)
+        band_b = torch.fft.irfft(spec * resp_b.to(spec.dtype), span, dim=-1)
+
+        t_norm = torch.linspace(0.0, 1.0, span, dtype=audio.dtype, device=audio.device)
+        swoosh = (1.0 - t_norm) * band_a.to(audio.device, audio.dtype) + t_norm * band_b.to(audio.device, audio.dtype)
+
+        if random.random() < 0.5:
+            f0 = random.uniform(40.0, 160.0)
+            f1 = random.uniform(35.0, 180.0)
+            phase = 2.0 * math.pi * (f0 * t_norm + 0.5 * (f1 - f0) * t_norm.square()) * (span / sample_rate)
+            sub_sweep = torch.sin(phase).unsqueeze(0).expand_as(swoosh)
+            swoosh = swoosh + random.uniform(0.25, 0.7) * sub_sweep
+
+        env = torch.sin(math.pi * t_norm).clamp_min(0.0).pow(random.uniform(1.2, 2.5))
+        swoosh = swoosh * env.unsqueeze(0)
+        swoosh_rms = swoosh.square().mean().sqrt().clamp_min(1e-8)
+        target_level = base_rms * db_to_gain(random.uniform(-22.0, -10.0))
+        out[:, start : start + span] += swoosh * (target_level / swoosh_rms)
+
+    return out
 
 
 def apply_saturation(audio: torch.Tensor) -> torch.Tensor:
@@ -1445,14 +1586,17 @@ class StemDataset(Dataset):
         if random.random() < 0.15:
             targets = pitch_shift_crop(targets)
 
-        vocal = targets[0]
-        if random.random() < 0.10:
+        vocal = clean_vocal_sub_rumble(targets[0], sample_rate, cutoff_hz=52.0)
+        other_rms = targets[1].square().mean().sqrt()
+        if random.random() < 0.05 and other_rms > 2e-3:
+            vocal.zero_()
+        elif random.random() < 0.22:
             samples = vocal.shape[-1]
             for _ in range(random.randint(1, 2)):
-                span = random.randint(max(64, samples // 50), max(65, samples // 10))
+                span = random.randint(max(64, samples // 40), max(65, samples // 3))
                 start = random.randint(0, max(0, samples - span))
                 end = min(samples, start + span)
-                ramp = min(512, max(0, (end - start) // 8))
+                ramp = min(1024, max(0, (end - start) // 8))
                 envelope = vocal.new_ones(samples)
                 envelope[start:end] = 0.0
                 if ramp > 1:
@@ -1470,7 +1614,7 @@ class StemDataset(Dataset):
                 vocal.mul_(envelope)
 
         if random.random() < 0.20:
-            vocal = random_spectral_eq(vocal, sample_rate)
+            vocal = random_spectral_eq(vocal, sample_rate, is_vocal=True)
         if random.random() < 0.15:
             vocal = apply_saturation(vocal)
         if random.random() < 0.15:
@@ -1481,13 +1625,15 @@ class StemDataset(Dataset):
 
         other = targets[1]
         if random.random() < 0.20:
-            other = random_spectral_eq(other, sample_rate)
+            other = random_spectral_eq(other, sample_rate, is_vocal=False)
         if random.random() < 0.15:
             other = apply_saturation(other)
         if random.random() < 0.15:
             other = apply_reverb(other, sample_rate)
         if random.random() < 0.15:
             other = add_noise_floor(other, sample_rate)
+        if random.random() < 0.20:
+            other = add_low_swoosh_fx(other, sample_rate)
         targets[1] = other
 
         if random.random() < 0.20:
@@ -2537,7 +2683,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
     elif audio.shape[0] > 2:
         audio = audio[:2]
     if source_sr != sample_rate:
-        audio = torchaudio.functional.resample(audio, source_sr, self.sample_rate)
+        audio = torchaudio.functional.resample(audio, source_sr, sample_rate)
     return audio
 
 
