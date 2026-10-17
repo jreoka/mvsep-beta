@@ -135,6 +135,15 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
     config = data.get("model_config")
     if not isinstance(config, dict):
         return False
+    # Mirror mvsep's own checkpoint pickers: the architecture string alone is
+    # not enough, because several checkpoint format revisions (v9-v11) share
+    # the current "v8" architecture string with older state-dict layouts.
+    # mvsep requires checkpoint_format_version >= CHECKPOINT_FORMAT_VERSION;
+    # without the same gate here, auto-selection can pick such a checkpoint
+    # and then fail hard inside load_inference_weights instead of skipping it.
+    expected_format = getattr(mvsep, "CHECKPOINT_FORMAT_VERSION", None)
+    if expected_format is not None and data.get("checkpoint_format_version", 0) < expected_format:
+        return False
     expected = mvsep.ModelConfig(use_checkpoint=False)
     if config.get("architecture") != expected.architecture:
         return False
