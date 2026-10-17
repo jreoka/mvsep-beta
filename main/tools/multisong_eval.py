@@ -228,9 +228,6 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
             args.precision = "fp16"
 
     model = mvsep.BSRoFormerSeparator(config)
-    for module in model.modules():
-        if isinstance(module, mvsep.RoPEAttention):
-            module.attention_backend = args.attention_backend
     mvsep.load_inference_weights(model, str(checkpoint))
     model.to(device).eval()
     return mvsep, model, device, checkpoint, model_script
@@ -404,11 +401,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap-seconds", type=float, default=3.0)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--device", default=None, help="Torch device, for example cuda or cpu.")
-    parser.add_argument(
-        "--attention-backend",
-        choices=("fused", "flash", "auto", "math"),
-        default="fused",
-    )
     parser.add_argument(
         "--expected-songs",
         type=int,
