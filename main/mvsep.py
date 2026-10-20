@@ -83,6 +83,14 @@ class LossConfig:
     main_stft_weight: float = 0.55
     mrstft_weight: float = 0.55
     midside_weight: float = 0.10
+    # Vocal-residue suppression: penalise vocal energy that exceeds the target
+    # vocal (by silence_margin) in frames where the target vocal is inactive
+    # relative to the mixture. Broadband generalisation of the old low-band term.
+    silence_weight: float = 0.50
+    mask_silence_weight: float = 0.50
+    silence_margin: float = 1.5
+    silence_floor_db: float = -45.0
+    silence_active_db: float = -25.0
 
 
 def seed_everything(seed: int) -> None:
@@ -867,9 +875,20 @@ class BSRoFormerSeparator(nn.Module):
         return torch.view_as_complex(masks_real_imag)
 
     def estimate_specs(
-        self, mixture_spec: torch.Tensor, mixture_audio: torch.Tensor | None = None
+        self,
+        mixture_spec: torch.Tensor,
+        mixture_audio: torch.Tensor | None = None,
+        mask_deadzone: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         masks = self(mixture_spec, mixture_audio)
+        if mask_deadzone > 0.0:
+            if torch.is_complex(masks):
+                unit = torch.ones_like(masks[:, :1])
+            else:
+                unit = torch.zeros_like(masks[:, :1])
+                unit[..., 0] = 1.0
+            vocal_mask = soft_threshold_mask(masks[:, :1], mask_deadzone)
+            masks = torch.cat((vocal_mask, unit - vocal_mask), dim=1)
         estimates = masks * mixture_spec[:, None]
         residual = mixture_spec - estimates.sum(dim=1)
         estimates[:, 1] = estimates[:, 1] + residual
@@ -1014,6 +1033,87 @@ def mid_side(audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return mid, side
 
 
+SILENCE_FRAME = 1024
+
+
+def _frame_mean(values: torch.Tensor, frame: int) -> torch.Tensor:
+    pad = (-values.shape[-1]) % frame
+    if pad:
+        values = F.pad(values, (0, pad))
+    return values.reshape(*values.shape[:-1], -1, frame).mean(dim=-1)
+
+
+def _stem_frame_power(audio: torch.Tensor, frame: int = SILENCE_FRAME) -> torch.Tensor:
+    """Mean power per frame of a [B, C, T] stem, averaged over channels."""
+    return _frame_mean(audio.square().mean(dim=-2), frame)
+
+
+def vocal_silence_weight(
+    target_vocal_power: torch.Tensor,
+    mixture_power: torch.Tensor,
+    floor_db: float = -45.0,
+    active_db: float = -25.0,
+) -> torch.Tensor:
+    """Weight ~1 where the target vocal is silent and ~0 where it is active.
+
+    Both inputs are per-frame mean powers. The target vocal is judged relative
+    to the mixture, so loud instrumental passages with no vocal always qualify,
+    regardless of how loud the track is.
+    """
+    relative_db = 10.0 * torch.log10(
+        (target_vocal_power + 1e-10) / (mixture_power + 1e-10)
+    )
+    span = max(active_db - floor_db, 1e-6)
+    ramp = ((relative_db - floor_db) / span).clamp(0.0, 1.0)
+    weight = 1.0 - ramp
+    audible = mixture_power > 1e-4 * mixture_power.amax().clamp_min(1e-12)
+    return weight * audible.to(weight.dtype)
+
+
+def complex_magnitude(x: torch.Tensor) -> torch.Tensor:
+    """Magnitude of a complex tensor, or of a trailing real/imag pair."""
+    if torch.is_complex(x):
+        return x.abs()
+    return torch.linalg.vector_norm(x, dim=-1)
+
+
+def soft_threshold_mask(mask: torch.Tensor, threshold: float) -> torch.Tensor:
+    """Complex soft-threshold: exact zero below ``threshold`` magnitude.
+
+    Accepts either a complex tensor ([..., T] complex) or a real/imag pair
+    ([..., T, 2]); the model returns complex masks, the tests use both.
+    """
+    if threshold <= 0.0:
+        return mask
+    if torch.is_complex(mask):
+        magnitude = mask.abs().clamp_min(1e-8)
+        gain = ((magnitude - threshold).clamp_min(0.0) / magnitude).clamp_max(1.0)
+    else:
+        magnitude = torch.linalg.vector_norm(mask, dim=-1, keepdim=True).clamp_min(1e-8)
+        gain = ((magnitude - threshold).clamp_min(0.0) / magnitude).clamp_max(1.0)
+    return mask * gain
+
+
+def silence_residue_loss(
+    predicted: torch.Tensor,
+    reference: torch.Tensor,
+    weight: torch.Tensor,
+    margin: float,
+    scale: float | torch.Tensor = 1.0,
+) -> torch.Tensor:
+    """Mean excess of ``predicted`` over ``margin * reference``, weighted.
+
+    Both inputs are non-negative magnitudes. Referencing the target instead of
+    a fixed floor is what keeps quiet-but-real vocals from being suppressed:
+    a frame may be "silent" for separation purposes and still hold a whisper,
+    and the hinge only fires once the prediction is margin times louder.
+    """
+    excess = (predicted - margin * reference).clamp_min(0.0)
+    weight = weight.expand_as(excess)
+    total_weight = weight.sum().clamp_min(1e-6)
+    return (excess * weight).sum() / total_weight / scale
+
+
 class SeparationLoss(nn.Module):
     def __init__(self, model_config: ModelConfig, loss_config: LossConfig):
         super().__init__()
@@ -1100,12 +1200,58 @@ class SeparationLoss(nn.Module):
         )
 
         cfg = self.loss_config
+        mixture_stem = (
+            mixture_audio if mixture_audio is not None else target_audio.sum(dim=1)
+        )
+        silence_frame_weight = vocal_silence_weight(
+            _stem_frame_power(target_audio[:, 0]),
+            _stem_frame_power(mixture_stem),
+            cfg.silence_floor_db,
+            cfg.silence_active_db,
+        )
+
+        # Waveform residue: vocal energy exceeding the target vocal (times a
+        # margin) wherever the target vocal is inactive.
+        sample_weight = torch.repeat_interleave(
+            silence_frame_weight, SILENCE_FRAME, dim=-1
+        )[..., : pred_audio.shape[-1]]
+        silence_scale = mixture_stem.abs().mean().detach().clamp_min(1e-4)
+        silence_wave = silence_residue_loss(
+            pred_audio[:, 0].abs().mean(dim=1),
+            target_audio[:, 0].abs().mean(dim=1),
+            sample_weight,
+            cfg.silence_margin,
+            silence_scale,
+        )
+
+        # Mask residue: same idea in mask space, where the residual gain
+        # actually lives. The reference is the true vocal share of the mixture.
+        mask_magnitude = complex_magnitude(masks[:, 0]).mean(dim=1)
+        mask_frame_weight = F.interpolate(
+            silence_frame_weight.unsqueeze(1),
+            size=mask_magnitude.shape[-1],
+            mode="nearest",
+        ).squeeze(1)
+        with torch.no_grad():
+            target_share = (
+                target_specs[:, 0].abs().mean(dim=1)
+                / (mixture_spec.abs().mean(dim=1) + 1e-6)
+            )
+        silence_mask = silence_residue_loss(
+            mask_magnitude,
+            target_share,
+            mask_frame_weight[..., None, :],
+            cfg.silence_margin,
+        )
+
         total = (
             cfg.waveform_weight * wave_loss
             + cfg.main_stft_weight * main_stft_loss
             + cfg.mrstft_weight * mrstft_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
+            + cfg.silence_weight * silence_wave
+            + cfg.mask_silence_weight * silence_mask
         )
         with torch.no_grad():
             pred_vocal_rms = pred_audio[:, 0].square().mean(dim=(-2, -1)).sqrt()
@@ -1129,6 +1275,8 @@ class SeparationLoss(nn.Module):
             "mrstft": mrstft_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
+            "silence_wave": silence_wave.detach(),
+            "silence_mask": silence_mask.detach(),
             "vocal_level_db": vocal_level_db.detach(),
             "vocal_mask_mag": vocal_mask_mag.detach(),
         }
@@ -1935,6 +2083,7 @@ def save_checkpoint(
     step: int,
     best_sdr: float,
     avg_loss: float,
+    extra_metrics: dict | None = None,
 ) -> None:
     payload = {
         "step": step,
@@ -1951,6 +2100,8 @@ def save_checkpoint(
         "model_config": asdict(model.config),
         "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
     }
+    if extra_metrics:
+        payload.update(extra_metrics)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -2041,6 +2192,7 @@ def separate_tensor(
     precision: str = "bf16",
     tta: bool = True,
     show_progress: bool = False,
+    mask_deadzone: float = 0.0,
 ) -> list[torch.Tensor]:
     if mixture.ndim != 2:
         raise ValueError("Mixture must be [channels, samples].")
@@ -2088,7 +2240,9 @@ def separate_tensor(
             window=stft_window,
         )
         with autocast_context(device, precision):
-            estimated_specs, _ = model.estimate_specs(spec, chunk.unsqueeze(0))
+            estimated_specs, _ = model.estimate_specs(
+                spec, chunk.unsqueeze(0), mask_deadzone=mask_deadzone
+            )
             if tta:
                 chunk_flipped = -chunk.flip(0).unsqueeze(0)
                 spec_flipped = make_stft(
@@ -2098,7 +2252,9 @@ def separate_tensor(
                     win_length=model.config.win_length,
                     window=stft_window,
                 )
-                est_flipped, _ = model.estimate_specs(spec_flipped, chunk_flipped)
+                est_flipped, _ = model.estimate_specs(
+                    spec_flipped, chunk_flipped, mask_deadzone=mask_deadzone
+                )
                 est_flipped = -est_flipped.flip(2)
                 estimated_specs = 0.5 * (estimated_specs + est_flipped)
 
@@ -2155,6 +2311,35 @@ def calculate_track_sdr(
 
 
 @torch.inference_mode()
+def calculate_vocal_residue_db(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mixture: torch.Tensor,
+    frame: int = SILENCE_FRAME,
+    active_db: float = -25.0,
+) -> float | None:
+    """Vocal level relative to the mixture where the target vocal is silent.
+
+    Reported in dB; lower is better. This is the number to watch for the
+    "vocal stem is not quite silent" problem, and the target's own value is the
+    floor the dataset allows.
+    """
+    pred_power = _stem_frame_power(prediction, frame)
+    target_power = _stem_frame_power(target, frame)
+    mixture_power = _stem_frame_power(mixture, frame)
+    weight = vocal_silence_weight(
+        target_power, mixture_power, floor_db=-60.0, active_db=active_db
+    )
+    total_weight = weight.sum()
+    if float(total_weight) <= 0.0:
+        return None
+    ratio_db = 10.0 * torch.log10(
+        (pred_power + 1e-10) / (mixture_power + 1e-10)
+    ).clamp_min(-120.0)
+    return float((ratio_db * weight).sum() / total_weight)
+
+
+@torch.inference_mode()
 def validate(
     model: BSRoFormerSeparator,
     test_dir: str,
@@ -2163,7 +2348,8 @@ def validate(
     overlap: int,
     precision: str,
     tta: bool = False,
-) -> tuple[list[float], float | None]:
+    mask_deadzone: float = 0.0,
+) -> tuple[list[float], float | None, float | None, float | None]:
     model.eval()
     track_dirs = [
         os.path.join(test_dir, name)
@@ -2172,9 +2358,11 @@ def validate(
     ] if os.path.isdir(test_dir) else []
     if not track_dirs:
         print(f"No validation tracks found under {test_dir!r}.")
-        return [0.0 for _ in STEMS], None
+        return [0.0 for _ in STEMS], None, None, None
 
     per_stem_track_scores: list[list[float]] = [[] for _ in STEMS]
+    residue_scores: list[float] = []
+    target_residue_scores: list[float] = []
     valid_tracks = 0
     progress = tqdm(track_dirs, desc="Validating", leave=False)
     for track_dir in progress:
@@ -2221,6 +2409,7 @@ def validate(
                 precision=precision,
                 tta=tta,
                 show_progress=False,
+                mask_deadzone=mask_deadzone,
             )
             scores = [
                 calculate_track_sdr(
@@ -2230,21 +2419,33 @@ def validate(
                 )
                 for pred, target in zip(predictions, targets)
             ]
+            residue = calculate_vocal_residue_db(
+                predictions[0], targets[0], mixture
+            )
+            target_residue = calculate_vocal_residue_db(
+                targets[0], targets[0], mixture
+            )
+            if residue is not None:
+                residue_scores.append(residue)
+            if target_residue is not None:
+                target_residue_scores.append(target_residue)
             for index, score in enumerate(scores):
                 if score is not None:
                     per_stem_track_scores[index].append(score)
             valid_tracks += 1
+            leak_text = f" | leak: {residue:.1f} dB" if residue is not None else ""
             progress.set_postfix_str(
                 " | ".join(
                     f"{stem}: {score:.3f}" if score is not None else f"{stem}: inactive"
                     for stem, score in zip(STEMS, scores)
                 )
+                + leak_text
             )
         except Exception as error:
             print(f"\nSkipping {track_dir}: {error}")
 
     if valid_tracks == 0 or not any(per_stem_track_scores):
-        return [0.0 for _ in STEMS], None
+        return [0.0 for _ in STEMS], None, None, None
     means = [
         sum(scores) / len(scores) if scores else float("nan")
         for scores in per_stem_track_scores
@@ -2256,7 +2457,15 @@ def validate(
         if math.isfinite(score)
     ]
     combined = sum(all_scores) / len(all_scores) if all_scores else None
-    return means, combined
+    residue_mean = (
+        sum(residue_scores) / len(residue_scores) if residue_scores else None
+    )
+    target_residue_mean = (
+        sum(target_residue_scores) / len(target_residue_scores)
+        if target_residue_scores
+        else None
+    )
+    return means, combined, residue_mean, target_residue_mean
 
 
 def train(
@@ -2492,13 +2701,23 @@ def train(
             refresh=False,
         )
         if latest_metrics:
-            wave, main_stft, mrstft, vocal_db, mask_mag = torch.stack(
+            (
+                wave,
+                main_stft,
+                mrstft,
+                vocal_db,
+                mask_mag,
+                residue_wave,
+                residue_mask,
+            ) = torch.stack(
                 (
                     latest_metrics["wave"],
                     latest_metrics["main_stft"],
                     latest_metrics["mrstft"],
                     latest_metrics["vocal_level_db"],
                     latest_metrics["vocal_mask_mag"],
+                    latest_metrics["silence_wave"],
+                    latest_metrics["silence_mask"],
                 )
             ).float().cpu().tolist()
             progress.set_postfix(
@@ -2507,6 +2726,7 @@ def train(
                 mr=f"{mrstft:.3f}",
                 vdb=f"{vocal_db:+.1f}",
                 vmask=f"{mask_mag:.3f}",
+                sil=f"{residue_wave:.3f}/{residue_mask:.3f}",
                 refresh=False,
             )
         progress.update(1)
@@ -2532,7 +2752,12 @@ def train(
                     else contextlib.nullcontext()
                 )
                 with compiler_context:
-                    stem_scores, combined_sdr = validate(
+                    (
+                        stem_scores,
+                        combined_sdr,
+                        vocal_residue_db,
+                        target_residue_db,
+                    ) = validate(
                         model,
                         args.test_dir,
                         device,
@@ -2540,6 +2765,7 @@ def train(
                         overlap=args.inference_overlap,
                         precision=args.precision,
                         tta=False,
+                        mask_deadzone=args.mask_deadzone,
                     )
 
             improved = combined_sdr is not None and combined_sdr > best_sdr
@@ -2550,10 +2776,18 @@ def train(
                     f"{stem}: {score:.4f} dB"
                     for stem, score in zip(STEMS, stem_scores)
                 )
+                residue_text = (
+                    f", vocal residue: {vocal_residue_db:.1f} dB"
+                    if vocal_residue_db is not None
+                    else ""
+                )
+                if target_residue_db is not None:
+                    residue_text += f" (target {target_residue_db:.1f} dB)"
                 print(
                     f"\nValidation step {step} "
                     "(EMA, mean full-track SDR): "
                     f"{score_text}, combined: {combined_sdr:.4f} dB"
+                    f"{residue_text}"
                 )
                 if improved:
                     best_sdr = combined_sdr
@@ -2571,6 +2805,11 @@ def train(
                     step,
                     best_sdr,
                     avg_loss,
+                    extra_metrics={
+                        "vocal_residue_db": vocal_residue_db,
+                        "target_residue_db": target_residue_db,
+                        "mask_deadzone": args.mask_deadzone,
+                    },
                 )
                 prune_old_checkpoints(
                     "best_ckpts", keep=1, config=model.config
@@ -2757,6 +2996,50 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
+    parser.add_argument(
+        "--mask_deadzone",
+        type=float,
+        default=0.03,
+        help=(
+            "Inference-only complex soft-threshold on the vocal mask. Mask "
+            "magnitudes below this value are set to exactly zero, so instrumental-"
+            "only passages are truly silent. 0 restores the previous behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--silence_weight",
+        type=float,
+        default=0.5,
+        help="Weight of the waveform vocal-residue (silence leakage) loss.",
+    )
+    parser.add_argument(
+        "--mask_silence_weight",
+        type=float,
+        default=0.5,
+        help="Weight of the mask-domain vocal-residue loss.",
+    )
+    parser.add_argument(
+        "--silence_margin",
+        type=float,
+        default=1.5,
+        help=(
+            "How far above the true vocal level (linear factor) the residue loss "
+            "tolerates before penalising. 1.5 keeps quiet-but-real vocals intact."
+        ),
+    )
+    parser.add_argument(
+        "--silence_floor_db",
+        type=float,
+        default=-45.0,
+        help="Vocal/mixture level (dB) below which leakage is not penalised.",
+    )
+    parser.add_argument(
+        "--silence_active_db",
+        type=float,
+        default=-25.0,
+        help="Vocal/mixture level (dB) at and above which a frame counts as active.",
+    )
+    parser.add_argument("--sdr_weight", type=float, default=0.35)
     parser.add_argument("--seed", type=int, default=1337)
     return parser
 
@@ -2789,6 +3072,16 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--inference_overlap_seconds cannot be negative.")
     if args.dataset_size < args.batch_size:
         raise ValueError("--dataset_size must be at least --batch_size.")
+    if args.mask_deadzone < 0.0 or args.mask_deadzone >= 1.0:
+        raise ValueError("--mask_deadzone must be in [0, 1).")
+    if args.silence_weight < 0.0 or args.mask_silence_weight < 0.0:
+        raise ValueError("Silence loss weights cannot be negative.")
+    if args.sdr_weight < 0.0:
+        raise ValueError("--sdr_weight cannot be negative.")
+    if args.silence_floor_db >= args.silence_active_db:
+        raise ValueError(
+            "--silence_floor_db must be below --silence_active_db."
+        )
 
 
 def main() -> None:
@@ -2885,7 +3178,17 @@ def main() -> None:
             weight_decay=args.weight_decay,
             slice_p=args.slice_p,
         )
-        loss_module = SeparationLoss(config, LossConfig())
+        loss_module = SeparationLoss(
+            config,
+            LossConfig(
+                sdr_weight=args.sdr_weight,
+                silence_weight=args.silence_weight,
+                mask_silence_weight=args.mask_silence_weight,
+                silence_margin=args.silence_margin,
+                silence_floor_db=args.silence_floor_db,
+                silence_active_db=args.silence_active_db,
+            ),
+        )
         train(
             model,
             dataloader,
@@ -2914,6 +3217,7 @@ def main() -> None:
         precision=args.precision,
         tta=args.tta,
         show_progress=True,
+        mask_deadzone=args.mask_deadzone,
     )
     for stem, prediction in zip(STEMS, predictions):
         output_path = os.path.join("outputs", f"{stem}.wav")
