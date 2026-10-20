@@ -881,15 +881,28 @@ class BSRoFormerSeparator(nn.Module):
         mask_deadzone: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         masks = self(mixture_spec, mixture_audio)
-        if mask_deadzone > 0.0:
+        deadzone_active = mask_deadzone > 0.0
+        if deadzone_active:
             if torch.is_complex(masks):
                 unit = torch.ones_like(masks[:, :1])
             else:
                 unit = torch.zeros_like(masks[:, :1])
                 unit[..., 0] = 1.0
-            vocal_mask = soft_threshold_mask(masks[:, :1], mask_deadzone)
-            masks = torch.cat((vocal_mask, unit - vocal_mask), dim=1)
+            raw_vocal_mask = masks[:, :1]
+            vocal_mask = soft_threshold_mask(raw_vocal_mask, mask_deadzone)
+            # The instrumental keeps its *unthresholded* complement. Deriving it
+            # from the thresholded mask (or re-adding the residual) routes the
+            # energy the deadzone just removed straight into the other stem: the
+            # complex soft threshold strips a fixed magnitude from every bin
+            # above the deadzone, so that ghost is a broadband copy of the vocal
+            # at roughly 20*log10(deadzone) dB down, which is audible.
+            masks = torch.cat((vocal_mask, unit - raw_vocal_mask), dim=1)
         estimates = masks * mixture_spec[:, None]
+        if deadzone_active:
+            # Deliberately no residual: the removed vocal energy is discarded
+            # instead of being conserved, so the instrumental stays bit-for-bit
+            # what it was with mask_deadzone == 0.
+            return estimates, masks
         residual = mixture_spec - estimates.sum(dim=1)
         estimates[:, 1] = estimates[:, 1] + residual
         return estimates, masks
@@ -2340,6 +2353,45 @@ def calculate_vocal_residue_db(
 
 
 @torch.inference_mode()
+def calculate_other_spill_db(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    vocal: torch.Tensor,
+    mixture: torch.Tensor,
+    frame: int = SILENCE_FRAME,
+    active_db: float = -25.0,
+) -> float | None:
+    """Instrumental energy above the target instrumental where the vocal sings.
+
+    Reported in dB relative to the mixture; lower is better. This is the mirror
+    of ``calculate_vocal_residue_db``: a dead-zone that cleans the vocal stem by
+    handing its energy to the instrumental raises this number, which is the
+    "I can hear the vocal in the instrumental" complaint made measurable.
+    """
+    mixture_power = _stem_frame_power(mixture, frame)
+    audible = (
+        mixture_power > 1e-4 * mixture_power.amax().clamp_min(1e-12)
+    ).to(mixture_power.dtype)
+    active = (
+        1.0
+        - vocal_silence_weight(
+            _stem_frame_power(vocal, frame),
+            mixture_power,
+            floor_db=-60.0,
+            active_db=active_db,
+        )
+    ) * audible
+    total_weight = active.sum()
+    if float(total_weight) <= 0.0:
+        return None
+    excess = (
+        _stem_frame_power(prediction, frame) - _stem_frame_power(target, frame)
+    ).clamp_min(0.0)
+    ratio = (excess * active).sum() / ((mixture_power * active).sum() + 1e-10)
+    return float(10.0 * torch.log10(ratio.clamp_min(1e-10)))
+
+
+@torch.inference_mode()
 def validate(
     model: BSRoFormerSeparator,
     test_dir: str,
@@ -2349,7 +2401,9 @@ def validate(
     precision: str,
     tta: bool = False,
     mask_deadzone: float = 0.0,
-) -> tuple[list[float], float | None, float | None, float | None]:
+) -> tuple[
+    list[float], float | None, float | None, float | None, float | None
+]:
     model.eval()
     track_dirs = [
         os.path.join(test_dir, name)
@@ -2358,11 +2412,12 @@ def validate(
     ] if os.path.isdir(test_dir) else []
     if not track_dirs:
         print(f"No validation tracks found under {test_dir!r}.")
-        return [0.0 for _ in STEMS], None, None, None
+        return [0.0 for _ in STEMS], None, None, None, None
 
     per_stem_track_scores: list[list[float]] = [[] for _ in STEMS]
     residue_scores: list[float] = []
     target_residue_scores: list[float] = []
+    spill_scores: list[float] = []
     valid_tracks = 0
     progress = tqdm(track_dirs, desc="Validating", leave=False)
     for track_dir in progress:
@@ -2425,15 +2480,22 @@ def validate(
             target_residue = calculate_vocal_residue_db(
                 targets[0], targets[0], mixture
             )
+            spill = calculate_other_spill_db(
+                predictions[1], targets[1], targets[0], mixture
+            )
             if residue is not None:
                 residue_scores.append(residue)
             if target_residue is not None:
                 target_residue_scores.append(target_residue)
+            if spill is not None:
+                spill_scores.append(spill)
             for index, score in enumerate(scores):
                 if score is not None:
                     per_stem_track_scores[index].append(score)
             valid_tracks += 1
             leak_text = f" | leak: {residue:.1f} dB" if residue is not None else ""
+            if spill is not None:
+                leak_text += f" | spill: {spill:.1f} dB"
             progress.set_postfix_str(
                 " | ".join(
                     f"{stem}: {score:.3f}" if score is not None else f"{stem}: inactive"
@@ -2445,7 +2507,7 @@ def validate(
             print(f"\nSkipping {track_dir}: {error}")
 
     if valid_tracks == 0 or not any(per_stem_track_scores):
-        return [0.0 for _ in STEMS], None, None, None
+        return [0.0 for _ in STEMS], None, None, None, None
     means = [
         sum(scores) / len(scores) if scores else float("nan")
         for scores in per_stem_track_scores
@@ -2465,7 +2527,8 @@ def validate(
         if target_residue_scores
         else None
     )
-    return means, combined, residue_mean, target_residue_mean
+    spill_mean = sum(spill_scores) / len(spill_scores) if spill_scores else None
+    return means, combined, residue_mean, target_residue_mean, spill_mean
 
 
 def train(
@@ -2757,6 +2820,7 @@ def train(
                         combined_sdr,
                         vocal_residue_db,
                         target_residue_db,
+                        other_spill_db,
                     ) = validate(
                         model,
                         args.test_dir,
@@ -2783,6 +2847,8 @@ def train(
                 )
                 if target_residue_db is not None:
                     residue_text += f" (target {target_residue_db:.1f} dB)"
+                if other_spill_db is not None:
+                    residue_text += f", instrumental spill: {other_spill_db:.1f} dB"
                 print(
                     f"\nValidation step {step} "
                     "(EMA, mean full-track SDR): "
@@ -2808,6 +2874,7 @@ def train(
                     extra_metrics={
                         "vocal_residue_db": vocal_residue_db,
                         "target_residue_db": target_residue_db,
+                        "other_spill_db": other_spill_db,
                         "mask_deadzone": args.mask_deadzone,
                     },
                 )
