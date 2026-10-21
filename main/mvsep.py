@@ -2294,8 +2294,13 @@ def separate_tensor(
         weight_sum[start : start + usable] += window
 
     output = output / weight_sum.clamp_min(1e-8)
-    residual = mixture - output.sum(dim=0)
-    output[1] = output[1] + residual
+    if mask_deadzone <= 0.0:
+        # Stems sum back to the mixture. With a deadzone the removed vocal
+        # energy was deliberately discarded, so compensating here would pour
+        # exactly that ghost back into the instrumental (whole-track, after
+        # every chunk was computed cleanly).
+        residual = mixture - output.sum(dim=0)
+        output[1] = output[1] + residual
     return [output[index] for index in range(model.config.num_stems)]
 
 
