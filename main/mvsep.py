@@ -327,16 +327,28 @@ def apply_rope(
     return x * cos + rotate_half(x) * sin
 
 
-class GELUMlp(nn.Module):
+class SwiGLUMlp(nn.Module):
+    """SwiGLU feed-forward (Shazeer 2020), replacing the plain GELU MLP.
+
+    Three matrices instead of two — gate, value, down — so the hidden size
+    is ~2/3 of the old 4x expansion to hold the parameter count roughly
+    constant: at dim 256 the hidden size is 704, giving 3*256*704 = 541k
+    parameters vs the old 524k (+3%). The down-projection stays
+    zero-initialised by the caller, so each transformer block still starts
+    training as the identity, exactly as the GELU version did.
+    """
+
     def __init__(self, dim: int, dropout: float = 0.0):
         super().__init__()
-        hidden_dim = dim * 4
-        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
+        hidden_dim = ((dim * 8 // 3) + 63) // 64 * 64
+        self.fc_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.fc_value = nn.Linear(dim, hidden_dim, bias=False)
+        self.fc_down = nn.Linear(hidden_dim, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.fc2(F.gelu(self.fc1(x))))
+        gated = F.silu(self.fc_gate(x)) * self.fc_value(x)
+        return self.dropout(self.fc_down(gated))
 
 
 class RoPEAttention(nn.Module):
@@ -400,8 +412,8 @@ class TransformerUnit(nn.Module):
             dropout=dropout,
         )
         self.ff_norm = nn.RMSNorm(dim)
-        self.ff = GELUMlp(dim, dropout=dropout)
-        nn.init.zeros_(self.ff.fc2.weight)
+        self.ff = SwiGLUMlp(dim, dropout=dropout)
+        nn.init.zeros_(self.ff.fc_down.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x))
