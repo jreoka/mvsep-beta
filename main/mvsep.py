@@ -3033,7 +3033,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=4096)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=4096)
-    parser.add_argument("--segment_seconds", type=float, default=8)
+    parser.add_argument("--segment_seconds", type=float, default=12)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
