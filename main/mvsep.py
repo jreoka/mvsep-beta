@@ -86,8 +86,8 @@ class LossConfig:
     # Vocal-residue suppression: penalise vocal energy that exceeds the target
     # vocal (by silence_margin) in frames where the target vocal is inactive
     # relative to the mixture. Broadband generalisation of the old low-band term.
-    silence_weight: float = 0.50
-    mask_silence_weight: float = 0.50
+    silence_weight: float = 0.30
+    mask_silence_weight: float = 0.30
     silence_margin: float = 1.5
     silence_floor_db: float = -45.0
     silence_active_db: float = -25.0
@@ -2215,7 +2215,6 @@ def separate_tensor(
     overlap: int,
     device: torch.device,
     precision: str = "bf16",
-    tta: bool = True,
     show_progress: bool = False,
     mask_deadzone: float = 0.0,
 ) -> list[torch.Tensor]:
@@ -2268,20 +2267,6 @@ def separate_tensor(
             estimated_specs, _ = model.estimate_specs(
                 spec, chunk.unsqueeze(0), mask_deadzone=mask_deadzone
             )
-            if tta:
-                chunk_flipped = -chunk.flip(0).unsqueeze(0)
-                spec_flipped = make_stft(
-                    chunk_flipped,
-                    n_fft=model.config.n_fft,
-                    hop_length=model.config.hop_length,
-                    win_length=model.config.win_length,
-                    window=stft_window,
-                )
-                est_flipped, _ = model.estimate_specs(
-                    spec_flipped, chunk_flipped, mask_deadzone=mask_deadzone
-                )
-                est_flipped = -est_flipped.flip(2)
-                estimated_specs = 0.5 * (estimated_specs + est_flipped)
 
         estimated = make_istft(
             estimated_specs,
@@ -2416,7 +2401,6 @@ def validate(
     chunk_size: int,
     overlap: int,
     precision: str,
-    tta: bool = False,
     mask_deadzone: float = 0.0,
 ) -> tuple[
     list[float], float | None, float | None, float | None, float | None
@@ -2479,7 +2463,6 @@ def validate(
                 overlap=overlap,
                 device=device,
                 precision=precision,
-                tta=tta,
                 show_progress=False,
                 mask_deadzone=mask_deadzone,
             )
@@ -2845,7 +2828,6 @@ def train(
                         chunk_size=args.segment_samples,
                         overlap=args.inference_overlap,
                         precision=args.precision,
-                        tta=False,
                         mask_deadzone=args.mask_deadzone,
                     )
 
@@ -3047,18 +3029,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=4096)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=4096)
-    parser.add_argument("--segment_seconds", type=float, default=8)
+    parser.add_argument("--segment_seconds", type=float, default=12)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
         default=3,
     )
-    parser.add_argument(
-        "--tta",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=16)
     parser.add_argument("--heads", type=int, default=8)
@@ -3093,13 +3069,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--silence_weight",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Weight of the waveform vocal-residue (silence leakage) loss.",
     )
     parser.add_argument(
         "--mask_silence_weight",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Weight of the mask-domain vocal-residue loss.",
     )
     parser.add_argument(
@@ -3243,7 +3219,7 @@ def main() -> None:
         dataset = build_training_dataset(args, config)
         generator = torch.Generator()
         generator.manual_seed(args.seed)
-        use_pin_memory = False
+        use_pin_memory = device.type == "cuda"
         use_persistent = False
         dataloader = DataLoader(
             dataset,
@@ -3299,7 +3275,6 @@ def main() -> None:
         overlap=args.inference_overlap,
         device=device,
         precision=args.precision,
-        tta=args.tta,
         show_progress=True,
         mask_deadzone=args.mask_deadzone,
     )
