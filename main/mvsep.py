@@ -328,16 +328,30 @@ def apply_rope(
 
 
 class SwiGLUMlp(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.0):
+    def __init__(self, dim: int, dropout: float = 0.0, gate_kernel_size: int = 13):
         super().__init__()
         hidden_dim = ((dim * 8 // 3) + 63) // 64 * 64
         self.fc_gate = nn.Linear(dim, hidden_dim, bias=False)
         self.fc_value = nn.Linear(dim, hidden_dim, bias=False)
         self.fc_down = nn.Linear(hidden_dim, dim, bias=False)
+        self.gate_conv = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=gate_kernel_size,
+            padding=gate_kernel_size // 2,
+            groups=hidden_dim,
+            bias=False,
+        )
         self.dropout = nn.Dropout(dropout)
+        # Delta init: the conv starts as the identity, so the block begins as
+        # plain SwiGLU and learns cross-token gating from there.
+        nn.init.zeros_(self.gate_conv.weight)
+        with torch.no_grad():
+            self.gate_conv.weight[:, 0, gate_kernel_size // 2] = 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gated = F.silu(self.fc_gate(x)) * self.fc_value(x)
+        gate = self.gate_conv(self.fc_gate(x).transpose(1, 2)).transpose(1, 2)
+        gated = F.silu(gate) * self.fc_value(x)
         return self.dropout(self.fc_down(gated))
 
 
@@ -3019,7 +3033,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=4096)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=4096)
-    parser.add_argument("--segment_seconds", type=float, default=12)
+    parser.add_argument("--segment_seconds", type=float, default=8)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
