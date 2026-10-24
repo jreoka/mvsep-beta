@@ -328,16 +328,6 @@ def apply_rope(
 
 
 class SwiGLUMlp(nn.Module):
-    """SwiGLU feed-forward (Shazeer 2020), replacing the plain GELU MLP.
-
-    Three matrices instead of two — gate, value, down — so the hidden size
-    is ~2/3 of the old 4x expansion to hold the parameter count roughly
-    constant: at dim 256 the hidden size is 704, giving 3*256*704 = 541k
-    parameters vs the old 524k (+3%). The down-projection stays
-    zero-initialised by the caller, so each transformer block still starts
-    training as the identity, exactly as the GELU version did.
-    """
-
     def __init__(self, dim: int, dropout: float = 0.0):
         super().__init__()
         hidden_dim = ((dim * 8 // 3) + 63) // 64 * 64
