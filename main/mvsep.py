@@ -3014,7 +3014,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data_weights",
         type=str,
-        default="3,1",
+        default="2,1",
     )
     parser.add_argument(
         "--data_dir",
