@@ -8,6 +8,7 @@ import os
 import random
 import re
 import signal
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -22,6 +23,12 @@ from prodigyopt import Prodigy
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Torchinductor does not support code generation for complex operators.*",
+    category=UserWarning,
+)
 
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
@@ -40,12 +47,11 @@ class ModelConfig:
     num_stems: int = len(STEMS)
     num_bands: int = 124
     dim: int = 256
-    depth: int = 16
-    heads: int = 8
+    depth: int = 12
     dropout: float = 0.0
     use_checkpoint: bool = True
     time_branch_width: int = 128
-    architecture: str = "bs124_roformer_axial_v8"
+    architecture: str = "bs124_resonant_conv_gate_v1"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -60,17 +66,13 @@ class ModelConfig:
             raise ValueError("This trainer currently requires stereo audio_channels=2.")
         if self.num_stems != len(STEMS):
             raise ValueError(f"num_stems must match STEMS ({len(STEMS)}), got {self.num_stems}.")
-        if self.dim <= 0 or self.depth <= 0 or self.heads <= 0:
-            raise ValueError("dim, depth, and heads must be positive.")
-        if self.dim % self.heads != 0:
-            raise ValueError("dim must be divisible by heads.")
-        if (self.dim // self.heads) % 2 != 0:
-            raise ValueError("The attention head dimension must be even for RoPE.")
+        if self.dim <= 0 or self.depth <= 0:
+            raise ValueError("dim and depth must be positive.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at exactly 124 bands.")
-        if self.architecture != "bs124_roformer_axial_v8":
+        if self.architecture != "bs124_resonant_conv_gate_v1":
             raise ValueError(f"Unsupported architecture {self.architecture!r}.")
         if self.time_branch_width <= 0:
             raise ValueError("time_branch_width must be positive.")
@@ -83,9 +85,6 @@ class LossConfig:
     main_stft_weight: float = 0.55
     mrstft_weight: float = 0.55
     midside_weight: float = 0.10
-    # Vocal-residue suppression: penalise vocal energy that exceeds the target
-    # vocal (by silence_margin) in frames where the target vocal is inactive
-    # relative to the mixture. Broadband generalisation of the old low-band term.
     silence_weight: float = 0.30
     mask_silence_weight: float = 0.30
     silence_margin: float = 1.5
@@ -292,137 +291,133 @@ def make_istft(
     return audio.reshape(*original_shape, length)
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, base: float = 10_000.0):
+class ResonantConvGateBlock(nn.Module):
+    def __init__(self, dim, expansion_factor=2.0, num_bands=32, norm_groups=8):
         super().__init__()
-        if head_dim % 2 != 0:
-            raise ValueError("RoPE head dimension must be even.")
-        inv_freq = base ** (-torch.arange(0, head_dim, 2).float() / head_dim)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        assert dim % 8 == 0 and num_bands % 2 == 0
+        self.dim = dim
+        self.branch_dim = dim // 4
+        self.num_bands = num_bands
+        self.half_bands = num_bands // 2
+        self.norm_groups = norm_groups if dim % norm_groups == 0 else 1
+        hidden_dim = int(dim * expansion_factor)
 
-    def forward(
-        self,
-        length: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.arange(length, device=device, dtype=self.inv_freq.dtype)
-        angles = torch.outer(positions, self.inv_freq)
-        angles = torch.cat((angles, angles), dim=-1)
-        return angles.cos().to(dtype=dtype), angles.sin().to(dtype=dtype)
+        self.norm1 = nn.RMSNorm(dim)
+        self.in_proj = nn.Linear(dim, dim * 3, bias=False)
 
+        self.conv_d1 = nn.Conv1d(self.branch_dim, self.branch_dim, kernel_size=3, padding=1, dilation=1, groups=self.branch_dim)
+        self.conv_d2 = nn.Conv1d(self.branch_dim, self.branch_dim, kernel_size=3, padding=2, dilation=2, groups=self.branch_dim)
+        self.conv_d4 = nn.Conv1d(self.branch_dim, self.branch_dim, kernel_size=3, padding=4, dilation=4, groups=self.branch_dim)
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+        init_filter = torch.zeros(1, dim * 2, num_bands)
+        init_filter[:, :dim, :] = 1.0
+        init_filter.add_(torch.randn_like(init_filter) * 0.02)
+        self.base_filter = nn.Parameter(init_filter)
 
+        bottleneck = max(dim // 4, 16)
+        self.band_proj = nn.Conv1d(dim * 3, dim, kernel_size=1, groups=dim)
+        self.band_conv1 = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.chan_mlp = nn.Sequential(
+            nn.Conv1d(dim, bottleneck, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv1d(bottleneck, dim, kernel_size=1)
+        )
+        self.band_conv2 = nn.Conv1d(dim, dim * 2, kernel_size=1, groups=dim)
+        nn.init.zeros_(self.band_conv2.weight)
+        nn.init.zeros_(self.band_conv2.bias)
 
-def apply_rope(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
-    return x * cos + rotate_half(x) * sin
-
-
-class SwiGLUMlp(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.0):
-        super().__init__()
-        hidden_dim = ((dim * 8 // 3) + 63) // 64 * 64
-        self.fc_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.fc_value = nn.Linear(dim, hidden_dim, bias=False)
-        self.fc_down = nn.Linear(hidden_dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gated = F.silu(self.fc_gate(x)) * self.fc_value(x)
-        return self.dropout(self.fc_down(gated))
-
-
-class RoPEAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        heads: int,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        if dim % heads != 0:
-            raise ValueError("Model dimension must be divisible by the number of heads.")
-        self.heads = heads
-        self.head_dim = dim // heads
-        self.dropout = dropout
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.out_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.out_dropout = nn.Dropout(dropout)
-        self.rope = RotaryEmbedding(self.head_dim)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        batch, length, dim = x.shape
-        qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        self.norm2 = nn.RMSNorm(dim)
+        self.ffn_in = nn.Linear(dim, hidden_dim * 2)
+        self.flux_scale = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.ffn_out = nn.Linear(hidden_dim, dim, bias=False)
 
-        cos, sin = self.rope(length, x.device, q.dtype)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        self.layer_scale_1 = nn.Parameter(torch.ones(dim) * 1e-2)
+        self.layer_scale_2 = nn.Parameter(torch.ones(dim) * 1e-2)
 
-        attention_dropout = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=attention_dropout,
-            is_causal=False,
+    def _grouped_l2_norm(self, x):
+        B, L, D = x.shape
+        x = x.view(B, L, self.norm_groups, D // self.norm_groups)
+        x = F.normalize(x, dim=-1)
+        return x.view(B, L, D)
+
+    def forward(self, x):
+        B, L, D = x.shape
+        shortcut = x
+        x_norm = self.norm1(x)
+
+        u, v, gate = self.in_proj(x_norm).chunk(3, dim=-1)
+        v = self._grouped_l2_norm(v).transpose(1, 2)
+        u = u.transpose(1, 2).contiguous()
+
+        v_shift, v1, v2, v4 = v.chunk(4, dim=1)
+        v_left, v_right = v_shift.chunk(2, dim=1)
+        v_shifted = torch.cat([
+            F.pad(v_left[:, :, :-1], (1, 0)),
+            F.pad(v_right[:, :, 1:], (0, 1))
+        ], dim=1)
+
+        y1 = self.conv_d1(v1)
+        y2 = self.conv_d2((v2 + y1) * 0.70710678)
+        y4 = self.conv_d4((v4 + y2) * 0.70710678)
+        local_feat = torch.cat([v_shifted, y1, y2, y4], dim=1).transpose(1, 2)
+
+        fft_len = 2 * L
+        u_f = torch.fft.rfft(u.float(), n=fft_len, dim=-1, norm="ortho")
+        freq_len = u_f.shape[-1]
+        low_cut = max(freq_len // 8, self.half_bands)
+
+        u_real, u_imag = u_f.real, u_f.imag
+        u_log_pow = torch.log1p(u_real.square() + u_imag.square())
+
+        f_stack = torch.cat([u_real, u_imag, u_log_pow], dim=1)
+        bands_low = F.adaptive_avg_pool1d(f_stack[:, :, :low_cut], self.half_bands)
+        bands_high = F.adaptive_avg_pool1d(f_stack[:, :, low_cut:], self.half_bands)
+        bands_raw = torch.cat([bands_low, bands_high], dim=-1).to(x.dtype)
+        bands_grouped = bands_raw.view(B, 3, D, self.num_bands).transpose(1, 2).reshape(B, D * 3, self.num_bands)
+
+        band_feat = self.band_proj(bands_grouped)
+        chan_ctx = self.chan_mlp(band_feat.mean(dim=-1, keepdim=True))
+        band_hidden = F.silu(self.band_conv1(band_feat) + chan_ctx)
+        dyn_bands = self.band_conv2(band_hidden)
+
+        total_bands = torch.tanh(self.base_filter + dyn_bands).float()
+        filter_low = F.interpolate(total_bands[:, :, :self.half_bands], size=low_cut, mode="linear", align_corners=True)
+        filter_high = F.interpolate(total_bands[:, :, self.half_bands:], size=freq_len - low_cut, mode="linear", align_corners=True)
+        full_filter = torch.cat([filter_low, filter_high], dim=-1)
+        w_real, w_imag = full_filter.chunk(2, dim=1)
+
+        u_f_filtered = torch.complex(
+            u_real * w_real - u_imag * w_imag,
+            u_real * w_imag + u_imag * w_real
         )
-        out = out.transpose(1, 2).reshape(batch, length, dim)
-        return self.out_dropout(self.out_proj(out))
+        global_feat = torch.fft.irfft(u_f_filtered, n=fft_len, dim=-1, norm="ortho")[:, :, :L].transpose(1, 2).to(x.dtype)
 
+        cross_mixed = local_feat * F.silu(global_feat) + global_feat * F.silu(local_feat)
+        mixed = self.out_norm(cross_mixed) * F.silu(gate)
+        x = shortcut + self.out_proj(mixed) * self.layer_scale_1
 
-class TransformerUnit(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        heads: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.attn_norm = nn.RMSNorm(dim)
-        self.attn = RoPEAttention(
-            dim,
-            heads,
-            dropout=dropout,
-        )
-        self.ff_norm = nn.RMSNorm(dim)
-        self.ff = SwiGLUMlp(dim, dropout=dropout)
-        nn.init.zeros_(self.ff.fc_down.weight)
+        shortcut2 = x
+        x_norm2 = self.norm2(x)
+        ffn_gate, ffn_val = self.ffn_in(x_norm2).chunk(2, dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        return x + self.ff(self.ff_norm(x))
+        flux = F.pad(ffn_val[:, 2:, :] - ffn_val[:, :-2, :], (0, 0, 1, 1))
+        ffn = F.silu(ffn_gate + flux * self.flux_scale) * ffn_val
+        x = shortcut2 + self.ffn_out(ffn) * self.layer_scale_2
+
+        return x
 
 
 class DualPathEncoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        unit_kwargs = dict(
-            dim=config.dim,
-            heads=config.heads,
-            dropout=config.dropout,
-        )
         self.time_layers = nn.ModuleList(
-            TransformerUnit(**unit_kwargs) for _ in range(config.depth)
+            ResonantConvGateBlock(config.dim) for _ in range(config.depth)
         )
         self.freq_layers = nn.ModuleList(
-            TransformerUnit(**unit_kwargs) for _ in range(config.depth)
+            ResonantConvGateBlock(config.dim) for _ in range(config.depth)
         )
         self.output_norm = nn.RMSNorm(config.dim)
         self.use_checkpoint = config.use_checkpoint
@@ -829,7 +824,7 @@ class TimeBranch(nn.Module):
         return tokens * self.gate
 
 
-class BSRoFormerSeparator(nn.Module):
+class ResonantConvGateSeparator(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -1152,7 +1147,7 @@ class SeparationLoss(nn.Module):
 
     def forward(
         self,
-        model: BSRoFormerSeparator,
+        model: ResonantConvGateSeparator,
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
@@ -2091,7 +2086,7 @@ def find_best_checkpoint(
 
 def save_checkpoint(
     path: str,
-    model: BSRoFormerSeparator,
+    model: ResonantConvGateSeparator,
     ema: EMA,
     optimizer: Prodigy,
     scaler: torch.amp.GradScaler,
@@ -2199,7 +2194,7 @@ def autocast_context(device: torch.device, precision: str):
 
 @torch.inference_mode()
 def separate_tensor(
-    model: BSRoFormerSeparator,
+    model: ResonantConvGateSeparator,
     mixture: torch.Tensor,
     chunk_size: int,
     overlap: int,
@@ -2385,7 +2380,7 @@ def calculate_other_spill_db(
 
 @torch.inference_mode()
 def validate(
-    model: BSRoFormerSeparator,
+    model: ResonantConvGateSeparator,
     test_dir: str,
     device: torch.device,
     chunk_size: int,
@@ -2522,7 +2517,7 @@ def validate(
 
 
 def train(
-    model: BSRoFormerSeparator,
+    model: ResonantConvGateSeparator,
     dataloader: DataLoader,
     optimizer: Prodigy,
     loss_module: SeparationLoss,
@@ -2643,7 +2638,7 @@ def train(
         model.encoder.compile_layers(mode="default")
         print(
             f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
-            "transformer units; activation checkpoint boundaries remain eager."
+            "resonant conv-gate units; activation checkpoint boundaries remain eager."
         )
 
     stft_window = torch.hann_window(model.config.win_length, device=device)
@@ -2918,7 +2913,6 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         num_bands=124,
         dim=args.model_dim,
         depth=args.depth,
-        heads=args.heads,
         dropout=args.dropout,
         use_checkpoint=args.ckpt,
     )
@@ -2947,7 +2941,7 @@ def inspect_checkpoint_config(
 
 
 def load_inference_weights(
-    model: BSRoFormerSeparator,
+    model: ResonantConvGateSeparator,
     checkpoint_path: str,
 ) -> None:
     checkpoint_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -2984,7 +2978,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="High SD-SDR 124-band BS-RoFormer separator for MVSEP"
+        description="High SD-SDR 124-band resonant conv-gate separator for MVSEP"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -3019,15 +3013,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=4096)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=4096)
-    parser.add_argument("--segment_seconds", type=float, default=12)
+    parser.add_argument("--segment_seconds", type=float, default=8)
     parser.add_argument(
         "--inference_overlap_seconds",
         type=float,
         default=3,
     )
     parser.add_argument("--model_dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=16)
-    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
@@ -3199,9 +3192,9 @@ def main() -> None:
             print("CUDA device lacks BF16 support; falling back to FP16.")
             args.precision = "fp16"
 
-    model = BSRoFormerSeparator(config)
+    model = ResonantConvGateSeparator(config)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    print(f"124-band axial RoFormer parameters: {parameter_count / 1e6:.2f}M")
+    print(f"124-band axial resonant conv-gate parameters: {parameter_count / 1e6:.2f}M")
 
     if args.train:
         if checkpoint_path:
