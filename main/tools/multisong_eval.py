@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import re
 import sys
@@ -99,7 +100,6 @@ def validate_archive(
             raise RuntimeError(f"Corrupt ZIP entry: {bad_entry}")
 
 
-
 def load_mvsep_module() -> tuple[Any, Path, Path]:
     """Import the sibling/parent ``mvsep.py`` training module.
 
@@ -124,6 +124,11 @@ def load_mvsep_module() -> tuple[Any, Path, Path]:
     return mvsep, main_dir, model_script
 
 
+def _checkpoint_step_from_name(path: Path) -> int:
+    match = re.search(r"step_(\d+)", path.name)
+    return int(match.group(1)) if match else -1
+
+
 def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
     """Accept checkpoints from this architecture without assuming default width/depth."""
     try:
@@ -132,31 +137,70 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
         print(f"Ignoring unreadable checkpoint {path}: {error}")
         return False
 
-    config = data.get("model_config")
-    if not isinstance(config, dict):
-        return False
-    # Mirror mvsep's own checkpoint pickers: the architecture string alone is
-    # not enough, because several checkpoint format revisions (v9-v11) share
-    # the current "v8" architecture string with older state-dict layouts.
-    # mvsep requires checkpoint_format_version >= CHECKPOINT_FORMAT_VERSION;
-    # without the same gate here, auto-selection can pick such a checkpoint
-    # and then fail hard inside load_inference_weights instead of skipping it.
-    expected_format = getattr(mvsep, "CHECKPOINT_FORMAT_VERSION", None)
-    if expected_format is not None and data.get("checkpoint_format_version", 0) < expected_format:
-        return False
-    expected = mvsep.ModelConfig(use_checkpoint=False)
-    if config.get("architecture") != expected.architecture:
-        return False
-    if config.get("num_bands", expected.num_bands) != 124:
-        return False
-    if tuple(data.get("stems", ())) != tuple(mvsep.STEMS):
-        return False
+    try:
+        if not isinstance(data, dict):
+            return False
+        config = data.get("model_config")
+        if not isinstance(config, dict):
+            return False
 
-    expected_metric = getattr(mvsep, "VALIDATION_METRIC", None)
-    saved_metric = data.get("validation_metric")
-    if expected_metric is not None and saved_metric not in (None, expected_metric):
-        return False
-    return True
+        # Mirror mvsep's own checkpoint pickers: require at least the current
+        # CHECKPOINT_FORMAT_VERSION (v13+ for bs124_conformer_rope_deepfilter_v2)
+        # as well as a valid ModelConfig and exact ResonantConvGateSeparator
+        # state-dict match so stale checkpoints are skipped during auto-selection
+        # rather than failing inside load_inference_weights.
+        expected_format = getattr(mvsep, "CHECKPOINT_FORMAT_VERSION", None)
+        if (
+            expected_format is not None
+            and data.get("checkpoint_format_version", 0) < expected_format
+        ):
+            return False
+
+        expected = mvsep.ModelConfig(use_checkpoint=False)
+        if config.get("architecture") != expected.architecture:
+            return False
+        if config.get("num_bands", expected.num_bands) != expected.num_bands:
+            return False
+        if tuple(data.get("stems", ())) != tuple(mvsep.STEMS):
+            return False
+
+        expected_metric = getattr(mvsep, "VALIDATION_METRIC", None)
+        saved_metric = data.get("validation_metric")
+        if expected_metric is not None and saved_metric not in (None, expected_metric):
+            return False
+
+        state = data.get("ema_state_dict") or data.get("model_state_dict")
+        if not isinstance(state, dict) or not state:
+            return False
+
+        valid_fields = mvsep.ModelConfig.__dataclass_fields__.keys()
+        filtered = {
+            key: value for key, value in config.items() if key in valid_fields
+        }
+        filtered["use_checkpoint"] = False
+        try:
+            parsed_config = mvsep.ModelConfig(**filtered)
+        except (TypeError, ValueError):
+            return False
+
+        if parsed_config.hop_length % 64 != 0:
+            return False
+
+        probe_model = mvsep.ResonantConvGateSeparator(parsed_config)
+        expected_state = probe_model.state_dict()
+        incoming_state = mvsep.clean_state_dict(state)
+        if len(incoming_state) != len(expected_state):
+            return False
+        if any(
+            key not in incoming_state
+            or incoming_state[key].shape != expected_tensor.shape
+            for key, expected_tensor in expected_state.items()
+        ):
+            return False
+        return True
+    finally:
+        del data
+        gc.collect()
 
 
 def compatible_checkpoints(folder: Path, mvsep: Any, pattern: str) -> list[Path]:
@@ -170,45 +214,75 @@ def compatible_checkpoints(folder: Path, mvsep: Any, pattern: str) -> list[Path]
 def resolve_checkpoint(args: argparse.Namespace, main_dir: Path, mvsep: Any) -> Path:
     if args.checkpoint is not None:
         checkpoint = args.checkpoint.expanduser().resolve()
-    elif args.latest:
-        candidates = compatible_checkpoints(main_dir / "ckpts", mvsep, "checkpoint_step_*.pt")
-        if candidates:
-            def step(path: Path) -> int:
-                match = re.search(r"step_(\d+)", path.name)
-                return int(match.group(1)) if match else -1
-            checkpoint = max(candidates, key=lambda path: (step(path), path.stat().st_mtime)).resolve()
-        else:
-            checkpoint = Path()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint file does not exist: {checkpoint}")
+        return checkpoint
+
+    if args.latest:
+        raw_candidates = [
+            path
+            for path in (main_dir / "ckpts").glob("checkpoint_step_*.pt")
+            if path.is_file()
+        ]
+        raw_candidates.sort(
+            key=lambda path: (_checkpoint_step_from_name(path), path.stat().st_mtime),
+            reverse=True,
+        )
+        for candidate in raw_candidates:
+            if checkpoint_matches_current_architecture(candidate, mvsep):
+                return candidate.resolve()
+        selection = "latest compatible ckpts checkpoint"
     else:
-        candidates = compatible_checkpoints(main_dir / "best_ckpts", mvsep, "*.pt")
-        scored: list[tuple[float, Path]] = []
-        for path in candidates:
+        scored: list[tuple[float, int, float, Path]] = []
+        for path in (main_dir / "best_ckpts").glob("*.pt"):
+            if not path.is_file():
+                continue
             score = mvsep.checkpoint_sdr_from_path(path)
             if score is not None:
-                scored.append((float(score), path))
-        checkpoint = max(scored, key=lambda item: item[0])[1].resolve() if scored else Path()
+                scored.append(
+                    (
+                        float(score),
+                        _checkpoint_step_from_name(path),
+                        path.stat().st_mtime,
+                        path,
+                    )
+                )
+        scored.sort(key=lambda item: item[:3], reverse=True)
+        for _score, _step, _mtime, candidate in scored:
+            if checkpoint_matches_current_architecture(candidate, mvsep):
+                return candidate.resolve()
+        selection = "best compatible checkpoint"
 
-    if not checkpoint.is_file():
-        selection = "latest compatible ckpts checkpoint" if args.latest else "best compatible checkpoint"
-        raise FileNotFoundError(
-            f"Could not find the {selection}. Pass its path with --checkpoint."
-        )
-    return checkpoint
+    raise FileNotFoundError(
+        f"Could not find the {selection}. Pass its path with --checkpoint."
+    )
 
 
 def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
     """Load the reviewed separator module and its inference checkpoint."""
     mvsep, main_dir, model_script = load_mvsep_module()
-    checkpoint = resolve_checkpoint(args, main_dir, mvsep)
-    fallback = mvsep.ModelConfig(use_checkpoint=False)
-    config = mvsep.inspect_checkpoint_config(str(checkpoint), fallback)
-    config.use_checkpoint = False
-
     if tuple(mvsep.STEMS) != ("vocals", "other"):
         raise RuntimeError(
             "This tool expects mvsep.STEMS to be ('vocals', 'other'); got "
             f"{tuple(mvsep.STEMS)!r}. Update the MVSEP submission mapping first."
         )
+
+    checkpoint = resolve_checkpoint(args, main_dir, mvsep)
+    fallback = mvsep.ModelConfig(use_checkpoint=False)
+    config = mvsep.inspect_checkpoint_config(str(checkpoint), fallback)
+    config.use_checkpoint = False
+
+    if hasattr(args, "segment_seconds") and hasattr(args, "overlap_seconds"):
+        chunk_size = int(round(args.segment_seconds * config.sample_rate))
+        overlap = int(round(args.overlap_seconds * config.sample_rate))
+        if chunk_size < config.win_length:
+            raise ValueError(
+                "--segment-seconds is too short for the checkpoint STFT window."
+            )
+        if overlap < 0 or overlap >= chunk_size:
+            raise ValueError(
+                "--overlap-seconds must be non-negative and shorter than the segment."
+            )
 
     torch = mvsep.torch
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -217,9 +291,10 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
     elif args.precision != "fp32":
-        print(f"{device.type.upper()} inference uses FP32; ignoring --precision={args.precision}.")
+        print(
+            f"{device.type.upper()} inference uses FP32; ignoring --precision={args.precision}."
+        )
         args.precision = "fp32"
 
     if device.type == "cuda" and args.precision == "bf16":
@@ -227,9 +302,20 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
             print("CUDA device lacks BF16 support; falling back to FP16.")
             args.precision = "fp16"
 
-    model = mvsep.BSRoFormerSeparator(config)
+    model = mvsep.ResonantConvGateSeparator(config)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    encoder_count = sum(
+        parameter.numel() for parameter in model.encoder.parameters()
+    )
+    print(
+        f"{config.num_bands}-band Conformer-RoPE + {config.filter_taps}-tap DeepFilter "
+        f"parameters: {parameter_count / 1e6:.2f}M "
+        f"(encoder backbone: {encoder_count / 1e6:.2f}M)"
+    )
     mvsep.load_inference_weights(model, str(checkpoint))
     model.to(device).eval()
+    if getattr(args, "compile", False):
+        model.encoder.compile_layers(mode="default")
     return mvsep, model, device, checkpoint, model_script
 
 
@@ -294,13 +380,20 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
         raise ValueError("--segment-seconds is too short for the checkpoint STFT window.")
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError("--overlap-seconds must be non-negative and shorter than the segment.")
+    mask_deadzone = float(getattr(args, "mask_deadzone", 0.0))
 
     print(f"Dataset: {len(mixtures)} mixtures from {args.dataset_dir.resolve()}")
     print(f"Model script: {model_script}")
     print(f"Checkpoint: {checkpoint}")
+    print(
+        f"Inference: device={device}, precision={args.precision}, "
+        f"segment={args.segment_seconds:g}s, overlap={args.overlap_seconds:g}s, "
+        f"mask_deadzone={mask_deadzone:g}, compile={getattr(args, 'compile', False)}"
+    )
     print(f"Output stems: {', '.join(args.stems)}")
 
     temporary_archive = temporary_archive_path(output_dir)
+    temporary_audio_dir = Path(tempfile.gettempdir())
     completed: list[Path] = []
     try:
         with zipfile.ZipFile(
@@ -320,8 +413,10 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
                     device=device,
                     precision=args.precision,
                     show_progress=False,
+                    mask_deadzone=mask_deadzone,
                 )
                 by_model_stem = dict(zip(mvsep.STEMS, predictions))
+                selected_predictions: dict[str, Any] = {}
                 for mvsep_stem in args.stems:
                     model_stem = MVSEP_TO_MODEL_STEM[mvsep_stem]
                     prediction = by_model_stem[model_stem]
@@ -329,16 +424,21 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
                         raise RuntimeError(
                             f"Non-finite samples in {mixture.path} ({mvsep_stem})."
                         )
+                    selected_predictions[mvsep_stem] = prediction.detach().float().cpu()
+                del by_model_stem, predictions, audio
+
+                for mvsep_stem, cpu_prediction in selected_predictions.items():
                     entry_name = f"{mixture.prefix}_{mvsep_stem}.{args.format}"
                     write_prediction(
                         archive,
-                        prediction,
+                        cpu_prediction,
                         config.sample_rate,
                         entry_name,
                         args.format,
-                        Path(tempfile.gettempdir()),
+                        temporary_audio_dir,
                         mvsep.sf,
                     )
+                del selected_predictions
 
         validate_archive(
             temporary_archive,
@@ -365,18 +465,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "dataset_dir",
         type=Path,
-        help="Extracted dataset directory containing song_NNN_mixture.wav files.",
+        help="Extracted dataset directory containing song_NNN_mixture.wav/.flac files.",
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
-        help="Checkpoint to evaluate (default: highest-SDR checkpoint in best_ckpts).",
+        help="Checkpoint to evaluate (default: highest-SDR compatible checkpoint in best_ckpts).",
     )
     parser.add_argument(
         "--latest",
         action="store_true",
-        help="Use the latest ckpts/checkpoint_step_*.pt instead of best_ckpts.",
+        help="Use the latest compatible ckpts/checkpoint_step_*.pt instead of best_ckpts.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--archive-prefix", default="multisong")
@@ -398,7 +498,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--segment-seconds", type=float, default=8.0)
-    parser.add_argument("--overlap-seconds", type=float, default=3.0)
+    parser.add_argument("--overlap-seconds", type=float, default=4.0)
+    parser.add_argument(
+        "--mask-deadzone",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional inference soft-threshold on estimated vocal magnitude relative "
+            "to mixture in [0, 1). Default 0.0 avoids active-bin shrinkage and "
+            "preserves exact mixture consistency and maximum SDR."
+        ),
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile Conformer-RoPE encoder layers with torch.compile.",
+    )
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--device", default=None, help="Torch device, for example cuda or cpu.")
     parser.add_argument(
@@ -415,8 +530,14 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.expected_songs <= 0:
         raise ValueError("--expected-songs must be positive.")
-    if args.segment_seconds <= 0:
+    if args.segment_seconds <= 0.0:
         raise ValueError("--segment-seconds must be positive.")
+    if args.overlap_seconds < 0.0:
+        raise ValueError("--overlap-seconds cannot be negative.")
+    if args.overlap_seconds >= args.segment_seconds:
+        raise ValueError("--overlap-seconds must be smaller than --segment-seconds.")
+    if args.mask_deadzone < 0.0 or args.mask_deadzone >= 1.0:
+        raise ValueError("--mask-deadzone must be in [0, 1).")
     if len(args.stems) != len(set(args.stems)):
         raise ValueError("--stems cannot contain duplicates.")
 
