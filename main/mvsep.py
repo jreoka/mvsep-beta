@@ -372,7 +372,7 @@ class ResonantConvGateBlock(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             u_f = torch.fft.rfft(u.float(), n=fft_len, dim=-1, norm="ortho")
             freq_len = u_f.shape[-1]
-            low_cut = max(freq_len // 8, self.half_bands)
+            low_cut = max(freq_len // 4, self.half_bands)
 
             u_real, u_imag = u_f.real, u_f.imag
             u_log_pow = torch.log1p(u_real.square() + u_imag.square())
@@ -888,30 +888,18 @@ class ResonantConvGateSeparator(nn.Module):
         mask_deadzone: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         masks = self(mixture_spec, mixture_audio)
-        deadzone_active = mask_deadzone > 0.0
-        if deadzone_active:
-            if torch.is_complex(masks):
-                unit = torch.ones_like(masks[:, :1])
-            else:
-                unit = torch.zeros_like(masks[:, :1])
-                unit[..., 0] = 1.0
-            raw_vocal_mask = masks[:, :1]
+        raw_vocal_mask = masks[:, :1]
+        raw_vocal_est = raw_vocal_mask * mixture_spec[:, None]
+        other_est = mixture_spec[:, None] - raw_vocal_est
+
+        if mask_deadzone > 0.0:
             vocal_mask = soft_threshold_mask(raw_vocal_mask, mask_deadzone)
-            # The instrumental keeps its *unthresholded* complement. Deriving it
-            # from the thresholded mask (or re-adding the residual) routes the
-            # energy the deadzone just removed straight into the other stem: the
-            # complex soft threshold strips a fixed magnitude from every bin
-            # above the deadzone, so that ghost is a broadband copy of the vocal
-            # at roughly 20*log10(deadzone) dB down, which is audible.
-            masks = torch.cat((vocal_mask, unit - raw_vocal_mask), dim=1)
-        estimates = masks * mixture_spec[:, None]
-        if deadzone_active:
-            # Deliberately no residual: the removed vocal energy is discarded
-            # instead of being conserved, so the instrumental stays bit-for-bit
-            # what it was with mask_deadzone == 0.
-            return estimates, masks
-        residual = mixture_spec - estimates.sum(dim=1)
-        estimates[:, 1] = estimates[:, 1] + residual
+            vocal_est = vocal_mask * mixture_spec[:, None]
+            masks = torch.cat((vocal_mask, masks[:, 1:]), dim=1)
+        else:
+            vocal_est = raw_vocal_est
+
+        estimates = torch.cat((vocal_est, other_est), dim=1)
         return estimates, masks
 
 
@@ -1162,10 +1150,9 @@ class SeparationLoss(nn.Module):
         target_audio: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        masks = model(mixture_spec, mixture_audio)
-        estimates = masks * mixture_spec[:, None]
-        residual = mixture_spec - estimates.sum(dim=1)
-        estimates[:, 1] = estimates[:, 1] + residual
+        estimates, masks = model.estimate_specs(
+            mixture_spec, mixture_audio, mask_deadzone=0.0
+        )
 
         pred_audio = make_istft(
             estimates,
