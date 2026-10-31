@@ -300,9 +300,11 @@ class ResonantConvGateBlock(nn.Module):
         self.num_bands = num_bands
         self.half_bands = num_bands // 2
         self.norm_groups = norm_groups if dim % norm_groups == 0 else 1
+        self.sphere_scale = math.sqrt(dim // self.norm_groups)
         hidden_dim = int(dim * expansion_factor)
 
         self.norm1 = nn.RMSNorm(dim)
+        self.dw_conv_in = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.in_proj = nn.Linear(dim, dim * 3, bias=False)
 
         self.conv_d1 = nn.Conv1d(self.branch_dim, self.branch_dim, kernel_size=3, padding=1, dilation=1, groups=self.branch_dim)
@@ -332,6 +334,7 @@ class ResonantConvGateBlock(nn.Module):
         self.norm2 = nn.RMSNorm(dim)
         self.ffn_in = nn.Linear(dim, hidden_dim * 2)
         self.flux_scale = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.ffn_norm = nn.RMSNorm(hidden_dim)
         self.ffn_out = nn.Linear(hidden_dim, dim, bias=False)
 
         self.layer_scale_1 = nn.Parameter(torch.ones(dim) * 1e-2)
@@ -340,16 +343,17 @@ class ResonantConvGateBlock(nn.Module):
     def _grouped_l2_norm(self, x):
         B, L, D = x.shape
         x = x.view(B, L, self.norm_groups, D // self.norm_groups)
-        x = F.normalize(x, dim=-1)
+        x = F.normalize(x, dim=-1) * self.sphere_scale
         return x.view(B, L, D)
 
     def forward(self, x):
         B, L, D = x.shape
         shortcut = x
         x_norm = self.norm1(x)
+        x_conv = x_norm + self.dw_conv_in(x_norm.transpose(1, 2)).transpose(1, 2)
 
-        u, v, gate = self.in_proj(x_norm).chunk(3, dim=-1)
-        v = self._grouped_l2_norm(v).transpose(1, 2)
+        u, v, gate = self.in_proj(x_conv).chunk(3, dim=-1)
+        v = v.transpose(1, 2)
         u = u.transpose(1, 2).contiguous()
 
         v_shift, v1, v2, v4 = v.chunk(4, dim=1)
@@ -365,35 +369,41 @@ class ResonantConvGateBlock(nn.Module):
         local_feat = torch.cat([v_shifted, y1, y2, y4], dim=1).transpose(1, 2)
 
         fft_len = 2 * L
-        u_f = torch.fft.rfft(u.float(), n=fft_len, dim=-1, norm="ortho")
-        freq_len = u_f.shape[-1]
-        low_cut = max(freq_len // 8, self.half_bands)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            u_f = torch.fft.rfft(u.float(), n=fft_len, dim=-1, norm="ortho")
+            freq_len = u_f.shape[-1]
+            low_cut = max(freq_len // 8, self.half_bands)
 
-        u_real, u_imag = u_f.real, u_f.imag
-        u_log_pow = torch.log1p(u_real.square() + u_imag.square())
+            u_real, u_imag = u_f.real, u_f.imag
+            u_log_pow = torch.log1p(u_real.square() + u_imag.square())
 
-        f_stack = torch.cat([u_real, u_imag, u_log_pow], dim=1)
-        bands_low = F.adaptive_avg_pool1d(f_stack[:, :, :low_cut], self.half_bands)
-        bands_high = F.adaptive_avg_pool1d(f_stack[:, :, low_cut:], self.half_bands)
-        bands_raw = torch.cat([bands_low, bands_high], dim=-1).to(x.dtype)
-        bands_grouped = bands_raw.view(B, 3, D, self.num_bands).transpose(1, 2).reshape(B, D * 3, self.num_bands)
+            f_stack = torch.cat([u_real, u_imag, u_log_pow], dim=1)
+            bands_low = F.adaptive_avg_pool1d(f_stack[:, :, :low_cut], self.half_bands)
+            bands_high = F.adaptive_avg_pool1d(f_stack[:, :, low_cut:], self.half_bands)
+            bands_raw = torch.cat([bands_low, bands_high], dim=-1)
+
+        bands_grouped = bands_raw.to(x.dtype).view(B, 3, D, self.num_bands).transpose(1, 2).reshape(B, D * 3, self.num_bands)
 
         band_feat = self.band_proj(bands_grouped)
         chan_ctx = self.chan_mlp(band_feat.mean(dim=-1, keepdim=True))
         band_hidden = F.silu(self.band_conv1(band_feat) + chan_ctx)
-        dyn_bands = self.band_conv2(band_hidden)
+        dyn_bands = torch.tanh(self.band_conv2(band_hidden))
 
-        total_bands = torch.tanh(self.base_filter + dyn_bands).float()
-        filter_low = F.interpolate(total_bands[:, :, :self.half_bands], size=low_cut, mode="linear", align_corners=True)
-        filter_high = F.interpolate(total_bands[:, :, self.half_bands:], size=freq_len - low_cut, mode="linear", align_corners=True)
-        full_filter = torch.cat([filter_low, filter_high], dim=-1)
-        w_real, w_imag = full_filter.chunk(2, dim=1)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            total_bands = (self.base_filter + dyn_bands).float()
+            filter_low = F.interpolate(total_bands[:, :, :self.half_bands], size=low_cut, mode="linear", align_corners=True)
+            filter_high = F.interpolate(total_bands[:, :, self.half_bands - 1:], size=freq_len - low_cut + 1, mode="linear", align_corners=True)[:, :, 1:]
+            full_filter = torch.cat([filter_low, filter_high], dim=-1)
+            w_real, w_imag = full_filter.chunk(2, dim=1)
 
-        u_f_filtered = torch.complex(
-            u_real * w_real - u_imag * w_imag,
-            u_real * w_imag + u_imag * w_real
-        )
-        global_feat = torch.fft.irfft(u_f_filtered, n=fft_len, dim=-1, norm="ortho")[:, :, :L].transpose(1, 2).to(x.dtype)
+            u_f_filtered = torch.complex(
+                u_real * w_real - u_imag * w_imag,
+                u_real * w_imag + u_imag * w_real
+            )
+            global_feat = torch.fft.irfft(u_f_filtered, n=fft_len, dim=-1, norm="ortho")[:, :, :L].transpose(1, 2).to(x.dtype)
+
+        local_feat = self._grouped_l2_norm(local_feat)
+        global_feat = self._grouped_l2_norm(global_feat)
 
         cross_mixed = local_feat * F.silu(global_feat) + global_feat * F.silu(local_feat)
         mixed = self.out_norm(cross_mixed) * F.silu(gate)
@@ -405,7 +415,7 @@ class ResonantConvGateBlock(nn.Module):
 
         flux = F.pad(ffn_val[:, 2:, :] - ffn_val[:, :-2, :], (0, 0, 1, 1))
         ffn = F.silu(ffn_gate + flux * self.flux_scale) * ffn_val
-        x = shortcut2 + self.ffn_out(ffn) * self.layer_scale_2
+        x = shortcut2 + self.ffn_out(self.ffn_norm(ffn)) * self.layer_scale_2
 
         return x
 
