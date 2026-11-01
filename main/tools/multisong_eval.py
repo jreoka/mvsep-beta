@@ -129,6 +129,17 @@ def _checkpoint_step_from_name(path: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
+def _default_model_config(mvsep: Any) -> Any:
+    try:
+        return mvsep.ModelConfig(use_checkpoint=False)
+    except ValueError:
+        default_dim = int(
+            mvsep.ModelConfig.__dataclass_fields__["dim"].default
+        )
+        num_heads = max(1, default_dim // 32) if default_dim % 32 == 0 else 8
+        return mvsep.ModelConfig(num_heads=num_heads, use_checkpoint=False)
+
+
 def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
     """Accept checkpoints from this architecture without assuming default width/depth."""
     try:
@@ -145,7 +156,7 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
             return False
 
         # Mirror mvsep's own checkpoint pickers: require at least the current
-        # CHECKPOINT_FORMAT_VERSION (v13+ for bs124_conformer_rope_deepfilter_v2)
+        # CHECKPOINT_FORMAT_VERSION (v1+ for bs124_conformer_rope_mimo_deepfilter_v4)
         # as well as a valid ModelConfig and exact ResonantConvGateSeparator
         # state-dict match so stale checkpoints are skipped during auto-selection
         # rather than failing inside load_inference_weights.
@@ -156,7 +167,7 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
         ):
             return False
 
-        expected = mvsep.ModelConfig(use_checkpoint=False)
+        expected = _default_model_config(mvsep)
         if config.get("architecture") != expected.architecture:
             return False
         if config.get("num_bands", expected.num_bands) != expected.num_bands:
@@ -268,13 +279,18 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
         )
 
     checkpoint = resolve_checkpoint(args, main_dir, mvsep)
-    fallback = mvsep.ModelConfig(use_checkpoint=False)
+    fallback = _default_model_config(mvsep)
     config = mvsep.inspect_checkpoint_config(str(checkpoint), fallback)
     config.use_checkpoint = False
 
-    if hasattr(args, "segment_seconds") and hasattr(args, "overlap_seconds"):
+    if hasattr(args, "segment_seconds"):
+        overlap_seconds = (
+            0.75 * args.segment_seconds
+            if getattr(args, "overlap_seconds", None) is None
+            else args.overlap_seconds
+        )
         chunk_size = int(round(args.segment_seconds * config.sample_rate))
-        overlap = int(round(args.overlap_seconds * config.sample_rate))
+        overlap = int(round(overlap_seconds * config.sample_rate))
         if chunk_size < config.win_length:
             raise ValueError(
                 "--segment-seconds is too short for the checkpoint STFT window."
@@ -307,10 +323,13 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
     encoder_count = sum(
         parameter.numel() for parameter in model.encoder.parameters()
     )
+    mask_count = sum(
+        parameter.numel() for parameter in model.mask_head.parameters()
+    )
     print(
-        f"{config.num_bands}-band Conformer-RoPE + {config.filter_taps}-tap DeepFilter "
-        f"parameters: {parameter_count / 1e6:.2f}M "
-        f"(encoder backbone: {encoder_count / 1e6:.2f}M)"
+        f"{config.num_bands}-band Conformer-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter "
+        f"parameters: {parameter_count / 1e6:.2f}M (encoder: {encoder_count / 1e6:.2f}M, "
+        f"mask head: {mask_count / 1e6:.2f}M)"
     )
     mvsep.load_inference_weights(model, str(checkpoint))
     model.to(device).eval()
@@ -374,8 +393,13 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
 
     mvsep, model, device, checkpoint, model_script = load_model(args)
     config = model.config
+    overlap_seconds = (
+        0.75 * args.segment_seconds
+        if getattr(args, "overlap_seconds", None) is None
+        else args.overlap_seconds
+    )
     chunk_size = int(round(args.segment_seconds * config.sample_rate))
-    overlap = int(round(args.overlap_seconds * config.sample_rate))
+    overlap = int(round(overlap_seconds * config.sample_rate))
     if chunk_size < config.win_length:
         raise ValueError("--segment-seconds is too short for the checkpoint STFT window.")
     if overlap < 0 or overlap >= chunk_size:
@@ -387,7 +411,7 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
     print(f"Checkpoint: {checkpoint}")
     print(
         f"Inference: device={device}, precision={args.precision}, "
-        f"segment={args.segment_seconds:g}s, overlap={args.overlap_seconds:g}s, "
+        f"segment={args.segment_seconds:g}s, overlap={overlap_seconds:g}s, "
         f"mask_deadzone={mask_deadzone:g}, compile={getattr(args, 'compile', False)}"
     )
     print(f"Output stems: {', '.join(args.stems)}")
@@ -498,7 +522,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--segment-seconds", type=float, default=8.0)
-    parser.add_argument("--overlap-seconds", type=float, default=4.0)
+    parser.add_argument(
+        "--overlap-seconds",
+        type=float,
+        default=None,
+        help="Sliding-window overlap in seconds (default: 0.75 * --segment-seconds).",
+    )
     parser.add_argument(
         "--mask-deadzone",
         type=float,
@@ -532,6 +561,8 @@ def main() -> None:
         raise ValueError("--expected-songs must be positive.")
     if args.segment_seconds <= 0.0:
         raise ValueError("--segment-seconds must be positive.")
+    if args.overlap_seconds is None:
+        args.overlap_seconds = 0.75 * args.segment_seconds
     if args.overlap_seconds < 0.0:
         raise ValueError("--overlap-seconds cannot be negative.")
     if args.overlap_seconds >= args.segment_seconds:
