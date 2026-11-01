@@ -3247,7 +3247,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Zero-ceiling 124-band Conformer-RoPE + 3-Tap Deep-Filter MVSEP Separator"
+        description="124-band Conformer-RoPE + 3-Tap Deep-Filter MVSEP Separator"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
