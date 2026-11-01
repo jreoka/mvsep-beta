@@ -25,7 +25,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 13
+CHECKPOINT_FORMAT_VERSION = 14
 RUNTIME_CONFIG_FIELDS = frozenset({"use_checkpoint", "dropout"})
 
 
@@ -40,13 +40,13 @@ class ModelConfig:
     num_bands: int = 124
     dim: int = 256
     depth: int = 12
-    num_heads: int = 4
+    num_heads: int = 8
     ffn_mult: float = 3.0
     filter_taps: int = 3
     dropout: float = 0.0
     use_checkpoint: bool = True
     time_branch_width: int = 128
-    architecture: str = "bs124_conformer_rope_deepfilter_v2"
+    architecture: str = "bs124_conformer_rope_mimo_deepfilter_v3"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -80,7 +80,7 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at 124 bands.")
-        if self.architecture != "bs124_conformer_rope_deepfilter_v2":
+        if self.architecture != "bs124_conformer_rope_mimo_deepfilter_v3":
             raise ValueError(f"Unsupported architecture {self.architecture!r}.")
         if self.time_branch_width <= 0:
             raise ValueError("time_branch_width must be positive.")
@@ -89,8 +89,8 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     waveform_weight: float = 1.0
-    sdr_weight: float = 0.15
-    main_stft_weight: float = 0.60
+    sdr_weight: float = 0.20
+    main_stft_weight: float = 0.80
     mrstft_weight: float = 0.60
     midside_weight: float = 0.15
     silence_weight: float = 0.05
@@ -208,8 +208,8 @@ def build_bs_bands(
         )
 
     if n_fft == 4096 and num_bands == 124:
-        # 2049 bins total across 124 psychoacoustic bands; max band width is 128
-        # so bucket widths stay <= 128 without wasting a 50%-padded 256-bin group.
+        # 2049 bins total across 124 psychoacoustic bands (7 exact-width groups,
+        # max band width 128, zero power-of-two bucket padding waste).
         widths = (
             [2] * 48
             + [4] * 24
@@ -520,57 +520,36 @@ class DualPathEncoder(nn.Module):
         return self.output_norm(x + stem_skip)
 
 
-def next_power_of_two(value: int) -> int:
-    return 1 if value <= 1 else 1 << (value - 1).bit_length()
-
-
 class BandInputGroup(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
         bands: Sequence[tuple[int, int]],
         band_ids: Sequence[int],
-        bucket_width: int,
+        band_width: int,
     ):
         super().__init__()
-        self.bucket_width = bucket_width
+        self.band_width = band_width
         self.audio_channels = config.audio_channels
-        self.feature_width = bucket_width * config.audio_channels * 2
+        self.feature_width = band_width * config.audio_channels * 2
         self.num_group_bands = len(band_ids)
 
         self.register_buffer(
             "band_ids", torch.tensor(band_ids, dtype=torch.long), persistent=False
         )
-        freq_indices = torch.zeros(
-            self.num_group_bands, bucket_width, dtype=torch.long
-        )
-        freq_valid = torch.zeros(
-            self.num_group_bands, bucket_width, dtype=torch.bool
-        )
-        valid_bin_counts = torch.zeros(self.num_group_bands, dtype=torch.float32)
-        valid_feature_counts = torch.zeros(
-            self.num_group_bands, dtype=torch.float32
+        freq_indices = torch.empty(
+            self.num_group_bands, band_width, dtype=torch.long
         )
         for local_index, band_id in enumerate(band_ids):
             start, end = bands[band_id]
             width = end - start
-            freq_indices[local_index, :width] = torch.arange(start, end)
-            freq_valid[local_index, :width] = True
-            valid_bin_counts[local_index] = float(width)
-            valid_feature_counts[local_index] = float(width * config.audio_channels * 2)
+            if width != band_width:
+                raise ValueError(
+                    f"Band {band_id} width {width} does not match group width {band_width}."
+                )
+            freq_indices[local_index] = torch.arange(start, end, dtype=torch.long)
 
-        feature_valid = (
-            freq_valid[:, :, None, None]
-            .expand(-1, -1, config.audio_channels, 2)
-            .reshape(self.num_group_bands, self.feature_width)
-        )
         self.register_buffer("freq_indices", freq_indices, persistent=False)
-        self.register_buffer("freq_valid", freq_valid, persistent=False)
-        self.register_buffer("feature_valid", feature_valid, persistent=False)
-        self.register_buffer("valid_bin_counts", valid_bin_counts, persistent=False)
-        self.register_buffer(
-            "valid_feature_counts", valid_feature_counts, persistent=False
-        )
 
         self.gamma = nn.Parameter(
             torch.ones(self.num_group_bands, self.feature_width)
@@ -584,13 +563,10 @@ class BandInputGroup(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        with torch.no_grad():
-            self.weight.zero_()
-            for band in range(self.num_group_bands):
-                fan_in = int(self.valid_feature_counts[band].item())
-                bound = math.sqrt(6.0 / (fan_in + self.weight.shape[-1]))
-                self.weight[band, :fan_in].uniform_(-bound, bound)
-            self.gamma.masked_fill_(~self.feature_valid, 0.0)
+        bound = math.sqrt(6.0 / (self.feature_width + self.weight.shape[-1]))
+        nn.init.uniform_(self.weight, -bound, bound)
+        nn.init.ones_(self.gamma)
+        nn.init.zeros_(self.bias)
 
     def forward(
         self,
@@ -598,7 +574,6 @@ class BandInputGroup(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Compute normalization and quadratic stereo spatial cues in fp32
         gathered = real_imag[:, :, self.freq_indices].float()
-        gathered = gathered * self.freq_valid[None, None, :, :, None, None]
 
         # Quadratic stereo spatial features per (B, T, band): Mid/Side ratio & L/R coherence
         left_r = gathered[..., 0, 0]
@@ -606,12 +581,13 @@ class BandInputGroup(nn.Module):
         right_r = gathered[..., 1, 0]
         right_i = gathered[..., 1, 1]
 
-        mid_pow = 0.25 * (
+        inv_bins = 1.0 / float(self.band_width)
+        mid_pow = (0.25 * inv_bins) * (
             (left_r + right_r).square() + (left_i + right_i).square()
-        ).sum(dim=-1) / self.valid_bin_counts[None, None]
-        side_pow = 0.25 * (
+        ).sum(dim=-1)
+        side_pow = (0.25 * inv_bins) * (
             (left_r - right_r).square() + (left_i - right_i).square()
-        ).sum(dim=-1) / self.valid_bin_counts[None, None]
+        ).sum(dim=-1)
         ms_log_ratio = (0.5 * torch.log((mid_pow + 1e-7) / (side_pow + 1e-7))).clamp(
             -8.0, 8.0
         )
@@ -631,8 +607,7 @@ class BandInputGroup(nn.Module):
             self.num_group_bands,
             self.feature_width,
         )
-        mean_square = features.square().sum(dim=-1, keepdim=True)
-        mean_square = mean_square / self.valid_feature_counts[None, None, :, None]
+        mean_square = features.square().mean(dim=-1, keepdim=True)
         features = features * torch.rsqrt(mean_square + 1e-7)
         features = features * self.gamma[None, None].float()
 
@@ -649,12 +624,12 @@ class BandSplit(nn.Module):
         self.num_bands = len(bands)
         grouped_ids: dict[int, list[int]] = {}
         for band_id, (start, end) in enumerate(bands):
-            bucket = next_power_of_two(end - start)
-            grouped_ids.setdefault(bucket, []).append(band_id)
+            band_width = end - start
+            grouped_ids.setdefault(band_width, []).append(band_id)
 
         self.groups = nn.ModuleList(
-            BandInputGroup(config, bands, ids, bucket)
-            for bucket, ids in sorted(grouped_ids.items())
+            BandInputGroup(config, bands, ids, band_width)
+            for band_width, ids in sorted(grouped_ids.items())
         )
         self.register_buffer(
             "band_feature_counts",
@@ -698,10 +673,13 @@ class BandSplit(nn.Module):
         )
         self.cue_fc1_b = nn.Parameter(torch.zeros(self.num_bands, cue_hidden))
         self.cue_fc2_w = nn.Parameter(
-            torch.empty(self.num_bands, cue_hidden, config.dim)
+            torch.empty(self.num_bands, cue_hidden, config.dim * 2)
         )
+        self.cue_fc2_b = nn.Parameter(torch.zeros(self.num_bands, config.dim * 2))
         nn.init.normal_(self.cue_fc1_w, std=1.0 / math.sqrt(self.SPATIAL_ENERGY_DIM))
         nn.init.normal_(self.cue_fc2_w, std=0.02)
+        with torch.no_grad():
+            self.cue_fc2_b[:, : config.dim].fill_(1.0)
 
     def forward_real(self, real_imag: torch.Tensor) -> torch.Tensor:
         real_imag = real_imag.permute(0, 3, 2, 1, 4)
@@ -747,16 +725,22 @@ class BandSplit(nn.Module):
             torch.einsum("btne,neh->btnh", cue_features, self.cue_fc1_w)
             + self.cue_fc1_b[None, None]
         )
-        cue_tokens = torch.einsum("btnh,nhd->btnd", cue_hidden, self.cue_fc2_w)
+        # FiLM multiplicative gate + additive shift attenuates unit-normed noise-floor bands
+        cue_proj = (
+            torch.einsum("btnh,nhd->btnd", cue_hidden, self.cue_fc2_w)
+            + self.cue_fc2_b[None, None]
+        )
+        cue_scale, cue_shift = cue_proj.chunk(2, dim=-1)
+        cue_gate = torch.sigmoid(cue_scale).to(dtype=output.dtype)
         metadata_tokens = self.metadata_proj(
             self.band_metadata.to(device=output.device, dtype=output.dtype)
         )[None, None]
-        return output + cue_tokens.to(dtype=output.dtype) + metadata_tokens
+        return output * cue_gate + cue_shift.to(dtype=output.dtype) + metadata_tokens
 
 
 class BandMaskGroup(nn.Module):
     """2-layer per-band MLP with temporal depthwise conv producing multi-tap
-    complex deep-filter coefficients (M_{t-k}, ..., M_t, ..., M_{t+k}).
+    cross-channel (C_out x C_in MIMO) complex deep-filter coefficients.
     """
 
     def __init__(
@@ -764,37 +748,39 @@ class BandMaskGroup(nn.Module):
         config: ModelConfig,
         bands: Sequence[tuple[int, int]],
         band_ids: Sequence[int],
-        bucket_width: int,
+        band_width: int,
     ):
         super().__init__()
         self.audio_channels = config.audio_channels
         self.filter_taps = config.filter_taps
-        self.bucket_width = bucket_width
-        self.feature_width = bucket_width * config.audio_channels * self.filter_taps * 2
+        self.band_width = band_width
+        self.feature_width = (
+            band_width
+            * self.audio_channels
+            * self.audio_channels
+            * self.filter_taps
+            * 2
+        )
         self.num_group_bands = len(band_ids)
 
         self.register_buffer(
             "band_ids", torch.tensor(band_ids, dtype=torch.long), persistent=False
         )
-        freq_indices = torch.zeros(
-            self.num_group_bands, bucket_width, dtype=torch.long
-        )
-        freq_valid = torch.zeros(
-            self.num_group_bands, bucket_width, dtype=torch.bool
+        freq_indices = torch.empty(
+            self.num_group_bands, band_width, dtype=torch.long
         )
         for local_index, band_id in enumerate(band_ids):
             start, end = bands[band_id]
             width = end - start
-            freq_indices[local_index, :width] = torch.arange(start, end)
-            freq_valid[local_index, :width] = True
+            if width != band_width:
+                raise ValueError(
+                    f"Band {band_id} width {width} does not match group width {band_width}."
+                )
+            freq_indices[local_index] = torch.arange(start, end, dtype=torch.long)
 
-        feature_valid = (
-            freq_valid[:, :, None, None, None]
-            .expand(-1, -1, config.audio_channels, self.filter_taps, 2)
-            .reshape(self.num_group_bands, self.feature_width)
+        self.register_buffer(
+            "flat_freq_indices", freq_indices.reshape(-1), persistent=False
         )
-        self.register_buffer("freq_indices", freq_indices, persistent=False)
-        self.register_buffer("feature_valid", feature_valid, persistent=False)
 
         hidden_dim = config.dim
         self.norm1 = nn.RMSNorm(config.dim)
@@ -842,26 +828,27 @@ class BandMaskGroup(nn.Module):
 
         raw = torch.einsum("btnh,nhq->btnq", h, self.output_weight)
         raw = F.glu(raw + self.output_bias[None, None], dim=-1)
-        raw = raw * self.feature_valid[None, None]
         raw = raw.reshape(
             batch,
             frames,
             self.num_group_bands,
-            self.bucket_width,
+            self.band_width,
+            self.audio_channels,
             self.audio_channels,
             self.filter_taps,
             2,
         )
-        # -> [B, C, T, N_group * bucket_width, taps, 2]
-        source = raw.permute(0, 4, 1, 2, 3, 5, 6).reshape(
+        # -> [B, C_out, C_in, T, N_group * band_width, taps, 2]
+        source = raw.permute(0, 4, 5, 1, 2, 3, 6, 7).reshape(
             batch,
             self.audio_channels,
+            self.audio_channels,
             frames,
-            self.num_group_bands * self.bucket_width,
+            self.num_group_bands * self.band_width,
             self.filter_taps,
             2,
         )
-        return source, self.freq_indices.reshape(-1)
+        return source, self.flat_freq_indices
 
 
 class MaskHead(nn.Module):
@@ -878,11 +865,11 @@ class MaskHead(nn.Module):
 
         grouped_ids: dict[int, list[int]] = {}
         for band_id, (start, end) in enumerate(bands):
-            bucket = next_power_of_two(end - start)
-            grouped_ids.setdefault(bucket, []).append(band_id)
+            band_width = end - start
+            grouped_ids.setdefault(band_width, []).append(band_id)
         self.groups = nn.ModuleList(
-            BandMaskGroup(config, bands, ids, bucket)
-            for bucket, ids in sorted(grouped_ids.items())
+            BandMaskGroup(config, bands, ids, band_width)
+            for band_width, ids in sorted(grouped_ids.items())
         )
 
         coverage = torch.zeros(self.freq_bins, dtype=torch.float32)
@@ -891,33 +878,44 @@ class MaskHead(nn.Module):
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
-        tap_bias = torch.zeros(1, 1, 1, 1, self.filter_taps, 2, dtype=torch.float32)
-        tap_bias[..., self.center_tap, 0] = 0.5
+        # Diagonal 0.5 bias on (c_out == c_in, center_tap, real), 0.0 on cross-channel terms
+        tap_bias = torch.zeros(
+            1,
+            self.audio_channels,
+            self.audio_channels,
+            1,
+            1,
+            self.filter_taps,
+            2,
+            dtype=torch.float32,
+        )
+        for ch in range(self.audio_channels):
+            tap_bias[0, ch, ch, 0, 0, self.center_tap, 0] = 0.5
         self.register_buffer("tap_bias", tap_bias, persistent=False)
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
         batch, frames = x.shape[0], x.shape[1]
         first_src, first_idx = self.groups[0](x.index_select(2, self.groups[0].band_ids))
         output = first_src.new_zeros(
-            batch, self.audio_channels, frames, self.freq_bins, self.filter_taps, 2
+            batch,
+            self.audio_channels,
+            self.audio_channels,
+            frames,
+            self.freq_bins,
+            self.filter_taps,
+            2,
         )
-        scatter_idx = first_idx.view(1, 1, 1, -1, 1, 1).expand(
-            batch, self.audio_channels, frames, -1, self.filter_taps, 2
-        )
-        output.scatter_add_(dim=3, index=scatter_idx, src=first_src)
+        output.index_copy_(4, first_idx, first_src)
 
         for group in self.groups[1:]:
             group_x = x.index_select(2, group.band_ids)
             source, flat_indices = group(group_x)
-            scatter_index = flat_indices.view(1, 1, 1, -1, 1, 1).expand(
-                batch, self.audio_channels, frames, -1, self.filter_taps, 2
-            )
-            output.scatter_add_(
-                dim=3, index=scatter_index, src=source.to(dtype=output.dtype)
+            output.index_copy_(
+                4, flat_indices, source.to(dtype=output.dtype)
             )
 
-        # -> [B, C, F, T, taps, 2] in fp32
-        output = output.permute(0, 1, 3, 2, 4, 5).contiguous().float()
+        # -> [B, C_out, C_in, F, T, taps, 2] in fp32
+        output = output.permute(0, 1, 2, 4, 3, 5, 6).contiguous().float()
         return output + self.tap_bias
 
 
@@ -989,18 +987,16 @@ class TimeBranch(nn.Module):
 
 
 def unfold_stft_taps(spec: torch.Tensor, taps: int) -> torch.Tensor:
-    """Build [B, C, F, T, taps] temporal neighborhood around each STFT frame."""
+    """Build [B, C, F, T, taps] zero-padded temporal neighborhood around each STFT frame."""
     if taps == 1:
         return spec.unsqueeze(-1)
     pad = taps // 2
-    left = spec[..., :1].expand(*spec.shape[:-1], pad)
-    right = spec[..., -1:].expand(*spec.shape[:-1], pad)
-    padded = torch.cat((left, spec, right), dim=-1)
+    padded = F.pad(spec, (pad, pad))
     return padded.unfold(dimension=-1, size=taps, step=1)
 
 
 class ResonantConvGateSeparator(nn.Module):
-    """124-Band Conformer-RoPE + Multi-Tap Complex Deep-Filter Separator.
+    """124-Band Conformer-RoPE + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator.
     Class name retained for backward API compatibility.
     """
 
@@ -1041,7 +1037,7 @@ class ResonantConvGateSeparator(nn.Module):
         mixture_spec: torch.Tensor,
         mixture_audio: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Returns multi-tap complex vocal filter [B, C, F, T, taps]."""
+        """Returns multi-tap MIMO complex vocal filter [B, C_out, C_in, F, T, taps]."""
         mixture_spec_c64 = mixture_spec.to(torch.complex64)
         mixture_real_imag = torch.view_as_real(mixture_spec_c64)
         vocal_filters_ri = self.forward_filters_real(mixture_real_imag, mixture_audio)
@@ -1056,7 +1052,12 @@ class ResonantConvGateSeparator(nn.Module):
         mixture_c64 = mixture_spec.to(torch.complex64)
         vocal_filters = self(mixture_c64, mixture_audio)
         neighbors = unfold_stft_taps(mixture_c64, self.config.filter_taps)
-        raw_vocal_est = (vocal_filters * neighbors).sum(dim=-1, keepdim=False).unsqueeze(1)
+        # 2x2 space-time MIMO Wiener filter: sum across input channels (dim=2) and taps (dim=-1)
+        raw_vocal_est = (
+            (vocal_filters * neighbors.unsqueeze(1))
+            .sum(dim=(2, -1))
+            .unsqueeze(1)
+        )
 
         # Effective equivalent complex mask ratio (smooth & atan2-free at X=0)
         mix_ref = mixture_c64[:, None]
@@ -1127,7 +1128,7 @@ class MultiResolutionSTFTLoss(nn.Module):
             pred_mag_b = pred_spec_b.abs()
             target_mag_b = target_spec_b.abs()
 
-            # 1. Per-item spectral convergence (RMSE normalized with track-level anchor)
+            # 1. Per-(stem, channel) spectral convergence (RMSE normalized with track-level anchor)
             diff_norm = torch.linalg.vector_norm(
                 (pred_mag_b - target_mag_b).flatten(2), dim=2
             )
@@ -1136,15 +1137,15 @@ class MultiResolutionSTFTLoss(nn.Module):
             denom_norm = torch.maximum(target_norm, 0.15 * ref_norm).clamp_min(1e-4)
             spectral_convergence = (diff_norm / denom_norm).mean()
 
-            # 2. Per-item power-compressed magnitude L1 (|S|^0.3 balances lows, mids, sibilance)
+            # 2. Power-compressed magnitude L1 (|S|^0.3 with mixture-anchored per-channel floor)
             pred_comp = (pred_mag_b + 1e-7).pow(self.compress_exp)
             target_comp = (target_mag_b + 1e-7).pow(self.compress_exp)
-            comp_denom = (
-                target_comp.mean(dim=(1, 2, 3), keepdim=True).detach().clamp_min(1e-3)
-            )
+            stem_comp = target_comp.mean(dim=(2, 3), keepdim=True).detach()
+            ref_comp = stem_comp.amax(dim=1, keepdim=True).clamp_min(1e-3)
+            comp_denom = torch.maximum(stem_comp, 0.35 * ref_comp).clamp_min(1e-3)
             comp_mag_loss = ((pred_comp - target_comp).abs() / comp_denom).mean()
 
-            # 3. Per-item phase-sensitive complex RMSE + L1
+            # 3. Mixture-anchored phase-sensitive complex RMSE + L1 (dominant Parseval/SDR term)
             complex_diff = (pred_spec_b - target_spec_b).abs()
             complex_scale = target_mag_b.mean(dim=(1, 2, 3)).detach().clamp_min(1e-3)
             complex_l1 = (complex_diff.mean(dim=(1, 2, 3)) / complex_scale).mean()
@@ -1155,9 +1156,9 @@ class MultiResolutionSTFTLoss(nn.Module):
 
             total = (
                 total
-                + 0.40 * spectral_convergence
-                + 0.40 * comp_mag_loss
-                + 0.25 * (0.5 * complex_l1 + 0.5 * complex_rmse)
+                + 0.15 * spectral_convergence
+                + 0.15 * comp_mag_loss
+                + 0.70 * (0.35 * complex_l1 + 0.65 * complex_rmse)
             )
 
         return total / len(self.resolutions)
@@ -1187,17 +1188,17 @@ def loudness_anchored_wave_loss(
     soft_anchor = (0.5 * mix_anchor + 0.5 * torch.maximum(mix_anchor, mix_anchor.new_tensor(0.04))).clamp_min(1e-3)
     stem_denom = torch.maximum(targ_rms, 0.20 * soft_anchor)
 
-    return (0.55 * (rmse_err / soft_anchor) + 0.45 * (l1_err / stem_denom)).mean()
+    return (0.65 * (rmse_err / soft_anchor) + 0.35 * (l1_err / stem_denom)).mean()
 
 
 def tamed_sdr_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    saturation_db: float = 25.0,
-    rel_error_floor: float = 1e-3,
+    saturation_db: float = 28.0,
+    rel_error_floor: float = 5e-4,
 ) -> torch.Tensor:
-    """Scale-dependent SDR loss with relative error floor (30 dB smooth rolloff)
-    so already-clean chunks never explode gradients as 1/||e|| or drown out STFT losses.
+    """Scale-dependent SDR loss with relative error floor (~33 dB smooth rolloff)
+    so already-clean chunks never explode gradients as 1/||e|| or starve dense choruses.
     """
     pred_f = prediction.float()
     targ_f = target.float()
@@ -1357,19 +1358,19 @@ class SeparationLoss(nn.Module):
         complex_diff = (est_normed - targ_normed).abs()
         main_complex = (
             (
-                0.5 * complex_diff.mean(dim=item_dims)
-                + 0.5 * complex_diff.square().mean(dim=item_dims).add(1e-10).sqrt()
+                0.35 * complex_diff.mean(dim=item_dims)
+                + 0.65 * complex_diff.square().mean(dim=item_dims).add(1e-10).sqrt()
             )
             / spec_scale
         ).mean()
 
         pred_comp = (pred_mag + 1e-7).pow(0.3)
         target_comp = (target_mag + 1e-7).pow(0.3)
-        comp_scale = (
-            target_comp.mean(dim=item_dims, keepdim=True).detach().clamp_min(1e-3)
-        )
+        stem_comp = target_comp.mean(dim=(-3, -2, -1), keepdim=True).detach()
+        ref_comp = stem_comp.amax(dim=1, keepdim=True).clamp_min(1e-3)
+        comp_scale = torch.maximum(stem_comp, 0.35 * ref_comp).clamp_min(1e-3)
         main_comp_mag = ((pred_comp - target_comp).abs() / comp_scale).mean()
-        main_stft_loss = main_complex + main_comp_mag
+        main_stft_loss = 0.75 * main_complex + 0.25 * main_comp_mag
 
         sdr_loss = tamed_sdr_loss(pred_audio, target_audio)
         pred_mid, pred_side = mid_side(pred_audio)
@@ -2228,6 +2229,24 @@ def build_optimizer(
     )
 
 
+def compute_prodigy_lr_scale(
+    step: int,
+    max_steps: int,
+    decay_start_frac: float = 0.5,
+    min_lr_scale: float = 0.05,
+) -> float:
+    """Warmup-Stable-Decay cosine schedule on Prodigy's outer lr multiplier."""
+    if max_steps <= 0:
+        return 1.0
+    decay_start = int(round(max_steps * decay_start_frac))
+    if step <= decay_start:
+        return 1.0
+    decay_span = max(1, max_steps - decay_start)
+    progress = min(1.0, max(0.0, (step - decay_start) / decay_span))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(min_lr_scale + (1.0 - min_lr_scale) * cosine)
+
+
 def peek_checkpoint_step(checkpoint_path: str | None) -> int:
     if not checkpoint_path or not os.path.isfile(checkpoint_path):
         return 0
@@ -2425,9 +2444,9 @@ def crossfade_window(
     phase = torch.linspace(0.0, math.pi / 2.0, fade_length, device=device, dtype=dtype)
     fade = torch.sin(phase).square()
     if fade_in:
-        window[:fade_length] = fade
+        window[:fade_length] *= fade
     if fade_out:
-        window[-fade_length:] = fade.flip(0)
+        window[-fade_length:] *= fade.flip(0)
     return window
 
 
@@ -2856,8 +2875,14 @@ def train(
             if "optimizer_state_dict" not in checkpoint_data:
                 raise RuntimeError("Continuation checkpoint has no optimizer state.")
             optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+            resume_lr = compute_prodigy_lr_scale(
+                step,
+                args.max_steps,
+                args.decay_start_frac,
+                args.min_lr_scale,
+            )
             for group in optimizer.param_groups:
-                group["lr"] = 1.0
+                group["lr"] = resume_lr
             if len(optimizer.param_groups) >= 2:
                 optimizer.param_groups[0]["weight_decay"] = args.weight_decay
                 optimizer.param_groups[1]["weight_decay"] = 0.0
@@ -2929,8 +2954,14 @@ def train(
             progress.write(f"Reached --max_steps={args.max_steps}; finishing training.")
             break
 
+        lr_scale = compute_prodigy_lr_scale(
+            step,
+            args.max_steps,
+            args.decay_start_frac,
+            args.min_lr_scale,
+        )
         for group in optimizer.param_groups:
-            group["lr"] = 1.0
+            group["lr"] = lr_scale
 
         model.train()
         accumulated_loss_tensor = torch.zeros((), device=device)
@@ -3247,7 +3278,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="124-band Conformer-RoPE + 3-Tap Deep-Filter MVSEP Separator"
+        description="124-band Conformer-RoPE + 2x2 MIMO 3-Tap Deep-Filter MVSEP Separator"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -3269,10 +3300,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=4096)
     parser.add_argument("--segment_seconds", type=float, default=8.0)
-    parser.add_argument("--inference_overlap_seconds", type=float, default=4.0)
+    parser.add_argument(
+        "--inference_overlap_seconds",
+        type=float,
+        default=None,
+        help="Inference/validation overlap in seconds (default: 0.75 * --segment_seconds).",
+    )
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
-    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--ffn_mult", type=float, default=3.0)
     parser.add_argument("--filter_taps", type=int, default=3, choices=(1, 3, 5))
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -3285,10 +3321,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--max_steps",
         type=int,
         default=0,
-        help="Total optimizer steps (0 = open-ended).",
+        help="Total optimizer steps (0 = open-ended; >0 enables WSD cosine LR decay).",
+    )
+    parser.add_argument(
+        "--decay_start_frac",
+        type=float,
+        default=0.5,
+        help="Fraction of --max_steps before Prodigy cosine LR decay starts.",
+    )
+    parser.add_argument(
+        "--min_lr_scale",
+        type=float,
+        default=0.05,
+        help="Final Prodigy LR multiplier at --max_steps.",
     )
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accumulation", type=int, default=1)
+    parser.add_argument("--grad_accumulation", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
@@ -3296,7 +3344,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--slice_p", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.9995)
+    parser.add_argument("--ema_decay", type=float, default=0.9996)
     parser.add_argument(
         "--precision", choices=("bf16", "fp16", "fp32"), default="bf16"
     )
@@ -3314,7 +3362,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--silence_margin", type=float, default=1.5)
     parser.add_argument("--silence_floor_db", type=float, default=-65.0)
     parser.add_argument("--silence_active_db", type=float, default=-50.0)
-    parser.add_argument("--sdr_weight", type=float, default=0.15)
+    parser.add_argument("--sdr_weight", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=1337)
     return parser
 
@@ -3334,6 +3382,10 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_workers cannot be negative.")
     if args.max_steps < 0:
         raise ValueError("--max_steps cannot be negative.")
+    if not 0.0 <= args.decay_start_frac < 1.0:
+        raise ValueError("--decay_start_frac must be in [0, 1).")
+    if not 0.0 < args.min_lr_scale <= 1.0:
+        raise ValueError("--min_lr_scale must be in (0, 1].")
     if args.ffn_mult <= 0.0:
         raise ValueError("--ffn_mult must be positive.")
     if args.grad_clip <= 0.0:
@@ -3348,6 +3400,8 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--ema_decay must be in [0, 1).")
     if args.segment_seconds <= 0.0:
         raise ValueError("--segment_seconds must be positive.")
+    if args.inference_overlap_seconds is None:
+        args.inference_overlap_seconds = 0.75 * args.segment_seconds
     if args.inference_overlap_seconds < 0.0:
         raise ValueError("--inference_overlap_seconds cannot be negative.")
     if args.dataset_size < args.batch_size:
@@ -3395,7 +3449,7 @@ def main() -> None:
             checkpoint_path = find_latest_compatible_checkpoint(config, "ckpts")
             if checkpoint_path is None and find_latest_checkpoint("ckpts") is not None:
                 print(
-                    "No compatible v13 auto-resume checkpoint was found in ckpts/. "
+                    "No compatible v14 auto-resume checkpoint was found in ckpts/. "
                     "Starting fresh run of the new architecture."
                 )
             elif checkpoint_path is not None:
@@ -3439,7 +3493,7 @@ def main() -> None:
         parameter.numel() for parameter in model.encoder.parameters()
     )
     print(
-        f"124-band Conformer-RoPE + {config.filter_taps}-tap DeepFilter parameters: "
+        f"124-band Conformer-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter parameters: "
         f"{parameter_count / 1e6:.2f}M (encoder backbone: {encoder_count / 1e6:.2f}M)"
     )
 
