@@ -156,8 +156,8 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
             return False
 
         # Mirror mvsep's own checkpoint pickers: require at least the current
-        # CHECKPOINT_FORMAT_VERSION (v1+ for bs124_conformer_rope_mimo_deepfilter_v4)
-        # as well as a valid ModelConfig and exact ResonantConvGateSeparator
+        # CHECKPOINT_FORMAT_VERSION (v1+ for bs124_gated_roformer)
+        # as well as a valid ModelConfig and exact StemSeparator
         # state-dict match so stale checkpoints are skipped during auto-selection
         # rather than failing inside load_inference_weights.
         expected_format = getattr(mvsep, "CHECKPOINT_FORMAT_VERSION", None)
@@ -194,10 +194,7 @@ def checkpoint_matches_current_architecture(path: Path, mvsep: Any) -> bool:
         except (TypeError, ValueError):
             return False
 
-        if parsed_config.hop_length % 64 != 0:
-            return False
-
-        probe_model = mvsep.ResonantConvGateSeparator(parsed_config)
+        probe_model = mvsep.StemSeparator(parsed_config)
         expected_state = probe_model.state_dict()
         incoming_state = mvsep.clean_state_dict(state)
         if len(incoming_state) != len(expected_state):
@@ -318,7 +315,7 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
             print("CUDA device lacks BF16 support; falling back to FP16.")
             args.precision = "fp16"
 
-    model = mvsep.ResonantConvGateSeparator(config)
+    model = mvsep.StemSeparator(config)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     encoder_count = sum(
         parameter.numel() for parameter in model.encoder.parameters()
@@ -327,7 +324,7 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
         parameter.numel() for parameter in model.mask_head.parameters()
     )
     print(
-        f"{config.num_bands}-band Conformer-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter "
+        f"{config.num_bands}-band Gated-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter "
         f"parameters: {parameter_count / 1e6:.2f}M (encoder: {encoder_count / 1e6:.2f}M, "
         f"mask head: {mask_count / 1e6:.2f}M)"
     )
@@ -541,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compile",
         action="store_true",
-        help="Compile Conformer-RoPE encoder layers with torch.compile.",
+        help="Compile Gated-RoPE encoder layers with torch.compile.",
     )
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--device", default=None, help="Torch device, for example cuda or cpu.")

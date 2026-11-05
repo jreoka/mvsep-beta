@@ -1061,7 +1061,7 @@ def unfold_stft_taps(spec: torch.Tensor, taps: int) -> torch.Tensor:
     return padded.unfold(dimension=-1, size=taps, step=1)
 
 
-class ResonantConvGateSeparator(nn.Module):
+class StemSeparator(nn.Module):
     """124-Band Gated-RoPE + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator."""
 
     def __init__(self, config: ModelConfig):
@@ -2529,7 +2529,7 @@ def find_best_checkpoint(
 
 def save_checkpoint(
     path: str,
-    model: ResonantConvGateSeparator,
+    model: StemSeparator,
     ema: EMA,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
@@ -2651,7 +2651,7 @@ def autocast_context(device: torch.device, precision: str):
 
 @torch.inference_mode()
 def separate_tensor(
-    model: ResonantConvGateSeparator,
+    model: StemSeparator,
     mixture: torch.Tensor,
     chunk_size: int,
     overlap: int,
@@ -2836,7 +2836,7 @@ def calculate_other_spill_db(
 
 @torch.inference_mode()
 def validate(
-    model: ResonantConvGateSeparator,
+    model: StemSeparator,
     test_dir: str,
     device: torch.device,
     chunk_size: int,
@@ -2979,7 +2979,7 @@ def validate(
 
 
 def train(
-    model: ResonantConvGateSeparator,
+    model: StemSeparator,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     loss_module: SeparationLoss,
@@ -3420,7 +3420,7 @@ def inspect_checkpoint_config(
 
 
 def load_inference_weights(
-    model: ResonantConvGateSeparator,
+    model: StemSeparator,
     checkpoint_path: str,
 ) -> None:
     checkpoint_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -3664,7 +3664,7 @@ def main() -> None:
             print("CUDA device lacks BF16 support; falling back to FP16.")
             args.precision = "fp16"
 
-    model = ResonantConvGateSeparator(config)
+    model = StemSeparator(config)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     encoder_count = sum(
         parameter.numel() for parameter in model.encoder.parameters()
