@@ -40,14 +40,13 @@ class ModelConfig:
     num_bands: int = 124
     dim: int = 256
     depth: int = 12
-    num_heads: int = 10
+    num_heads: int = 8
     ffn_mult: float = 3.0
     filter_taps: int = 3
     dropout: float = 0.0
     drop_path: float = 0.08
     use_checkpoint: bool = True
-    time_branch_width: int = 128
-    architecture: str = "bs124_conformer_rope_mimo_deepfilter_v4"
+    architecture: str = "bs124_gated_roformer"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -83,10 +82,8 @@ class ModelConfig:
             raise ValueError("drop_path must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at 124 bands.")
-        if self.architecture != "bs124_conformer_rope_mimo_deepfilter_v4":
+        if self.architecture != "bs124_gated_roformer":
             raise ValueError(f"Unsupported architecture {self.architecture!r}.")
-        if self.time_branch_width <= 0:
-            raise ValueError("time_branch_width must be positive.")
 
 
 @dataclass
@@ -361,13 +358,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-class ConformerRoPEBlock(nn.Module):
-    """Conformer-RoFormer axial block:
-    1) Multi-scale gated depthwise local conv module (k=3 + k=7)
-    2) QK-RMSNorm + RoPE + FlashAttention-2 with per-element sigmoid output gate
-    3) Full-capacity SwiGLU FFN
-    """
-
+class GatedRoPEBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -384,15 +375,6 @@ class ConformerRoPEBlock(nn.Module):
         self.dropout = dropout
         ffn_hidden = max(64, int(round(dim * ffn_mult / 64.0)) * 64)
 
-        # 1. Multi-scale gated local convolution sub-block
-        self.conv_norm = nn.RMSNorm(dim)
-        self.conv_in = nn.Linear(dim, dim * 2, bias=False)
-        self.dw_conv3 = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
-        self.dw_conv7 = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.conv_mid_norm = nn.RMSNorm(dim)
-        self.conv_out = nn.Linear(dim, dim, bias=False)
-
-        # 2. Gated RoPE Self-Attention sub-block with QK-RMSNorm
         self.attn_norm = nn.RMSNorm(dim)
         self.qkvg_proj = nn.Linear(dim, dim * 4, bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim)
@@ -400,7 +382,6 @@ class ConformerRoPEBlock(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim, base=rope_base)
         self.attn_out = nn.Linear(dim, dim, bias=False)
 
-        # 3. SwiGLU FFN sub-block
         self.ffn_norm = nn.RMSNorm(dim)
         self.ffn_in = nn.Linear(dim, ffn_hidden * 2, bias=False)
         self.ffn_out = nn.Linear(ffn_hidden, dim, bias=False)
@@ -410,11 +391,8 @@ class ConformerRoPEBlock(nn.Module):
 
     def _init_weights(self, residual_scale: float) -> None:
         in_std = 1.0 / math.sqrt(self.dim)
-        for proj in (self.conv_in, self.qkvg_proj, self.ffn_in):
+        for proj in (self.qkvg_proj, self.ffn_in):
             nn.init.normal_(proj.weight, std=in_std)
-        nn.init.zeros_(self.dw_conv3.bias)
-        nn.init.zeros_(self.dw_conv7.bias)
-        nn.init.normal_(self.conv_out.weight, std=in_std * residual_scale)
         nn.init.normal_(self.attn_out.weight, std=in_std * residual_scale)
         ffn_out_std = (1.0 / math.sqrt(self.ffn_out.in_features)) * residual_scale
         nn.init.normal_(self.ffn_out.weight, std=ffn_out_std)
@@ -422,17 +400,6 @@ class ConformerRoPEBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_eff, seq_len, dim = x.shape
 
-        # Sub-block 1: Gated Multi-Scale Depthwise Convolution
-        h = self.conv_norm(x)
-        u, gate_c = self.conv_in(h).chunk(2, dim=-1)
-        u_t = (u * torch.sigmoid(gate_c)).transpose(1, 2)
-        conv_feat = (self.dw_conv3(u_t) + self.dw_conv7(u_t)) * 0.70710678
-        conv_feat = F.silu(self.conv_mid_norm(conv_feat.transpose(1, 2)))
-        x = x + self.drop(self.conv_out(conv_feat))
-
-        # Sub-block 2: QK-Norm RoPE FlashAttention with Sigmoid Output Gate
-        # Keep q, k, v in contiguous [B, L, H, head_dim] until SDPA transpose view
-        # so q, k, v share identical strides and dispatch directly to FlashAttention-2.
         h = self.attn_norm(x)
         q, k, v, attn_gate = self.qkvg_proj(h).chunk(4, dim=-1)
         q = self.q_norm(q.reshape(batch_eff, seq_len, self.num_heads, self.head_dim))
@@ -451,7 +418,6 @@ class ConformerRoPEBlock(nn.Module):
         attn = attn * torch.sigmoid(attn_gate)
         x = x + self.drop(self.attn_out(attn))
 
-        # Sub-block 3: SwiGLU FFN
         h = self.ffn_norm(x)
         ffn_gate, ffn_val = self.ffn_in(h).chunk(2, dim=-1)
         ffn = F.silu(ffn_gate) * ffn_val
@@ -466,7 +432,7 @@ class DualPathEncoder(nn.Module):
         self.drop_path = config.drop_path
         res_scale = 1.0 / math.sqrt(2.0 * config.depth)
         self.time_layers = nn.ModuleList(
-            ConformerRoPEBlock(
+            GatedRoPEBlock(
                 dim=config.dim,
                 num_heads=config.num_heads,
                 ffn_mult=config.ffn_mult,
@@ -477,7 +443,7 @@ class DualPathEncoder(nn.Module):
             for _ in range(config.depth)
         )
         self.freq_layers = nn.ModuleList(
-            ConformerRoPEBlock(
+            GatedRoPEBlock(
                 dim=config.dim,
                 num_heads=config.num_heads,
                 ffn_mult=config.ffn_mult,
@@ -487,7 +453,6 @@ class DualPathEncoder(nn.Module):
             )
             for _ in range(config.depth)
         )
-        # Symmetric U-Net long skip highways from early layers to late layers
         self.num_unet_skips = config.depth // 2
         if self.num_unet_skips > 0:
             self.unet_skip_gates = nn.Parameter(
@@ -985,7 +950,6 @@ class MaskHead(nn.Module):
             * 2
         )
 
-        # Ordered cross-band context conv heals discontinuities across width-group boundaries
         self.band_context_norm = nn.RMSNorm(config.dim)
         self.band_context_dw = nn.Conv1d(
             config.dim, config.dim, kernel_size=5, padding=2, groups=config.dim
@@ -1003,16 +967,14 @@ class MaskHead(nn.Module):
             for band_width, ids in sorted(grouped_ids.items())
         )
 
-        # Full-resolution (Freq=2049, Time=T) seam-refinement conv smooths bin-level
-        # amplitude/phase across adjacent rectangular BS band boundaries
-        self.seam_dw = nn.Conv2d(
+        self.seam_dw = nn.Conv1d(
             self.filter_channels,
             self.filter_channels,
-            kernel_size=(5, 3),
-            padding=(2, 1),
+            kernel_size=5,
+            padding=2,
             groups=self.filter_channels,
         )
-        self.seam_pw = nn.Conv2d(
+        self.seam_pw = nn.Conv1d(
             self.filter_channels, self.filter_channels, kernel_size=1
         )
         nn.init.zeros_(self.seam_dw.bias)
@@ -1025,7 +987,6 @@ class MaskHead(nn.Module):
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
-        # Diagonal 0.5 bias on (c_out == c_in, center_tap, real), 0.0 on cross-channel terms
         tap_bias = torch.zeros(
             1,
             self.audio_channels,
@@ -1068,7 +1029,6 @@ class MaskHead(nn.Module):
             source, flat_indices = group(group_x)
             output.index_copy_(4, flat_indices, source.float())
 
-        # Full-resolution 2D cross-bin seam refinement in fp32
         device_type = output.device.type
         no_autocast = (
             torch.amp.autocast(device_type=device_type, enabled=False)
@@ -1076,120 +1036,20 @@ class MaskHead(nn.Module):
             else contextlib.nullcontext()
         )
         with no_autocast:
-            # output: [B, C_out, C_in, T, F, taps, 2] -> [B, 24, F, T]
-            flat_f = output.permute(0, 1, 2, 5, 6, 4, 3).reshape(
-                batch, self.filter_channels, self.freq_bins, frames
+            flat_f = output.permute(0, 3, 1, 2, 5, 6, 4).reshape(
+                batch * frames, self.filter_channels, self.freq_bins
             )
             flat_f = flat_f + self.seam_pw(F.silu(self.seam_dw(flat_f)))
             refined = flat_f.reshape(
                 batch,
+                frames,
                 self.audio_channels,
                 self.audio_channels,
                 self.filter_taps,
                 2,
                 self.freq_bins,
-                frames,
-            ).permute(0, 1, 2, 5, 6, 3, 4).contiguous()
+            ).permute(0, 2, 3, 6, 1, 4, 5).contiguous()
             return refined + self.tap_bias
-
-
-class ChannelRMSNorm(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.norm = nn.RMSNorm(channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(x.transpose(1, 2)).transpose(1, 2)
-
-
-class ResidualDilatedBlock(nn.Module):
-    def __init__(self, width: int, dilation: int):
-        super().__init__()
-        self.norm = ChannelRMSNorm(width)
-        self.conv = nn.Conv1d(
-            width, width, kernel_size=3, padding=dilation, dilation=dilation
-        )
-        self.proj = nn.Conv1d(width, width, kernel_size=1)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.proj(self.act(self.conv(self.norm(x))))
-
-
-class TimeBranch(nn.Module):
-    LOCAL_RMS_HOPS = 173  # ~2.0s local RMS window (consistent across sliding chunks)
-
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        if config.hop_length % 64 != 0:
-            raise ValueError(
-                f"TimeBranch requires hop_length divisible by 64, got {config.hop_length}."
-            )
-        self.hop_length = config.hop_length
-        width = config.time_branch_width
-        channels = config.audio_channels
-        stride3 = config.hop_length // 64
-        self.entry = nn.Sequential(
-            nn.Conv1d(channels, width, kernel_size=17, stride=8, padding=8),
-            nn.GELU(),
-            nn.Conv1d(width, width * 2, kernel_size=17, stride=8, padding=8),
-            nn.GELU(),
-            nn.Conv1d(width * 2, width * 4, kernel_size=17, stride=stride3, padding=8),
-            nn.GELU(),
-        )
-        self.body = nn.Sequential(
-            ResidualDilatedBlock(width * 4, dilation=1),
-            ResidualDilatedBlock(width * 4, dilation=2),
-            ResidualDilatedBlock(width * 4, dilation=4),
-        )
-        self.out_norm = nn.RMSNorm(width * 4)
-        self.proj = nn.Linear(width * 4, config.dim)
-        self.token_norm = nn.RMSNorm(config.dim)
-        nn.init.normal_(self.proj.weight, std=1.0 / math.sqrt(width * 4))
-        nn.init.zeros_(self.proj.bias)
-        self.gate = nn.Parameter(torch.full((config.dim,), 0.1))
-
-    def _local_normalize(self, waveform: torch.Tensor) -> torch.Tensor:
-        wave_f = waveform.float()
-        sample_pow = wave_f.square().mean(dim=1, keepdim=True)
-        pad_hop = (-sample_pow.shape[-1]) % self.hop_length
-        if pad_hop:
-            sample_pow = F.pad(sample_pow, (0, pad_hop), mode="replicate")
-        hop_pow = sample_pow.reshape(
-            waveform.shape[0], 1, -1, self.hop_length
-        ).mean(dim=-1)
-        win = min(self.LOCAL_RMS_HOPS, hop_pow.shape[-1])
-        if win % 2 == 0:
-            win = max(1, win - 1)
-        if win > 1:
-            half = win // 2
-            local_pow = F.avg_pool1d(
-                F.pad(hop_pow, (half, half), mode="reflect"),
-                kernel_size=win,
-                stride=1,
-            )
-        else:
-            local_pow = hop_pow
-        local_rms = local_pow.sqrt().clamp_min(1e-4)
-        rms_env = F.interpolate(
-            local_rms,
-            size=waveform.shape[-1],
-            mode="linear",
-            align_corners=False,
-        )
-        return (wave_f / rms_env).to(dtype=waveform.dtype)
-
-    def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
-        normed = self._local_normalize(waveform)
-        features = self.body(self.entry(normed))
-        if features.shape[-1] < frames:
-            features = F.pad(
-                features, (0, frames - features.shape[-1]), mode="replicate"
-            )
-        elif features.shape[-1] > frames:
-            features = features[..., :frames]
-        tokens = self.token_norm(self.proj(self.out_norm(features.transpose(1, 2))))
-        return tokens * self.gate
 
 
 def unfold_stft_taps(spec: torch.Tensor, taps: int) -> torch.Tensor:
@@ -1202,61 +1062,45 @@ def unfold_stft_taps(spec: torch.Tensor, taps: int) -> torch.Tensor:
 
 
 class ResonantConvGateSeparator(nn.Module):
-    """124-Band Conformer-RoPE + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator.
-    Class name retained for backward API compatibility.
-    """
+    """124-Band Gated-RoPE + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.bands = build_bs_bands(config.n_fft, config.num_bands)
         self.band_split = BandSplit(config, self.bands)
-        self.time_branch = TimeBranch(config)
-        self.time_band_gate = nn.Parameter(
-            torch.ones(config.num_bands, config.dim)
-        )
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, self.bands)
 
     def forward_filters_real(
         self,
         mixture_real_imag: torch.Tensor,
-        mixture_audio: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = self.band_split.forward_real(mixture_real_imag)
-        if mixture_audio is None:
-            raise ValueError(
-                "mixture_audio is required: the time branch is always active."
-            )
         if tokens.shape[2] != self.config.num_bands:
             raise ValueError(
                 f"Expected {self.config.num_bands} band tokens, got {tokens.shape[2]}."
             )
-        time_tokens = self.time_branch(mixture_audio, tokens.shape[1])
-        gate = self.time_band_gate.to(dtype=tokens.dtype, device=tokens.device)
-        tokens = tokens + time_tokens.to(dtype=tokens.dtype).unsqueeze(2) * gate
         tokens = self.encoder(tokens)
         return self.mask_head.forward_real(tokens)
 
     def forward(
         self,
         mixture_spec: torch.Tensor,
-        mixture_audio: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Returns multi-tap MIMO complex vocal filter [B, C_out, C_in, F, T, taps]."""
         mixture_spec_c64 = mixture_spec.to(torch.complex64)
         mixture_real_imag = torch.view_as_real(mixture_spec_c64)
-        vocal_filters_ri = self.forward_filters_real(mixture_real_imag, mixture_audio)
+        vocal_filters_ri = self.forward_filters_real(mixture_real_imag)
         return torch.view_as_complex(vocal_filters_ri)
 
     def estimate_specs(
         self,
         mixture_spec: torch.Tensor,
-        mixture_audio: torch.Tensor | None = None,
         mask_deadzone: float = 0.0,
     ) -> torch.Tensor:
         mixture_c64 = mixture_spec.to(torch.complex64)
-        vocal_filters = self(mixture_c64, mixture_audio)
+        vocal_filters = self(mixture_c64)
         neighbors = unfold_stft_taps(mixture_c64, self.config.filter_taps)
         # 2x2 space-time MIMO Wiener filter: sum across input channels (dim=2) and taps (dim=-1)
         raw_vocal_est = (
@@ -2876,7 +2720,7 @@ def separate_tensor(
         )
         with autocast_context(device, precision):
             estimated_specs = model.estimate_specs(
-                spec, chunk.unsqueeze(0), mask_deadzone=mask_deadzone
+                spec, mask_deadzone=mask_deadzone
             )
 
         estimated = make_istft(
@@ -3250,7 +3094,7 @@ def train(
         model.encoder.compile_layers(mode="default")
         print(
             f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
-            "Conformer-RoPE axial blocks (FlashAttention + SwiGLU, zero FFT graph breaks)."
+            "Gated-RoPE axial blocks (FlashAttention + SwiGLU, zero FFT graph breaks)."
         )
 
     stft_window = torch.hann_window(model.config.win_length, device=device)
@@ -3307,7 +3151,7 @@ def train(
 
             with autocast_context(device, args.precision):
                 estimates = model.estimate_specs(
-                    mixture_spec, mixture_audio, mask_deadzone=0.0
+                    mixture_spec, mask_deadzone=0.0
                 )
             loss, latest_metrics = loss_module.compute_from_estimates(
                 estimates,
@@ -3615,7 +3459,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="124-band Conformer-RoPE + 2x2 MIMO 3-Tap Deep-Filter MVSEP Separator"
+        description="124-band Gated-RoPE + 2x2 MIMO 3-Tap Deep-Filter MVSEP Separator"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -3829,7 +3673,7 @@ def main() -> None:
         parameter.numel() for parameter in model.mask_head.parameters()
     )
     print(
-        f"124-band Conformer-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter parameters: "
+        f"124-band Gated-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter parameters: "
         f"{parameter_count / 1e6:.2f}M (encoder: {encoder_count / 1e6:.2f}M, "
         f"mask head: {mask_count / 1e6:.2f}M)"
     )
