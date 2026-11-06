@@ -282,7 +282,7 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path, Path]:
 
     if hasattr(args, "segment_seconds"):
         overlap_seconds = (
-            0.75 * args.segment_seconds
+            0.30 * args.segment_seconds
             if getattr(args, "overlap_seconds", None) is None
             else args.overlap_seconds
         )
@@ -391,7 +391,7 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
     mvsep, model, device, checkpoint, model_script = load_model(args)
     config = model.config
     overlap_seconds = (
-        0.75 * args.segment_seconds
+        0.30 * args.segment_seconds
         if getattr(args, "overlap_seconds", None) is None
         else args.overlap_seconds
     )
@@ -523,7 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--overlap-seconds",
         type=float,
         default=None,
-        help="Sliding-window overlap in seconds (default: 0.75 * --segment-seconds).",
+        help="Sliding-window overlap in seconds (default: 0.30 * --segment-seconds).",
     )
     parser.add_argument(
         "--mask-deadzone",
@@ -559,7 +559,7 @@ def main() -> None:
     if args.segment_seconds <= 0.0:
         raise ValueError("--segment-seconds must be positive.")
     if args.overlap_seconds is None:
-        args.overlap_seconds = 0.75 * args.segment_seconds
+        args.overlap_seconds = 0.30 * args.segment_seconds
     if args.overlap_seconds < 0.0:
         raise ValueError("--overlap-seconds cannot be negative.")
     if args.overlap_seconds >= args.segment_seconds:

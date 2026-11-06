@@ -3485,7 +3485,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--inference_overlap_seconds",
         type=float,
         default=None,
-        help="Inference/validation overlap in seconds (default: 0.75 * --segment_seconds).",
+        help="Inference/validation overlap in seconds (default: 0.30 * --segment_seconds).",
     )
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
@@ -3578,7 +3578,7 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
     if args.segment_seconds <= 0.0:
         raise ValueError("--segment_seconds must be positive.")
     if args.inference_overlap_seconds is None:
-        args.inference_overlap_seconds = 0.75 * args.segment_seconds
+        args.inference_overlap_seconds = 0.30 * args.segment_seconds
     if args.inference_overlap_seconds < 0.0:
         raise ValueError("--inference_overlap_seconds cannot be negative.")
     if args.dataset_size < args.batch_size:
