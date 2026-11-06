@@ -494,10 +494,14 @@ class DualPathEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, frames, bands, dim = x.shape
+        # Belt-and-braces: keep the residual stream in the autocast compute
+        # dtype even if a caller passes fp32 tokens under autocast.
+        if torch.is_autocast_enabled(x.device.type):
+            x = x.to(torch.get_autocast_dtype(x.device.type))
         should_checkpoint = (
             self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad
         )
-        stem_skip = self.skip_proj(x)
+        stem_skip = self.skip_proj(x).to(dtype=x.dtype)
         total_blocks = max(1, 2 * self.depth - 1)
         unet_skips: list[torch.Tensor] = []
         pop_start = self.depth - self.num_unet_skips
@@ -505,13 +509,6 @@ class DualPathEncoder(nn.Module):
         for layer_idx, (time_layer, freq_layer) in enumerate(
             zip(self.time_layers, self.freq_layers)
         ):
-            if layer_idx >= pop_start and self.unet_skip_gates is not None:
-                skip_idx = layer_idx - pop_start
-                gate = self.unet_skip_gates[skip_idx].to(
-                    device=x.device, dtype=x.dtype
-                )
-                x = x + unet_skips.pop() * gate
-
             p_time = self.drop_path * (2 * layer_idx) / total_blocks
             keep_t = self._drop_keep_mask(batch, p_time, x.device, x.dtype)
             time_in = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
@@ -528,6 +525,12 @@ class DualPathEncoder(nn.Module):
 
             if layer_idx < self.num_unet_skips:
                 unet_skips.append(x)
+            elif layer_idx >= pop_start and self.unet_skip_gates is not None:
+                skip_idx = layer_idx - pop_start
+                gate = self.unet_skip_gates[skip_idx].to(
+                    device=x.device, dtype=x.dtype
+                )
+                x = x + unet_skips.pop() * gate
 
         return self.output_norm(x + stem_skip)
 
@@ -623,7 +626,26 @@ class BandInputGroup(nn.Module):
         features = features * torch.rsqrt(mean_square + 1e-7)
         features = features * self.gamma[None, None].float()
 
-        tokens = torch.einsum("btni,nid->btnd", features, self.weight) + self.bias
+        # Keep the token projection in fp32: autocast would otherwise downcast
+        # the fp32 einsum inputs back to bf16 (aten::bmm/matmul path).
+        device_type = features.device.type
+        no_autocast = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if device_type == "cuda"
+            else contextlib.nullcontext()
+        )
+        with no_autocast:
+            tokens = torch.einsum(
+                "btni,nid->btnd", features.float(), self.weight.float()
+            ) + self.bias.float()
+        # Downcast to the active autocast compute dtype so the downstream
+        # DualPathEncoder residual stream stays in bf16 (fp32 tokens would
+        # promote every `x + block(x)` addition to fp32, doubling activation
+        # / checkpoint memory). The projection itself still accumulates in fp32.
+        # NOTE: is_autocast_enabled() takes no device arg checks CUDA only;
+        # pass the tensor's device type so CPU autocast is honored too.
+        if torch.is_autocast_enabled(tokens.device.type):
+            tokens = tokens.to(torch.get_autocast_dtype(tokens.device.type))
         return tokens, mean_square.squeeze(-1), spatial_cues
 
 
@@ -757,7 +779,7 @@ class BandSplit(nn.Module):
         cue_gate = torch.sigmoid(cue_scale).to(dtype=output.dtype)
         metadata_tokens = self.metadata_proj(
             self.band_metadata.to(device=output.device, dtype=output.dtype)
-        )[None, None]
+        )[None, None].to(dtype=output.dtype)
         return output * cue_gate + cue_shift.to(dtype=output.dtype) + metadata_tokens
 
 
@@ -893,19 +915,34 @@ class BandMaskGroup(nn.Module):
         h = h + h_t.permute(0, 3, 1, 2)
         h = h + F.silu(self.fc2(self.norm2(h)))
 
-        # Compute final filter tap projections in fp32 to avoid bf16 -48 dB mantissa steps
-        if self.bottleneck_dim > 0 and self.bottleneck_weight is not None:
-            bn = torch.einsum("btnh,nhr->btnr", h, self.bottleneck_weight)
-            bn = F.glu(bn.float() + self.bottleneck_bias[None, None].float(), dim=-1)
-            raw = (
-                torch.einsum("btnr,nrq->btnq", bn, self.output_weight.float())
-                + self.output_bias[None, None].float()
-            )
-        else:
-            raw = torch.einsum(
-                "btnh,nhq->btnq", h.float(), self.output_weight.float()
-            )
-            raw = F.glu(raw + self.output_bias[None, None].float(), dim=-1)
+        # Compute final filter tap projections in fp32 to avoid bf16 -48 dB mantissa steps.
+        # NOTE: must disable autocast: torch.einsum dispatches to aten::bmm/matmul
+        # which autocast would downcast back to bf16 despite the explicit .float().
+        device_type = h.device.type
+        no_autocast = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if device_type == "cuda"
+            else contextlib.nullcontext()
+        )
+        with no_autocast:
+            h_f = h.float()
+            if self.bottleneck_dim > 0 and self.bottleneck_weight is not None:
+                bn = torch.einsum(
+                    "btnh,nhr->btnr", h_f, self.bottleneck_weight.float()
+                )
+                bn = F.glu(
+                    bn + self.bottleneck_bias[None, None].float(), dim=-1
+                )
+                raw = torch.einsum(
+                    "btnr,nrq->btnq", bn, self.output_weight.float()
+                ) + self.output_bias[None, None].float()
+            else:
+                raw = torch.einsum(
+                    "btnh,nhq->btnq", h_f, self.output_weight.float()
+                )
+                raw = F.glu(
+                    raw + self.output_bias[None, None].float(), dim=-1
+                )
 
         raw = raw.reshape(
             batch,
@@ -1173,7 +1210,7 @@ class MultiResolutionSTFTLoss(nn.Module):
 
         for index, (n_fft, hop_length, win_length) in enumerate(self.resolutions):
             window = getattr(self, f"window_{index}")
-            win_norm = (0.5 * window.sum()).clamp_min(1.0)
+            win_norm = (0.5 * window.square().sum()).sqrt().clamp_min(1e-8)
             both_spec = torch.stft(
                 both_flat,
                 n_fft=n_fft,
@@ -1398,7 +1435,7 @@ class SeparationLoss(nn.Module):
         wave_loss = loudness_anchored_wave_loss(pred_audio, target_audio)
         mrstft_loss = self.mrstft(pred_audio, target_audio)
 
-        win_norm = (0.5 * self.window.sum()).clamp_min(1.0)
+        win_norm = (0.5 * self.window.square().sum()).sqrt().clamp_min(1e-8)
         est_normed = estimates / win_norm
         targ_normed = target_specs / win_norm
         target_mag = targ_normed.abs()
@@ -1599,9 +1636,7 @@ def fft_convolve(signal_tensor: torch.Tensor, impulse: torch.Tensor) -> torch.Te
     fft_size = 1 << (total - 1).bit_length()
     signal_spec = torch.fft.rfft(signal_tensor, fft_size, dim=-1)
     impulse_spec = torch.fft.rfft(impulse.to(signal_tensor.dtype), fft_size, dim=-1)
-    convolved = torch.fft.irfft(
-        signal_spec * impulse_spec.unsqueeze(0), fft_size, dim=-1
-    )
+    convolved = torch.fft.irfft(signal_spec * impulse_spec, fft_size, dim=-1)
     return convolved[..., : signal_tensor.shape[-1]]
 
 
@@ -1611,9 +1646,14 @@ def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
     tail = max(1, length - pre_delay)
     time = torch.arange(tail, dtype=torch.float32)
     tau = random.uniform(0.07, 0.28) * sample_rate
-    impulse = torch.randn(tail, dtype=torch.float32) * torch.exp(-time / tau)
+    # Independent L/R tails so the wet reverb is true stereo (decorrelated
+    # reflections, coh_real near 0) instead of a mono tail (coh_real == 1.0)
+    # that would distort BandInputGroup's M/S + coherence spatial cues.
+    impulse = torch.randn(2, tail, dtype=torch.float32) * torch.exp(-time / tau)
     if pre_delay > 0:
-        impulse = torch.cat((torch.zeros(pre_delay, dtype=torch.float32), impulse))
+        impulse = torch.cat(
+            (torch.zeros(2, pre_delay, dtype=torch.float32), impulse), dim=-1
+        )
     n = impulse.shape[-1]
     freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
     hp_cutoff = random.uniform(180.0, 340.0)
@@ -1622,8 +1662,11 @@ def make_reverb_impulse(sample_rate: int, max_length: int) -> torch.Tensor:
     lp_response = (1.0 + (freqs / lp_cutoff) ** 2).rsqrt()
     response = hp_response * lp_response
     response[0] = 0.0
-    impulse = torch.fft.irfft(torch.fft.rfft(impulse, n) * response, n)
-    return impulse / impulse.square().sum().sqrt().clamp_min(1e-8)
+    impulse = torch.fft.irfft(
+        torch.fft.rfft(impulse, n, dim=-1) * response, n, dim=-1
+    )
+    norm = impulse.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+    return impulse / norm
 
 
 def apply_reverb(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
@@ -1782,39 +1825,59 @@ def random_spectral_eq(
     return filtered * gain
 
 
-_PINK_NOISE_CACHE: dict[int, torch.Tensor] = {}
+_PINK_NOISE_CACHE: dict[int, torch.Tensor] = {}  # sample_rate -> [2, needed] stereo
+
+
+def _pink_noise_buffer(sample_rate: int, needed: int) -> torch.Tensor:
+    """Cached [2, needed] stereo pink-noise buffer with independent L/R."""
+    buffer = _PINK_NOISE_CACHE.get(sample_rate)
+    if buffer is None or buffer.shape[-1] < needed:
+        total = needed
+        freqs = torch.fft.rfftfreq(total, 1.0 / sample_rate).clamp_min(1.0)
+        amp = 1.0 / freqs.sqrt()
+        channels: list[torch.Tensor] = []
+        for _ in range(2):
+            spec = torch.complex(
+                torch.randn(total // 2 + 1, dtype=torch.float32),
+                torch.randn(total // 2 + 1, dtype=torch.float32),
+            )
+            spec = spec * amp
+            spec[0] = 0.0
+            channel = torch.fft.irfft(spec, total)
+            channels.append(channel)
+        buffer = torch.stack(channels, dim=0)
+        buffer = buffer / buffer.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+        _PINK_NOISE_CACHE.clear()
+        _PINK_NOISE_CACHE[sample_rate] = buffer
+    return buffer
 
 
 def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
     if length <= 0:
         return torch.zeros(0)
     needed = max(2**20, 4 * length)
-    buffer = _PINK_NOISE_CACHE.get(sample_rate)
-    if buffer is None or buffer.numel() < needed:
-        total = needed
-        freqs = torch.fft.rfftfreq(total, 1.0 / sample_rate).clamp_min(1.0)
-        amp = 1.0 / freqs.sqrt()
-        spec = torch.complex(
-            torch.randn(total // 2 + 1, dtype=torch.float32),
-            torch.randn(total // 2 + 1, dtype=torch.float32),
-        )
-        spec = spec * amp
-        spec[0] = 0.0
-        buffer = torch.fft.irfft(spec, total)
-        buffer = buffer / buffer.square().mean().sqrt().clamp_min(1e-8)
-        _PINK_NOISE_CACHE.clear()
-        _PINK_NOISE_CACHE[sample_rate] = buffer
+    buffer = _pink_noise_buffer(sample_rate, needed)
     offset = random.randint(0, buffer.shape[-1] - length)
-    return buffer[offset : offset + length].clone()
+    channel = random.randint(0, 1)
+    return buffer[channel, offset : offset + length].clone()
+
+
+def _stereo_pink_noise(length: int, sample_rate: int) -> torch.Tensor:
+    """Single [2, length] slice; L/R rows are independent so they can never
+    overlap like two independent 1D slices drawn from one shared buffer."""
+    if length <= 0:
+        return torch.zeros(2, 0)
+    needed = max(2**20, 4 * length)
+    buffer = _pink_noise_buffer(sample_rate, needed)
+    offset = random.randint(0, buffer.shape[-1] - length)
+    return buffer[:, offset : offset + length].clone()
 
 
 def add_noise_floor(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
     length = audio.shape[-1]
     level_db = random.uniform(-68.0, -50.0)
     level = 10.0 ** (level_db / 20.0) * audio.square().mean().sqrt().clamp_min(1e-8)
-    noise_l = _pink_noise(length, sample_rate)
-    noise_r = _pink_noise(length, sample_rate)
-    stereo_noise = torch.stack((noise_l, noise_r), dim=0).to(
+    stereo_noise = _stereo_pink_noise(length, sample_rate).to(
         device=audio.device, dtype=audio.dtype
     )
     return audio + level * stereo_noise
@@ -1846,7 +1909,7 @@ def apply_bus_compression(targets: torch.Tensor, frame: int = 512) -> torch.Tens
     threshold_db = random.uniform(-28.0, -15.0)
     ratio = random.uniform(1.5, 3.5)
     mix = random.uniform(0.25, 0.65)
-    gain_db = torch.clamp((env_db - threshold_db) * (1.0 - 1.0 / ratio), max=0.0)
+    gain_db = torch.clamp((threshold_db - env_db) * (1.0 - 1.0 / ratio), max=0.0)
     alpha = random.uniform(0.35, 0.65)
     one_minus_alpha = 1.0 - alpha
     gain_list = gain_db.tolist()
@@ -2018,19 +2081,22 @@ class StemDataset(Dataset):
         pitch_prob = 0.35
 
         if random.random() < self.remix_probability:
-            v_shift = (
+            # Shared varispeed factor for all remix stems: independent
+            # downward shifts would move each stem's Nyquist shelf by a
+            # different amount (down to ~19.6 kHz at -2 semitones), leaving a
+            # top-band region containing energy from only the non-downshifted
+            # stem that the model could exploit as a brickwall cue. Sharing one
+            # shift keeps all stems Nyquist-aligned like real test mixtures.
+            remix_shift = (
                 random.uniform(-2.0, 2.0) if random.random() < pitch_prob else 0.0
             )
+            v_shift = remix_shift
             vocal_crop = self._sample_active_vocal(v_shift)
 
             # Multi-vocal harmony / backing-vocal simulation so overlapping voices
             # are retained in vocals rather than leaked into accompaniment
             if random.random() < 0.15:
-                h_shift = (
-                    random.uniform(-2.0, 2.0)
-                    if random.random() < pitch_prob
-                    else 0.0
-                )
+                h_shift = remix_shift
                 harmony = self._sample_active_vocal(h_shift)
                 h_gain = db_to_gain(random.uniform(-12.0, -3.5))
                 h_pan = random.uniform(-0.35, 0.35)
@@ -2043,9 +2109,7 @@ class StemDataset(Dataset):
                 )
                 vocal_crop = vocal_crop + h_gain * harmony
 
-            o_shift = (
-                random.uniform(-2.0, 2.0) if random.random() < pitch_prob else 0.0
-            )
+            o_shift = remix_shift
             orig_f, new_f, needed_samples = pitch_shift_plan(
                 o_shift, self.segment_samples
             )
@@ -2141,7 +2205,14 @@ class StemDataset(Dataset):
             targets = targets.flip(dims=(1,))
 
         # Clean, unmodified low-end preservation: NO unconditional vocal high-pass!
+        # EQ/saturation run BEFORE the silence-dropout punch so circular
+        # rfft/irfft ringing can't wrap across the segment boundary into the
+        # dropout, and reverb runs AFTER so room tails ring naturally into it.
         vocal = targets[0]
+        if random.random() < 0.20:
+            vocal = random_spectral_eq(vocal, sample_rate)
+        if random.random() < 0.10:
+            vocal = apply_saturation(vocal)
         other_rms = targets[1].square().mean().sqrt()
         if random.random() < 0.03 and other_rms > 2e-3:
             vocal = torch.zeros_like(vocal)
@@ -2169,10 +2240,6 @@ class StemDataset(Dataset):
                         )
                 vocal.mul_(envelope)
 
-        if random.random() < 0.20:
-            vocal = random_spectral_eq(vocal, sample_rate)
-        if random.random() < 0.10:
-            vocal = apply_saturation(vocal)
         if random.random() < 0.10:
             vocal = apply_reverb(vocal, sample_rate)
         targets[0] = vocal
@@ -2635,10 +2702,17 @@ def chunk_starts(total_length: int, chunk_size: int, overlap: int) -> list[int]:
     step = chunk_size - overlap
     if step <= 0:
         raise ValueError("Overlap must be smaller than chunk size.")
-    starts = list(range(0, total_length - chunk_size + 1, step))
-    final_start = total_length - chunk_size
-    if starts[-1] != final_start:
-        starts.append(final_start)
+    # Uniform step so every adjacent chunk pair overlaps by exactly `overlap`
+    # samples; stop as soon as the current chunk reaches total_length so no
+    # trailing sliver with usable < overlap is emitted (a short final chunk
+    # uses the reflect-padding path in separate_tensor).
+    starts: list[int] = []
+    start = 0
+    while True:
+        starts.append(start)
+        if start + chunk_size >= total_length:
+            break
+        start += step
     return starts
 
 
