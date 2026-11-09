@@ -39,14 +39,15 @@ class ModelConfig:
     num_stems: int = len(STEMS)
     num_bands: int = 124
     dim: int = 256
-    depth: int = 12
+    depth: int = 14
     num_heads: int = 8
     ffn_mult: float = 3.0
+    patch_size: int = 2
     filter_taps: int = 3
     dropout: float = 0.0
     drop_path: float = 0.08
     use_checkpoint: bool = True
-    architecture: str = "bs124_gated_roformer"
+    architecture: str = "bs124_sub_roformer"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -74,6 +75,8 @@ class ModelConfig:
             raise ValueError(f"head_dim ({head_dim}) must be even for RoPE.")
         if self.ffn_mult <= 0.0:
             raise ValueError("ffn_mult must be positive.")
+        if self.patch_size not in (1, 2, 4):
+            raise ValueError("patch_size must be one of {1, 2, 4}.")
         if self.filter_taps not in (1, 3, 5):
             raise ValueError("filter_taps must be one of {1, 3, 5}.")
         if not 0.0 <= self.dropout < 1.0:
@@ -82,7 +85,7 @@ class ModelConfig:
             raise ValueError("drop_path must be in [0, 1).")
         if self.num_bands != 124:
             raise ValueError("This architecture is intentionally fixed at 124 bands.")
-        if self.architecture != "bs124_gated_roformer":
+        if self.architecture != "bs124_sub_roformer":
             raise ValueError(f"Unsupported architecture {self.architecture!r}.")
 
 
@@ -123,7 +126,7 @@ def training_worker_init(worker_id: int) -> None:
         return
     dataset = info.dataset
     if hasattr(dataset, "segment_samples") and hasattr(dataset, "sample_rate"):
-        _pink_noise(dataset.segment_samples, dataset.sample_rate)
+        _stereo_pink_noise(dataset.segment_samples, dataset.sample_rate)
 
 
 def clean_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -425,23 +428,273 @@ class GatedRoPEBlock(nn.Module):
         return x
 
 
+class ConvNeXtV2TemporalMixer(nn.Module):
+    """SubRoFormer ConvNeXt-V2-style local temporal mixer with RMSNorm, SwiGLU gating,
+    and Global Response Normalization (GRN) applied per subband at the fine frame rate.
+    Expects [B * bands, frames, dim].
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_mult: float = 2.0,
+        kernel_size: int = 7,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__()
+        hidden_dim = max(64, int(round(dim * ffn_mult / 64.0)) * 64)
+        self.dwconv = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=dim,
+        )
+        self.norm = nn.RMSNorm(dim)
+        self.pw_in = nn.Linear(dim, hidden_dim * 2, bias=False)
+        self.grn_gamma = nn.Parameter(torch.zeros(hidden_dim))
+        self.grn_beta = nn.Parameter(torch.zeros(hidden_dim))
+        self.pw_out = nn.Linear(hidden_dim, dim, bias=False)
+        self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        nn.init.zeros_(self.dwconv.bias)
+        nn.init.normal_(self.pw_in.weight, std=1.0 / math.sqrt(dim))
+        nn.init.normal_(
+            self.pw_out.weight,
+            std=(1.0 / math.sqrt(hidden_dim)) * residual_scale,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
+        h = self.norm(h)
+        gate, val = self.pw_in(h).chunk(2, dim=-1)
+        h = F.silu(gate) * val
+        gx = h.float().square().mean(dim=1, keepdim=True).add(1e-6).sqrt()
+        nx = (gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)).to(dtype=h.dtype)
+        h = h + self.grn_gamma.to(dtype=h.dtype) * (h * nx) + self.grn_beta.to(
+            dtype=h.dtype
+        )
+        return x + self.drop(self.pw_out(self.drop(h)))
+
+
+class FineRateBoundaryBlock(nn.Module):
+    """SubRoFormer fine-rate boundary block (PreBlock / PostBlock, Section IV-A.1 & IV-A.4):
+    ConvNeXt-V2 temporal mixer with RMSNorm + SwiGLU gating -> fine-rate temporal
+    RoPE Transformer layer -> fine-rate subband RoPE Transformer layer.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        ffn_mult: float = 3.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.temporal_mixer = ConvNeXtV2TemporalMixer(
+            dim=dim,
+            ffn_mult=min(2.0, ffn_mult),
+            kernel_size=7,
+            dropout=dropout,
+            residual_scale=residual_scale,
+        )
+        self.time_layer = GatedRoPEBlock(
+            dim=dim,
+            num_heads=num_heads,
+            ffn_mult=ffn_mult,
+            rope_base=10_000.0,
+            dropout=dropout,
+            residual_scale=residual_scale,
+        )
+        self.freq_layer = GatedRoPEBlock(
+            dim=dim,
+            num_heads=num_heads,
+            ffn_mult=ffn_mult,
+            rope_base=1_000.0,
+            dropout=dropout,
+            residual_scale=residual_scale,
+        )
+
+    def compile_layers(self, mode: str = "default") -> None:
+        self.temporal_mixer.compile(mode=mode, dynamic=False)
+        self.time_layer.compile(mode=mode, dynamic=False)
+        self.freq_layer.compile(mode=mode, dynamic=False)
+
+    @staticmethod
+    def _run_unit(
+        module: nn.Module,
+        x: torch.Tensor,
+        use_checkpoint: bool,
+    ) -> torch.Tensor:
+        if not use_checkpoint:
+            return module(x)
+        return checkpoint(module, x, use_reentrant=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        should_checkpoint: bool = False,
+        keep_t: torch.Tensor | None = None,
+        keep_f: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch, frames, bands, dim = x.shape
+        t_in = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
+        t_mixed = self._run_unit(
+            self.temporal_mixer, t_in, should_checkpoint
+        )
+        x_mixed = t_mixed.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
+
+        t_out = self._run_unit(self.time_layer, t_mixed, should_checkpoint)
+        t_out = t_out.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
+        x = t_out if keep_t is None else x_mixed + (t_out - x_mixed) * keep_t
+
+        f_in = x.reshape(batch * frames, bands, dim)
+        f_out = self._run_unit(self.freq_layer, f_in, should_checkpoint)
+        f_out = f_out.reshape(batch, frames, bands, dim)
+        return f_out if keep_f is None else x + (f_out - x) * keep_f
+
+
+class TemporalPatchDown(nn.Module):
+    """Learned temporal patchification module (SubRoFormer Section IV-A.1).
+    Groups neighboring fine-rate temporal frames [B, T, K, D] into coarse-rate
+    patches [B, ceil(T / P), K, D] while preserving full subband resolution K.
+    """
+
+    def __init__(self, dim: int, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.norm = nn.RMSNorm(dim * patch_size)
+        self.proj = nn.Linear(dim * patch_size, dim, bias=False)
+        with torch.no_grad():
+            nn.init.normal_(
+                self.proj.weight, std=0.02 / math.sqrt(dim * patch_size)
+            )
+            eye = torch.eye(dim) / float(patch_size)
+            self.proj.weight.add_(eye.repeat(1, patch_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, frames, bands, dim = x.shape
+        if self.patch_size == 1:
+            return self.proj(self.norm(x))
+        pad_t = (-frames) % self.patch_size
+        if pad_t > 0:
+            last_frame = x[:, -1:, :, :].expand(batch, pad_t, bands, dim)
+            x = torch.cat((x, last_frame), dim=1)
+        coarse_frames = x.shape[1] // self.patch_size
+        patched = (
+            x.reshape(batch, coarse_frames, self.patch_size, bands, dim)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(batch, coarse_frames, bands, self.patch_size * dim)
+        )
+        return self.proj(self.norm(patched))
+
+
+class TemporalPatchUp(nn.Module):
+    """Learned temporal unpatchification module (SubRoFormer Section IV-A.3).
+    Maps coarse-rate representation [B, T', K, D] back to fine temporal resolution
+    [B, T, K, D].
+    """
+
+    def __init__(self, dim: int, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.norm = nn.RMSNorm(dim)
+        self.proj = nn.Linear(dim, dim * patch_size, bias=False)
+        with torch.no_grad():
+            nn.init.normal_(self.proj.weight, std=0.02 / math.sqrt(dim))
+            eye = torch.eye(dim)
+            self.proj.weight.add_(eye.repeat(patch_size, 1))
+
+    def forward(self, h: torch.Tensor, target_frames: int) -> torch.Tensor:
+        batch, coarse_frames, bands, dim = h.shape
+        expanded = self.proj(self.norm(h))
+        if self.patch_size == 1:
+            return expanded[:, :target_frames, :, :]
+        return (
+            expanded.reshape(
+                batch, coarse_frames, bands, self.patch_size, dim
+            )
+            .permute(0, 1, 3, 2, 4)
+            .reshape(batch, coarse_frames * self.patch_size, bands, dim)[
+                :, :target_frames, :, :
+            ]
+        )
+
+
+class GEGLUFusion(nn.Module):
+    """SubRoFormer GEGLU Gated Residual Fusion Module (Section IV-A.3, Eq. 16):
+    Y = Concat(X', Y')
+    Y_fuse = Y' + W_o(GELU(W_g Y) * W_v Y)
+    Combines long-range coarse context Y' with fine-rate skip features X'.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_mult: float = 2.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__()
+        hidden_dim = max(64, int(round(dim * ffn_mult / 64.0)) * 64)
+        self.skip_norm = nn.RMSNorm(dim)
+        self.coarse_norm = nn.RMSNorm(dim)
+        self.wgv = nn.Linear(dim * 2, hidden_dim * 2, bias=False)
+        self.wo = nn.Linear(hidden_dim, dim, bias=False)
+        self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        nn.init.normal_(self.wgv.weight, std=1.0 / math.sqrt(dim * 2))
+        nn.init.normal_(
+            self.wo.weight,
+            std=(1.0 / math.sqrt(hidden_dim)) * residual_scale,
+        )
+
+    def forward(
+        self,
+        x_skip: torch.Tensor,
+        y_coarse: torch.Tensor,
+    ) -> torch.Tensor:
+        y_cat = torch.cat(
+            (self.skip_norm(x_skip), self.coarse_norm(y_coarse)), dim=-1
+        )
+        wg, wv = self.wgv(y_cat).chunk(2, dim=-1)
+        gated = F.gelu(wg) * wv
+        return y_coarse + self.drop(self.wo(self.drop(gated)))
+
+
 class DualPathEncoder(nn.Module):
+    """Residual SubRoFormer Separator Backbone (SubRoFormer Section IV, Fig. 1):
+    1. Fine-rate PreBlock (ConvNeXt-V2 temporal mixer + fine-rate time & subband RoPE blocks)
+       producing fine-rate skip representation X'.
+    2. Learned TemporalPatchDown reducing sequence length by patch_size (T -> T').
+    3. Stacked coarse-rate axial RoFormer blocks alternating subband-axis B_l and
+       temporal-axis T_l attention (Eq. 15: H^(l) = T_l(B_l(H^(l-1)))).
+    4. Learned TemporalPatchUp + GEGLUFusion (Eq. 16) combining coarse context Y'
+       and fine-rate skip X'.
+    5. Fine-rate PostBlock symmetric to PreBlock + terminal RMSNorm.
+    """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.depth = config.depth
         self.drop_path = config.drop_path
-        res_scale = 1.0 / math.sqrt(2.0 * config.depth)
-        self.time_layers = nn.ModuleList(
-            GatedRoPEBlock(
-                dim=config.dim,
-                num_heads=config.num_heads,
-                ffn_mult=config.ffn_mult,
-                rope_base=10_000.0,
-                dropout=config.dropout,
-                residual_scale=res_scale,
-            )
-            for _ in range(config.depth)
+        total_axial_pairs = config.depth + 2
+        res_scale = 1.0 / math.sqrt(2.0 * total_axial_pairs)
+
+        self.pre_block = FineRateBoundaryBlock(
+            dim=config.dim,
+            num_heads=config.num_heads,
+            ffn_mult=config.ffn_mult,
+            dropout=config.dropout,
+            residual_scale=res_scale,
         )
+        self.patch_down = TemporalPatchDown(
+            dim=config.dim, patch_size=config.patch_size
+        )
+
+        # Central coarse-rate axial RoFormer blocks: H^(l) = T_l(B_l(H^(l-1)))
         self.freq_layers = nn.ModuleList(
             GatedRoPEBlock(
                 dim=config.dim,
@@ -453,21 +706,43 @@ class DualPathEncoder(nn.Module):
             )
             for _ in range(config.depth)
         )
-        self.num_unet_skips = config.depth // 2
-        if self.num_unet_skips > 0:
-            self.unet_skip_gates = nn.Parameter(
-                torch.full((self.num_unet_skips, config.dim), 0.1)
+        self.time_layers = nn.ModuleList(
+            GatedRoPEBlock(
+                dim=config.dim,
+                num_heads=config.num_heads,
+                ffn_mult=config.ffn_mult,
+                rope_base=10_000.0,
+                dropout=config.dropout,
+                residual_scale=res_scale,
             )
-        else:
-            self.register_parameter("unet_skip_gates", None)
-        self.skip_proj = nn.Linear(config.dim, config.dim, bias=False)
-        nn.init.eye_(self.skip_proj.weight)
+            for _ in range(config.depth)
+        )
+
+        self.patch_up = TemporalPatchUp(
+            dim=config.dim, patch_size=config.patch_size
+        )
+        self.geglu_fusion = GEGLUFusion(
+            dim=config.dim,
+            ffn_mult=min(2.0, config.ffn_mult),
+            dropout=config.dropout,
+            residual_scale=res_scale,
+        )
+        self.post_block = FineRateBoundaryBlock(
+            dim=config.dim,
+            num_heads=config.num_heads,
+            ffn_mult=config.ffn_mult,
+            dropout=config.dropout,
+            residual_scale=res_scale,
+        )
         self.output_norm = nn.RMSNorm(config.dim)
         self.use_checkpoint = config.use_checkpoint
 
     def compile_layers(self, mode: str = "default") -> None:
-        for unit in (*self.time_layers, *self.freq_layers):
+        self.pre_block.compile_layers(mode=mode)
+        for unit in (*self.freq_layers, *self.time_layers):
             unit.compile(mode=mode, dynamic=False)
+        self.geglu_fusion.compile(mode=mode, dynamic=False)
+        self.post_block.compile_layers(mode=mode)
 
     @staticmethod
     def _run_module(
@@ -501,38 +776,86 @@ class DualPathEncoder(nn.Module):
         should_checkpoint = (
             self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad
         )
-        stem_skip = self.skip_proj(x).to(dtype=x.dtype)
-        total_blocks = max(1, 2 * self.depth - 1)
-        unet_skips: list[torch.Tensor] = []
-        pop_start = self.depth - self.num_unet_skips
+        total_blocks = max(1, 2 * (self.depth + 2) - 1)
 
-        for layer_idx, (time_layer, freq_layer) in enumerate(
-            zip(self.time_layers, self.freq_layers)
+        # 1. Fine-rate PreBlock -> retains fine-rate skip representation X'
+        keep_pre_t = self._drop_keep_mask(
+            batch, 0.0, x.device, x.dtype
+        )
+        keep_pre_f = self._drop_keep_mask(
+            batch, self.drop_path * 1.0 / total_blocks, x.device, x.dtype
+        )
+        x_fine_skip = self.pre_block(
+            x,
+            should_checkpoint=should_checkpoint,
+            keep_t=keep_pre_t,
+            keep_f=keep_pre_f,
+        )
+
+        # 2. Learned TemporalPatchDown: [B, T, K, D] -> [B, T', K, D]
+        h = self.patch_down(x_fine_skip)
+        coarse_frames = h.shape[1]
+
+        # 3. Patched coarse-rate axial RoFormer stack: H^(l) = T_l(B_l(H^(l-1)))
+        for layer_idx, (freq_layer, time_layer) in enumerate(
+            zip(self.freq_layers, self.time_layers)
         ):
-            p_time = self.drop_path * (2 * layer_idx) / total_blocks
-            keep_t = self._drop_keep_mask(batch, p_time, x.device, x.dtype)
-            time_in = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
-            time_out = self._run_module(time_layer, time_in, should_checkpoint)
-            time_out = time_out.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
-            x = time_out if keep_t is None else x + (time_out - x) * keep_t
+            block_offset = 2 * (layer_idx + 1)
+            p_freq = self.drop_path * block_offset / total_blocks
+            keep_f = self._drop_keep_mask(batch, p_freq, h.device, h.dtype)
+            freq_in = h.reshape(batch * coarse_frames, bands, dim)
+            freq_out = self._run_module(
+                freq_layer, freq_in, should_checkpoint
+            )
+            freq_out = freq_out.reshape(batch, coarse_frames, bands, dim)
+            h = freq_out if keep_f is None else h + (freq_out - h) * keep_f
 
-            p_freq = self.drop_path * (2 * layer_idx + 1) / total_blocks
-            keep_f = self._drop_keep_mask(batch, p_freq, x.device, x.dtype)
-            freq_in = x.reshape(batch * frames, bands, dim)
-            freq_out = self._run_module(freq_layer, freq_in, should_checkpoint)
-            freq_out = freq_out.reshape(batch, frames, bands, dim)
-            x = freq_out if keep_f is None else x + (freq_out - x) * keep_f
+            p_time = self.drop_path * (block_offset + 1) / total_blocks
+            keep_t = self._drop_keep_mask(batch, p_time, h.device, h.dtype)
+            time_in = h.permute(0, 2, 1, 3).reshape(
+                batch * bands, coarse_frames, dim
+            )
+            time_out = self._run_module(
+                time_layer, time_in, should_checkpoint
+            )
+            time_out = time_out.reshape(
+                batch, bands, coarse_frames, dim
+            ).permute(0, 2, 1, 3)
+            h = time_out if keep_t is None else h + (time_out - h) * keep_t
 
-            if layer_idx < self.num_unet_skips:
-                unet_skips.append(x)
-            elif layer_idx >= pop_start and self.unet_skip_gates is not None:
-                skip_idx = layer_idx - pop_start
-                gate = self.unet_skip_gates[skip_idx].to(
-                    device=x.device, dtype=x.dtype
-                )
-                x = x + unet_skips.pop() * gate
+        # 4. Learned TemporalPatchUp + GEGLU Gated Residual Fusion (Eq. 16)
+        y_coarse = self.patch_up(h, target_frames=frames)
+        if should_checkpoint:
+            y_fused = checkpoint(
+                self.geglu_fusion,
+                x_fine_skip,
+                y_coarse,
+                use_reentrant=False,
+            )
+        else:
+            y_fused = self.geglu_fusion(x_fine_skip, y_coarse)
 
-        return self.output_norm(x + stem_skip)
+        # 5. Fine-rate PostBlock + terminal RMSNorm
+        post_offset = 2 * (self.depth + 1)
+        keep_post_t = self._drop_keep_mask(
+            batch,
+            self.drop_path * post_offset / total_blocks,
+            y_fused.device,
+            y_fused.dtype,
+        )
+        keep_post_f = self._drop_keep_mask(
+            batch,
+            self.drop_path * (post_offset + 1) / total_blocks,
+            y_fused.device,
+            y_fused.dtype,
+        )
+        u = self.post_block(
+            y_fused,
+            should_checkpoint=should_checkpoint,
+            keep_t=keep_post_t,
+            keep_f=keep_post_f,
+        )
+        return self.output_norm(u)
 
 
 class BandInputGroup(nn.Module):
@@ -545,7 +868,6 @@ class BandInputGroup(nn.Module):
     ):
         super().__init__()
         self.band_width = band_width
-        self.audio_channels = config.audio_channels
         self.feature_width = band_width * config.audio_channels * 2
         self.num_group_bands = len(band_ids)
 
@@ -813,7 +1135,7 @@ class BandMaskGroup(nn.Module):
         self.audio_channels = config.audio_channels
         self.filter_taps = config.filter_taps
         self.band_width = band_width
-        self.feature_width = (
+        feature_width = (
             band_width
             * self.audio_channels
             * self.audio_channels
@@ -869,11 +1191,11 @@ class BandMaskGroup(nn.Module):
             )
             self.output_weight = nn.Parameter(
                 torch.empty(
-                    self.num_group_bands, self.bottleneck_dim, self.feature_width
+                    self.num_group_bands, self.bottleneck_dim, feature_width
                 )
             )
             self.output_bias = nn.Parameter(
-                torch.zeros(self.num_group_bands, self.feature_width)
+                torch.zeros(self.num_group_bands, feature_width)
             )
             nn.init.normal_(
                 self.bottleneck_weight, std=1.0 / math.sqrt(hidden_dim)
@@ -886,11 +1208,11 @@ class BandMaskGroup(nn.Module):
             self.register_parameter("bottleneck_bias", None)
             self.output_weight = nn.Parameter(
                 torch.empty(
-                    self.num_group_bands, hidden_dim, self.feature_width * 2
+                    self.num_group_bands, hidden_dim, feature_width * 2
                 )
             )
             self.output_bias = nn.Parameter(
-                torch.zeros(self.num_group_bands, self.feature_width * 2)
+                torch.zeros(self.num_group_bands, feature_width * 2)
             )
             nn.init.normal_(self.output_weight, std=0.25 / math.sqrt(hidden_dim))
 
@@ -978,7 +1300,7 @@ class MaskHead(nn.Module):
         self.num_bands = len(bands)
         self.audio_channels = config.audio_channels
         self.filter_taps = config.filter_taps
-        self.center_tap = config.filter_taps // 2
+        center_tap = config.filter_taps // 2
         self.freq_bins = config.n_fft // 2 + 1
         self.filter_channels = (
             self.audio_channels
@@ -1035,7 +1357,7 @@ class MaskHead(nn.Module):
             dtype=torch.float32,
         )
         for ch in range(self.audio_channels):
-            tap_bias[0, ch, ch, 0, 0, self.center_tap, 0] = 0.5
+            tap_bias[0, ch, ch, 0, 0, center_tap, 0] = 0.5
         self.register_buffer("tap_bias", tap_bias, persistent=False)
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
@@ -1099,15 +1421,15 @@ def unfold_stft_taps(spec: torch.Tensor, taps: int) -> torch.Tensor:
 
 
 class StemSeparator(nn.Module):
-    """124-Band Gated-RoPE + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator."""
+    """124-Band Residual SubRoFormer + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.bands = build_bs_bands(config.n_fft, config.num_bands)
-        self.band_split = BandSplit(config, self.bands)
+        bands = build_bs_bands(config.n_fft, config.num_bands)
+        self.band_split = BandSplit(config, bands)
         self.encoder = DualPathEncoder(config)
-        self.mask_head = MaskHead(config, self.bands)
+        self.mask_head = MaskHead(config, bands)
 
     def forward_filters_real(
         self,
@@ -1852,16 +2174,6 @@ def _pink_noise_buffer(sample_rate: int, needed: int) -> torch.Tensor:
     return buffer
 
 
-def _pink_noise(length: int, sample_rate: int) -> torch.Tensor:
-    if length <= 0:
-        return torch.zeros(0)
-    needed = max(2**20, 4 * length)
-    buffer = _pink_noise_buffer(sample_rate, needed)
-    offset = random.randint(0, buffer.shape[-1] - length)
-    channel = random.randint(0, 1)
-    return buffer[channel, offset : offset + length].clone()
-
-
 def _stereo_pink_noise(length: int, sample_rate: int) -> torch.Tensor:
     """Single [2, length] slice; L/R rows are independent so they can never
     overlap like two independent 1D slices drawn from one shared buffer."""
@@ -1938,7 +2250,6 @@ class StemDataset(Dataset):
         remix_probability: float = 0.75,
         min_activity_rms: float = 1e-4,
     ):
-        self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_samples = segment_samples
         self.segment_seconds = segment_samples / sample_rate
@@ -2449,7 +2760,7 @@ class _EMAStateView(nn.Module):
         return None
 
 
-NO_DECAY_KEYWORDS = ("bias", "norm", "gamma", "gate")
+NO_DECAY_KEYWORDS = ("bias", "norm", "gamma", "gate", "grn")
 
 
 def split_decay_parameters(
@@ -3167,8 +3478,8 @@ def train(
     if args.compile:
         model.encoder.compile_layers(mode="default")
         print(
-            f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
-            "Gated-RoPE axial blocks (FlashAttention + SwiGLU, zero FFT graph breaks)."
+            f"Compiled SubRoFormer PreBlock, {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
+            f"coarse-rate (patch={model.config.patch_size}) Gated-RoPE axial blocks, GEGLUFusion, and PostBlock."
         )
 
     stft_window = torch.hann_window(model.config.win_length, device=device)
@@ -3462,6 +3773,7 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         depth=args.depth,
         num_heads=args.num_heads,
         ffn_mult=args.ffn_mult,
+        patch_size=args.patch_size,
         filter_taps=args.filter_taps,
         dropout=args.dropout,
         drop_path=args.drop_path,
@@ -3533,7 +3845,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="124-band Gated-RoPE + 2x2 MIMO 3-Tap Deep-Filter MVSEP Separator"
+        description="124-band Residual SubRoFormer + 2x2 MIMO 3-Tap Deep-Filter MVSEP Separator"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -3562,7 +3874,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inference/validation overlap in seconds (default: 0.30 * --segment_seconds).",
     )
     parser.add_argument("--model_dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--depth", type=int, default=14)
     parser.add_argument(
         "--num_heads",
         type=int,
@@ -3570,6 +3882,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Attention heads (default: model_dim // 32 for 32-d FlashAttention heads).",
     )
     parser.add_argument("--ffn_mult", type=float, default=3.0)
+    parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=2,
+        choices=(1, 2, 4),
+        help=(
+            "SubRoFormer temporal patch factor for the central axial RoFormer stack "
+            "(1 = unpatched, 2 = 2x coarse temporal patching, 4 = 4x coarse temporal patching)."
+        ),
+    )
     parser.add_argument("--filter_taps", type=int, default=3, choices=(1, 3, 5))
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--drop_path", type=float, default=0.08)
@@ -3639,6 +3961,8 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--drop_path must be in [0, 1).")
     if args.ffn_mult <= 0.0:
         raise ValueError("--ffn_mult must be positive.")
+    if args.patch_size not in (1, 2, 4):
+        raise ValueError("--patch_size must be one of {1, 2, 4}.")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad_clip must be positive.")
     if args.weight_decay < 0.0:
@@ -3747,7 +4071,8 @@ def main() -> None:
         parameter.numel() for parameter in model.mask_head.parameters()
     )
     print(
-        f"124-band Gated-RoPE + 2x2 MIMO {config.filter_taps}-tap DeepFilter parameters: "
+        f"124-band Residual SubRoFormer (1 pre + {config.depth}x coarse[patch={config.patch_size}] + 1 post) "
+        f"+ 2x2 MIMO {config.filter_taps}-tap DeepFilter parameters: "
         f"{parameter_count / 1e6:.2f}M (encoder: {encoder_count / 1e6:.2f}M, "
         f"mask head: {mask_count / 1e6:.2f}M)"
     )
