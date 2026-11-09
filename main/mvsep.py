@@ -1043,11 +1043,33 @@ class BandSplit(nn.Module):
         win = min(self.LOCAL_ANCHOR_FRAMES, frames)
         if win % 2 == 0:
             win = max(1, win - 1)
+        # Weight audible frames (within ~35 dB / 4.0 Nepers of the chunk peak)
+        # so pre-song digital silence or full-mix breaks (-8.06) cannot drag down
+        # local_anchor and create a ~0.5-1.0s temporal_relative spike at track start.
+        peak_log_rms = frame_log_rms.amax(dim=1, keepdim=True)
+        active_floor = peak_log_rms - 4.0
+        clamped_log_rms = torch.maximum(frame_log_rms, active_floor)
+        active_weight = (
+            ((frame_log_rms - active_floor) / 1.5).clamp(0.0, 1.0) + 1e-3
+        )
         if win <= 1:
-            return frame_log_rms.mean(dim=1, keepdim=True)
+            return (clamped_log_rms * active_weight).sum(
+                dim=1, keepdim=True
+            ) / active_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
         half = win // 2
-        padded = F.pad(frame_log_rms.transpose(1, 2), (half, half), mode="reflect")
-        return F.avg_pool1d(padded, kernel_size=win, stride=1).transpose(1, 2)
+        val_pad = F.pad(
+            (clamped_log_rms * active_weight).transpose(1, 2),
+            (half, half),
+            mode="replicate",
+        )
+        w_pad = F.pad(
+            active_weight.transpose(1, 2),
+            (half, half),
+            mode="replicate",
+        )
+        num = F.avg_pool1d(val_pad, kernel_size=win, stride=1)
+        den = F.avg_pool1d(w_pad, kernel_size=win, stride=1).clamp_min(1e-6)
+        return (num / den).transpose(1, 2)
 
     def forward_real(self, real_imag: torch.Tensor) -> torch.Tensor:
         real_imag = real_imag.permute(0, 3, 2, 1, 4)
@@ -2569,6 +2591,22 @@ class StemDataset(Dataset):
         if random.random() < 0.16:
             targets = apply_bus_compression(targets)
 
+        # Simulate track-start or full-mix stop where both vocals and instrumental
+        # start immediately together from digital silence.
+        if random.random() < 0.08:
+            samples = targets.shape[-1]
+            intro_silence = random.randint(
+                max(2048, samples // 32), max(2049, samples // 5)
+            )
+            ramp = min(256, intro_silence)
+            targets = targets.clone()
+            targets[..., :intro_silence] = 0.0
+            if ramp > 1 and intro_silence + ramp <= samples:
+                fade_in = torch.linspace(
+                    0.0, 1.0, ramp, device=targets.device, dtype=targets.dtype
+                )
+                targets[..., intro_silence : intro_silence + ramp] *= fade_in
+
         global_gain = db_to_gain(random.uniform(-4.0, 3.0))
         targets = targets * global_gain
         peak = targets.sum(dim=0).abs().amax()
@@ -3056,20 +3094,24 @@ def separate_tensor(
 
     mixture = mixture.to(device=device, dtype=torch.float32)
     orig_length = mixture.shape[-1]
-    # Reflect-pad multi-chunk tracks so song start and end sit inside bidirectional context
-    edge_pad = (
-        min(overlap // 2, orig_length - 1)
-        if orig_length > chunk_size and overlap > 0
-        else 0
-    )
-    if edge_pad > 0:
-        padded_mix = F.pad(mixture.unsqueeze(0), (edge_pad, edge_pad), mode="reflect").squeeze(0)
-    else:
-        padded_mix = mixture
 
-    total_length = padded_mix.shape[-1]
+    # Align Chunk 0 with the first active sample (matching training crops, which
+    # always start on active audio at frame 0) and avoid reflect-padding 1.2s of
+    # time-reversed vocals before the track onset.
+    active_mask = mixture.abs().amax(dim=0) > 1e-4
+    if active_mask.any():
+        active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+        guard = model.config.hop_length
+        trim_start = max(0, int(active_indices[0].item()) - guard)
+        trim_end = min(orig_length, int(active_indices[-1].item()) + 1 + guard)
+    else:
+        trim_start = 0
+        trim_end = orig_length
+
+    active_mix = mixture[:, trim_start:trim_end]
+    total_length = active_mix.shape[-1]
     starts = chunk_starts(total_length, chunk_size, overlap)
-    output = torch.zeros(
+    active_output = torch.zeros(
         model.config.num_stems,
         model.config.audio_channels,
         total_length,
@@ -3085,7 +3127,7 @@ def separate_tensor(
 
     for start in iterator:
         usable = min(chunk_size, total_length - start)
-        chunk = padded_mix[:, start : start + usable]
+        chunk = active_mix[:, start : start + usable]
         if usable < chunk_size:
             pad = chunk_size - usable
             if usable > 1:
@@ -3127,16 +3169,30 @@ def separate_tensor(
             device=device,
             dtype=estimated.dtype,
         )[:usable]
-        output[..., start : start + usable] += estimated[..., :usable] * window
+        active_output[..., start : start + usable] += estimated[..., :usable] * window
         weight_sum[start : start + usable] += window
 
-    output = output / weight_sum.clamp_min(1e-8)
-    if edge_pad > 0:
-        output = output[..., edge_pad : edge_pad + orig_length]
-
+    active_output = active_output / weight_sum.clamp_min(1e-8)
     if mask_deadzone <= 0.0:
-        residual = mixture - output.sum(dim=0)
-        output[1] = output[1] + residual
+        residual = active_mix - active_output.sum(dim=0)
+        active_output[1] = active_output[1] + residual
+
+    if trim_start == 0 and trim_end == orig_length:
+        output = active_output
+    else:
+        output = torch.zeros(
+            model.config.num_stems,
+            model.config.audio_channels,
+            orig_length,
+            device=device,
+            dtype=torch.float32,
+        )
+        output[..., trim_start:trim_end] = active_output
+        if mask_deadzone <= 0.0:
+            if trim_start > 0:
+                output[1, :, :trim_start] = mixture[:, :trim_start]
+            if trim_end < orig_length:
+                output[1, :, trim_end:] = mixture[:, trim_end:]
     return [output[index] for index in range(model.config.num_stems)]
 
 
