@@ -42,8 +42,7 @@ class ModelConfig:
     depth: int = 14
     num_heads: int = 8
     ffn_mult: float = 3.0
-    patch_size: int = 2
-    filter_taps: int = 3
+    patch_size: int = 1
     dropout: float = 0.0
     drop_path: float = 0.08
     use_checkpoint: bool = True
@@ -75,10 +74,8 @@ class ModelConfig:
             raise ValueError(f"head_dim ({head_dim}) must be even for RoPE.")
         if self.ffn_mult <= 0.0:
             raise ValueError("ffn_mult must be positive.")
-        if self.patch_size not in (1, 2, 4):
-            raise ValueError("patch_size must be one of {1, 2, 4}.")
-        if self.filter_taps not in (1, 3, 5):
-            raise ValueError("filter_taps must be one of {1, 3, 5}.")
+        if self.patch_size != 1:
+            raise ValueError("This architecture is fixed at patch_size=1 (unpatched).")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if not 0.0 <= self.drop_path < 1.0:
@@ -328,14 +325,15 @@ class RotaryEmbedding(nn.Module):
             and self._cos_cached.dtype == dtype
         ):
             return (
-                self._cos_cached[:, :seq_len, :, :],
-                self._sin_cached[:, :seq_len, :, :],
+                self._cos_cached[:, :, :seq_len, :],
+                self._sin_cached[:, :, :seq_len, :],
             )
         positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(positions, self.inv_freq.to(device=device, dtype=torch.float32))
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().to(dtype=dtype)[None, :, None, :]
-        sin = emb.sin().to(dtype=dtype)[None, :, None, :]
+        freqs = torch.outer(
+            positions, self.inv_freq.to(device=device, dtype=torch.float32)
+        )
+        cos = freqs.cos().to(dtype=dtype)[None, None, :, :]
+        sin = freqs.sin().to(dtype=dtype)[None, None, :, :]
         if not torch.compiler.is_compiling():
             self._cos_cached = cos
             self._sin_cached = sin
@@ -347,18 +345,13 @@ class RotaryEmbedding(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # q, k are contiguous [B, L, H, head_dim]
-        cos, sin = self._get_cos_sin(q.shape[1], q.device, q.dtype)
-        q_rot = (q * cos) + (_rotate_half(q) * sin)
-        k_rot = (k * cos) + (_rotate_half(k) * sin)
+        # q, k have shape [B, H, L, head_dim]; returns contiguous [B, H, L, head_dim]
+        cos, sin = self._get_cos_sin(q.shape[2], q.device, q.dtype)
+        q1, q2 = q.chunk(2, dim=-1)
+        k1, k2 = k.chunk(2, dim=-1)
+        q_rot = torch.cat((q1 * cos - q2 * sin, q2 * cos + q1 * sin), dim=-1)
+        k_rot = torch.cat((k1 * cos - k2 * sin, k2 * cos + k1 * sin), dim=-1)
         return q_rot, k_rot
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 class GatedRoPEBlock(nn.Module):
@@ -405,16 +398,22 @@ class GatedRoPEBlock(nn.Module):
 
         h = self.attn_norm(x)
         q, k, v, attn_gate = self.qkvg_proj(h).chunk(4, dim=-1)
-        q = self.q_norm(q.reshape(batch_eff, seq_len, self.num_heads, self.head_dim))
-        k = self.k_norm(k.reshape(batch_eff, seq_len, self.num_heads, self.head_dim))
-        v = v.reshape(batch_eff, seq_len, self.num_heads, self.head_dim)
+        q = self.q_norm(
+            q.reshape(batch_eff, seq_len, self.num_heads, self.head_dim)
+        ).transpose(1, 2)
+        k = self.k_norm(
+            k.reshape(batch_eff, seq_len, self.num_heads, self.head_dim)
+        ).transpose(1, 2)
+        v = v.reshape(batch_eff, seq_len, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )
         q, k = self.rope(q, k)
 
         attn_p = self.dropout if self.training else 0.0
         attn = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
+            q,
+            k,
+            v,
             dropout_p=attn_p,
         )
         attn = attn.transpose(1, 2).reshape(batch_eff, seq_len, dim)
@@ -536,8 +535,8 @@ class FineRateBoundaryBlock(nn.Module):
         self,
         x: torch.Tensor,
         should_checkpoint: bool = False,
-        keep_t: torch.Tensor | None = None,
-        keep_f: torch.Tensor | None = None,
+        keep_t: torch.Tensor | float | None = None,
+        keep_f: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         batch, frames, bands, dim = x.shape
         t_in = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
@@ -546,88 +545,26 @@ class FineRateBoundaryBlock(nn.Module):
         )
         x_mixed = t_mixed.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
 
-        t_out = self._run_unit(self.time_layer, t_mixed, should_checkpoint)
-        t_out = t_out.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
-        x = t_out if keep_t is None else x_mixed + (t_out - x_mixed) * keep_t
+        if keep_t is not None and isinstance(keep_t, float) and keep_t == 0.0:
+            x = x_mixed
+        else:
+            t_out = self._run_unit(self.time_layer, t_mixed, should_checkpoint)
+            t_out = t_out.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
+            x = t_out if keep_t is None else x_mixed + (t_out - x_mixed) * keep_t
 
+        if keep_f is not None and isinstance(keep_f, float) and keep_f == 0.0:
+            return x
         f_in = x.reshape(batch * frames, bands, dim)
         f_out = self._run_unit(self.freq_layer, f_in, should_checkpoint)
         f_out = f_out.reshape(batch, frames, bands, dim)
         return f_out if keep_f is None else x + (f_out - x) * keep_f
 
 
-class TemporalPatchDown(nn.Module):
-    """Learned temporal patchification module (SubRoFormer Section IV-A.1).
-    Groups neighboring fine-rate temporal frames [B, T, K, D] into coarse-rate
-    patches [B, ceil(T / P), K, D] while preserving full subband resolution K.
-    """
-
-    def __init__(self, dim: int, patch_size: int):
-        super().__init__()
-        self.patch_size = patch_size
-        self.norm = nn.RMSNorm(dim * patch_size)
-        self.proj = nn.Linear(dim * patch_size, dim, bias=False)
-        with torch.no_grad():
-            nn.init.normal_(
-                self.proj.weight, std=0.02 / math.sqrt(dim * patch_size)
-            )
-            eye = torch.eye(dim) / float(patch_size)
-            self.proj.weight.add_(eye.repeat(1, patch_size))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, frames, bands, dim = x.shape
-        if self.patch_size == 1:
-            return self.proj(self.norm(x))
-        pad_t = (-frames) % self.patch_size
-        if pad_t > 0:
-            last_frame = x[:, -1:, :, :].expand(batch, pad_t, bands, dim)
-            x = torch.cat((x, last_frame), dim=1)
-        coarse_frames = x.shape[1] // self.patch_size
-        patched = (
-            x.reshape(batch, coarse_frames, self.patch_size, bands, dim)
-            .permute(0, 1, 3, 2, 4)
-            .reshape(batch, coarse_frames, bands, self.patch_size * dim)
-        )
-        return self.proj(self.norm(patched))
-
-
-class TemporalPatchUp(nn.Module):
-    """Learned temporal unpatchification module (SubRoFormer Section IV-A.3).
-    Maps coarse-rate representation [B, T', K, D] back to fine temporal resolution
-    [B, T, K, D].
-    """
-
-    def __init__(self, dim: int, patch_size: int):
-        super().__init__()
-        self.patch_size = patch_size
-        self.norm = nn.RMSNorm(dim)
-        self.proj = nn.Linear(dim, dim * patch_size, bias=False)
-        with torch.no_grad():
-            nn.init.normal_(self.proj.weight, std=0.02 / math.sqrt(dim))
-            eye = torch.eye(dim)
-            self.proj.weight.add_(eye.repeat(patch_size, 1))
-
-    def forward(self, h: torch.Tensor, target_frames: int) -> torch.Tensor:
-        batch, coarse_frames, bands, dim = h.shape
-        expanded = self.proj(self.norm(h))
-        if self.patch_size == 1:
-            return expanded[:, :target_frames, :, :]
-        return (
-            expanded.reshape(
-                batch, coarse_frames, bands, self.patch_size, dim
-            )
-            .permute(0, 1, 3, 2, 4)
-            .reshape(batch, coarse_frames * self.patch_size, bands, dim)[
-                :, :target_frames, :, :
-            ]
-        )
-
-
 class GEGLUFusion(nn.Module):
     """SubRoFormer GEGLU Gated Residual Fusion Module (Section IV-A.3, Eq. 16):
     Y = Concat(X', Y')
     Y_fuse = Y' + W_o(GELU(W_g Y) * W_v Y)
-    Combines long-range coarse context Y' with fine-rate skip features X'.
+    Combines axial context Y' with fine-rate skip features X'.
     """
 
     def __init__(
@@ -665,15 +602,13 @@ class GEGLUFusion(nn.Module):
 
 
 class DualPathEncoder(nn.Module):
-    """Residual SubRoFormer Separator Backbone (SubRoFormer Section IV, Fig. 1):
+    """Residual SubRoFormer Separator Backbone (unpatched fine-rate axial stack):
     1. Fine-rate PreBlock (ConvNeXt-V2 temporal mixer + fine-rate time & subband RoPE blocks)
        producing fine-rate skip representation X'.
-    2. Learned TemporalPatchDown reducing sequence length by patch_size (T -> T').
-    3. Stacked coarse-rate axial RoFormer blocks alternating subband-axis B_l and
+    2. Stacked fine-rate axial RoFormer blocks alternating subband-axis B_l and
        temporal-axis T_l attention (Eq. 15: H^(l) = T_l(B_l(H^(l-1)))).
-    4. Learned TemporalPatchUp + GEGLUFusion (Eq. 16) combining coarse context Y'
-       and fine-rate skip X'.
-    5. Fine-rate PostBlock symmetric to PreBlock + terminal RMSNorm.
+    3. GEGLUFusion (Eq. 16) combining axial context Y' and fine-rate skip X'.
+    4. Fine-rate PostBlock symmetric to PreBlock + terminal RMSNorm.
     """
 
     def __init__(self, config: ModelConfig):
@@ -690,11 +625,8 @@ class DualPathEncoder(nn.Module):
             dropout=config.dropout,
             residual_scale=res_scale,
         )
-        self.patch_down = TemporalPatchDown(
-            dim=config.dim, patch_size=config.patch_size
-        )
 
-        # Central coarse-rate axial RoFormer blocks: H^(l) = T_l(B_l(H^(l-1)))
+        # Central fine-rate axial RoFormer blocks: H^(l) = T_l(B_l(H^(l-1)))
         self.freq_layers = nn.ModuleList(
             GatedRoPEBlock(
                 dim=config.dim,
@@ -718,9 +650,6 @@ class DualPathEncoder(nn.Module):
             for _ in range(config.depth)
         )
 
-        self.patch_up = TemporalPatchUp(
-            dim=config.dim, patch_size=config.patch_size
-        )
         self.geglu_fusion = GEGLUFusion(
             dim=config.dim,
             ffn_mult=min(2.0, config.ffn_mult),
@@ -760,11 +689,19 @@ class DualPathEncoder(nn.Module):
         drop_prob: float,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | float | None:
         if not self.training or drop_prob <= 0.0:
             return None
         keep_prob = 1.0 - drop_prob
-        mask = (torch.rand(batch, 1, 1, 1, device=device) < keep_prob).to(dtype)
+        if batch == 1 and not torch.compiler.is_compiling():
+            return 0.0 if random.random() < drop_prob else (1.0 / keep_prob)
+        mask_cpu = torch.rand(batch, 1, 1, 1) < keep_prob
+        if not torch.compiler.is_compiling():
+            if not bool(mask_cpu.any()):
+                return 0.0
+            if bool(mask_cpu.all()):
+                return 1.0 / keep_prob
+        mask = mask_cpu.to(device=device, dtype=dtype, non_blocking=True)
         return mask / keep_prob
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -792,50 +729,48 @@ class DualPathEncoder(nn.Module):
             keep_f=keep_pre_f,
         )
 
-        # 2. Learned TemporalPatchDown: [B, T, K, D] -> [B, T', K, D]
-        h = self.patch_down(x_fine_skip)
-        coarse_frames = h.shape[1]
-
-        # 3. Patched coarse-rate axial RoFormer stack: H^(l) = T_l(B_l(H^(l-1)))
+        # 2. Unpatched fine-rate axial RoFormer stack: H^(l) = T_l(B_l(H^(l-1)))
+        h = x_fine_skip
         for layer_idx, (freq_layer, time_layer) in enumerate(
             zip(self.freq_layers, self.time_layers)
         ):
             block_offset = 2 * (layer_idx + 1)
             p_freq = self.drop_path * block_offset / total_blocks
             keep_f = self._drop_keep_mask(batch, p_freq, h.device, h.dtype)
-            freq_in = h.reshape(batch * coarse_frames, bands, dim)
-            freq_out = self._run_module(
-                freq_layer, freq_in, should_checkpoint
-            )
-            freq_out = freq_out.reshape(batch, coarse_frames, bands, dim)
-            h = freq_out if keep_f is None else h + (freq_out - h) * keep_f
+            if not (isinstance(keep_f, float) and keep_f == 0.0):
+                freq_in = h.reshape(batch * frames, bands, dim)
+                freq_out = self._run_module(
+                    freq_layer, freq_in, should_checkpoint
+                )
+                freq_out = freq_out.reshape(batch, frames, bands, dim)
+                h = freq_out if keep_f is None else h + (freq_out - h) * keep_f
 
             p_time = self.drop_path * (block_offset + 1) / total_blocks
             keep_t = self._drop_keep_mask(batch, p_time, h.device, h.dtype)
-            time_in = h.permute(0, 2, 1, 3).reshape(
-                batch * bands, coarse_frames, dim
-            )
-            time_out = self._run_module(
-                time_layer, time_in, should_checkpoint
-            )
-            time_out = time_out.reshape(
-                batch, bands, coarse_frames, dim
-            ).permute(0, 2, 1, 3)
-            h = time_out if keep_t is None else h + (time_out - h) * keep_t
+            if not (isinstance(keep_t, float) and keep_t == 0.0):
+                time_in = h.permute(0, 2, 1, 3).reshape(
+                    batch * bands, frames, dim
+                )
+                time_out = self._run_module(
+                    time_layer, time_in, should_checkpoint
+                )
+                time_out = time_out.reshape(
+                    batch, bands, frames, dim
+                ).permute(0, 2, 1, 3)
+                h = time_out if keep_t is None else h + (time_out - h) * keep_t
 
-        # 4. Learned TemporalPatchUp + GEGLU Gated Residual Fusion (Eq. 16)
-        y_coarse = self.patch_up(h, target_frames=frames)
+        # 3. GEGLU Gated Residual Fusion (Eq. 16)
         if should_checkpoint:
             y_fused = checkpoint(
                 self.geglu_fusion,
                 x_fine_skip,
-                y_coarse,
+                h,
                 use_reentrant=False,
             )
         else:
-            y_fused = self.geglu_fusion(x_fine_skip, y_coarse)
+            y_fused = self.geglu_fusion(x_fine_skip, h)
 
-        # 5. Fine-rate PostBlock + terminal RMSNorm
+        # 4. Fine-rate PostBlock + terminal RMSNorm
         post_offset = 2 * (self.depth + 1)
         keep_post_t = self._drop_keep_mask(
             batch,
@@ -919,20 +854,18 @@ class BandInputGroup(nn.Module):
         right_i = gathered[..., 1, 1]
 
         inv_bins = 1.0 / float(self.band_width)
-        mid_pow = (0.25 * inv_bins) * (
-            (left_r + right_r).square() + (left_i + right_i).square()
-        ).sum(dim=-1)
-        side_pow = (0.25 * inv_bins) * (
-            (left_r - right_r).square() + (left_i - right_i).square()
-        ).sum(dim=-1)
-        ms_log_ratio = (0.5 * torch.log((mid_pow + 1e-7) / (side_pow + 1e-7))).clamp(
-            -8.0, 8.0
-        )
-
         left_pow = (left_r.square() + left_i.square()).sum(dim=-1)
         right_pow = (right_r.square() + right_i.square()).sum(dim=-1)
         cross_r = (left_r * right_r + left_i * right_i).sum(dim=-1)
         cross_i = (left_i * right_r - left_r * right_i).sum(dim=-1)
+
+        total_pow = left_pow + right_pow
+        mid_pow = (0.25 * inv_bins) * (total_pow + 2.0 * cross_r).clamp_min(0.0)
+        side_pow = (0.25 * inv_bins) * (total_pow - 2.0 * cross_r).clamp_min(0.0)
+        ms_log_ratio = (0.5 * torch.log((mid_pow + 1e-7) / (side_pow + 1e-7))).clamp(
+            -8.0, 8.0
+        )
+
         coh_denom = (left_pow * right_pow).clamp_min(0.0).sqrt() + 1e-7
         coh_real = (cross_r / coh_denom).clamp(-1.0, 1.0)
         coh_imag = (cross_i / coh_denom).clamp(-1.0, 1.0)
@@ -944,7 +877,7 @@ class BandInputGroup(nn.Module):
             self.num_group_bands,
             self.feature_width,
         )
-        mean_square = features.square().mean(dim=-1, keepdim=True)
+        mean_square = ((0.25 * inv_bins) * total_pow).unsqueeze(-1)
         features = features * torch.rsqrt(mean_square + 1e-7)
         features = features * self.gamma[None, None].float()
 
@@ -964,8 +897,6 @@ class BandInputGroup(nn.Module):
         # DualPathEncoder residual stream stays in bf16 (fp32 tokens would
         # promote every `x + block(x)` addition to fp32, doubling activation
         # / checkpoint memory). The projection itself still accumulates in fp32.
-        # NOTE: is_autocast_enabled() takes no device arg checks CUDA only;
-        # pass the tensor's device type so CPU autocast is honored too.
         if torch.is_autocast_enabled(tokens.device.type):
             tokens = tokens.to(torch.get_autocast_dtype(tokens.device.type))
         return tokens, mean_square.squeeze(-1), spatial_cues
@@ -1057,15 +988,19 @@ class BandSplit(nn.Module):
                 dim=1, keepdim=True
             ) / active_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
         half = win // 2
+        # Zero-pad numerator and denominator equally so boundary windows average
+        # strictly over in-bounds frames without replicating frame 0 86 times.
         val_pad = F.pad(
             (clamped_log_rms * active_weight).transpose(1, 2),
             (half, half),
-            mode="replicate",
+            mode="constant",
+            value=0.0,
         )
         w_pad = F.pad(
             active_weight.transpose(1, 2),
             (half, half),
-            mode="replicate",
+            mode="constant",
+            value=0.0,
         )
         num = F.avg_pool1d(val_pad, kernel_size=win, stride=1)
         den = F.avg_pool1d(w_pad, kernel_size=win, stride=1).clamp_min(1e-6)
@@ -1110,15 +1045,22 @@ class BandSplit(nn.Module):
             ),
             dim=-1,
         )
-        cue_hidden = F.silu(
-            torch.einsum("btne,neh->btnh", cue_features, self.cue_fc1_w)
-            + self.cue_fc1_b[None, None]
+        device_type = output.device.type
+        no_autocast = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if device_type == "cuda"
+            else contextlib.nullcontext()
         )
-        # FiLM multiplicative gate + additive shift attenuates unit-normed noise-floor bands
-        cue_proj = (
-            torch.einsum("btnh,nhd->btnd", cue_hidden, self.cue_fc2_w)
-            + self.cue_fc2_b[None, None]
-        )
+        with no_autocast:
+            cue_hidden = F.silu(
+                torch.einsum("btne,neh->btnh", cue_features.float(), self.cue_fc1_w.float())
+                + self.cue_fc1_b[None, None].float()
+            )
+            # FiLM multiplicative gate + additive shift attenuates unit-normed noise-floor bands
+            cue_proj = (
+                torch.einsum("btnh,nhd->btnd", cue_hidden, self.cue_fc2_w.float())
+                + self.cue_fc2_b[None, None].float()
+            )
         cue_scale, cue_shift = cue_proj.chunk(2, dim=-1)
         cue_gate = torch.sigmoid(cue_scale).to(dtype=output.dtype)
         metadata_tokens = self.metadata_proj(
@@ -1129,7 +1071,7 @@ class BandSplit(nn.Module):
 
 class BandMaskGroup(nn.Module):
     """Per-band MLP with temporal depthwise conv and adaptive SwiGLU bottleneck
-    producing fp32 multi-tap cross-channel (C_out x C_in MIMO) complex deep filters.
+    producing fp32 per-channel complex STFT masks.
     Full rank is preserved on narrow low-frequency harmonic bands while wide >2 kHz
     bands use a factorized bottleneck to prevent high-frequency dataset memorization.
     """
@@ -1155,15 +1097,8 @@ class BandMaskGroup(nn.Module):
     ):
         super().__init__()
         self.audio_channels = config.audio_channels
-        self.filter_taps = config.filter_taps
         self.band_width = band_width
-        feature_width = (
-            band_width
-            * self.audio_channels
-            * self.audio_channels
-            * self.filter_taps
-            * 2
-        )
+        feature_width = band_width * self.audio_channels * 2
         self.num_group_bands = len(band_ids)
 
         self.register_buffer(
@@ -1249,17 +1184,15 @@ class BandMaskGroup(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, frames, num_bands, _ = x.shape
         h = self.norm1(x)
-        h = F.silu(
-            torch.einsum("btnd,ndh->btnh", h, self.fc1_weight)
-            + self.fc1_bias[None, None]
-        )
+        h_proj = torch.einsum("btnd,ndh->btnh", h, self.fc1_weight)
+        h = F.silu(h_proj + self.fc1_bias[None, None].to(dtype=h_proj.dtype))
 
         h_t = h.permute(0, 2, 3, 1).reshape(batch * num_bands, h.shape[-1], frames)
         h_t = self.temporal_dwconv(h_t).reshape(batch, num_bands, h.shape[-1], frames)
-        h = h + h_t.permute(0, 3, 1, 2)
-        h = h + F.silu(self.fc2(self.norm2(h)))
+        h = h + h_t.permute(0, 3, 1, 2).to(dtype=h.dtype)
+        h = h + F.silu(self.fc2(self.norm2(h))).to(dtype=h.dtype)
 
-        # Compute final filter tap projections in fp32 to avoid bf16 -48 dB mantissa steps.
+        # Compute final mask projections in fp32 to avoid bf16 -48 dB mantissa steps.
         # NOTE: must disable autocast: torch.einsum dispatches to aten::bmm/matmul
         # which autocast would downcast back to bf16 despite the explicit .float().
         device_type = h.device.type
@@ -1294,18 +1227,14 @@ class BandMaskGroup(nn.Module):
             self.num_group_bands,
             self.band_width,
             self.audio_channels,
-            self.audio_channels,
-            self.filter_taps,
             2,
         )
-        # -> [B, C_out, C_in, T, N_group * band_width, taps, 2]
-        source = raw.permute(0, 4, 5, 1, 2, 3, 6, 7).reshape(
+        # -> [B, C, T, N_group * band_width, 2]
+        source = raw.permute(0, 4, 1, 2, 3, 5).reshape(
             batch,
-            self.audio_channels,
             self.audio_channels,
             frames,
             self.num_group_bands * self.band_width,
-            self.filter_taps,
             2,
         )
         return source, self.flat_freq_indices
@@ -1321,15 +1250,8 @@ class MaskHead(nn.Module):
         self.dim = config.dim
         self.num_bands = len(bands)
         self.audio_channels = config.audio_channels
-        self.filter_taps = config.filter_taps
-        center_tap = config.filter_taps // 2
         self.freq_bins = config.n_fft // 2 + 1
-        self.filter_channels = (
-            self.audio_channels
-            * self.audio_channels
-            * self.filter_taps
-            * 2
-        )
+        self.mask_channels = self.audio_channels * 2
 
         self.band_context_norm = nn.RMSNorm(config.dim)
         self.band_context_dw = nn.Conv1d(
@@ -1349,14 +1271,14 @@ class MaskHead(nn.Module):
         )
 
         self.seam_dw = nn.Conv1d(
-            self.filter_channels,
-            self.filter_channels,
+            self.mask_channels,
+            self.mask_channels,
             kernel_size=5,
             padding=2,
-            groups=self.filter_channels,
+            groups=self.mask_channels,
         )
         self.seam_pw = nn.Conv1d(
-            self.filter_channels, self.filter_channels, kernel_size=1
+            self.mask_channels, self.mask_channels, kernel_size=1
         )
         nn.init.zeros_(self.seam_dw.bias)
         nn.init.zeros_(self.seam_pw.weight)
@@ -1368,19 +1290,9 @@ class MaskHead(nn.Module):
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
-        tap_bias = torch.zeros(
-            1,
-            self.audio_channels,
-            self.audio_channels,
-            1,
-            1,
-            self.filter_taps,
-            2,
-            dtype=torch.float32,
-        )
-        for ch in range(self.audio_channels):
-            tap_bias[0, ch, ch, 0, 0, center_tap, 0] = 0.5
-        self.register_buffer("tap_bias", tap_bias, persistent=False)
+        mask_bias = torch.zeros(1, 1, 1, 1, 2, dtype=torch.float32)
+        mask_bias[..., 0] = 0.5
+        self.register_buffer("mask_bias", mask_bias, persistent=False)
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
         batch, frames = x.shape[0], x.shape[1]
@@ -1396,19 +1308,17 @@ class MaskHead(nn.Module):
         output = first_src.new_zeros(
             batch,
             self.audio_channels,
-            self.audio_channels,
             frames,
             self.freq_bins,
-            self.filter_taps,
             2,
             dtype=torch.float32,
         )
-        output.index_copy_(4, first_idx, first_src.float())
+        output.index_copy_(3, first_idx, first_src.float())
 
         for group in self.groups[1:]:
             group_x = x.index_select(2, group.band_ids)
             source, flat_indices = group(group_x)
-            output.index_copy_(4, flat_indices, source.float())
+            output.index_copy_(3, flat_indices, source.float())
 
         device_type = output.device.type
         no_autocast = (
@@ -1417,33 +1327,22 @@ class MaskHead(nn.Module):
             else contextlib.nullcontext()
         )
         with no_autocast:
-            flat_f = output.permute(0, 3, 1, 2, 5, 6, 4).reshape(
-                batch * frames, self.filter_channels, self.freq_bins
+            flat_m = output.permute(0, 2, 1, 4, 3).reshape(
+                batch * frames, self.mask_channels, self.freq_bins
             )
-            flat_f = flat_f + self.seam_pw(F.silu(self.seam_dw(flat_f)))
-            refined = flat_f.reshape(
+            flat_m = flat_m + self.seam_pw(F.silu(self.seam_dw(flat_m)))
+            refined = flat_m.reshape(
                 batch,
                 frames,
                 self.audio_channels,
-                self.audio_channels,
-                self.filter_taps,
                 2,
                 self.freq_bins,
-            ).permute(0, 2, 3, 6, 1, 4, 5).contiguous()
-            return refined + self.tap_bias
-
-
-def unfold_stft_taps(spec: torch.Tensor, taps: int) -> torch.Tensor:
-    """Build [B, C, F, T, taps] zero-padded temporal neighborhood around each STFT frame."""
-    if taps == 1:
-        return spec.unsqueeze(-1)
-    pad = taps // 2
-    padded = F.pad(spec, (pad, pad))
-    return padded.unfold(dimension=-1, size=taps, step=1)
+            ).permute(0, 2, 4, 1, 3).contiguous()
+            return refined + self.mask_bias
 
 
 class StemSeparator(nn.Module):
-    """124-Band Residual SubRoFormer + 2x2 MIMO Multi-Tap Complex Deep-Filter Separator."""
+    """124-Band Residual SubRoFormer Complex-Mask Separator."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -1453,7 +1352,7 @@ class StemSeparator(nn.Module):
         self.encoder = DualPathEncoder(config)
         self.mask_head = MaskHead(config, bands)
 
-    def forward_filters_real(
+    def forward_masks_real(
         self,
         mixture_real_imag: torch.Tensor,
     ) -> torch.Tensor:
@@ -1469,11 +1368,11 @@ class StemSeparator(nn.Module):
         self,
         mixture_spec: torch.Tensor,
     ) -> torch.Tensor:
-        """Returns multi-tap MIMO complex vocal filter [B, C_out, C_in, F, T, taps]."""
+        """Returns complex vocal mask [B, C, F, T]."""
         mixture_spec_c64 = mixture_spec.to(torch.complex64)
         mixture_real_imag = torch.view_as_real(mixture_spec_c64)
-        vocal_filters_ri = self.forward_filters_real(mixture_real_imag)
-        return torch.view_as_complex(vocal_filters_ri)
+        vocal_mask_ri = self.forward_masks_real(mixture_real_imag)
+        return torch.view_as_complex(vocal_mask_ri)
 
     def estimate_specs(
         self,
@@ -1481,14 +1380,8 @@ class StemSeparator(nn.Module):
         mask_deadzone: float = 0.0,
     ) -> torch.Tensor:
         mixture_c64 = mixture_spec.to(torch.complex64)
-        vocal_filters = self(mixture_c64)
-        neighbors = unfold_stft_taps(mixture_c64, self.config.filter_taps)
-        # 2x2 space-time MIMO Wiener filter: sum across input channels (dim=2) and taps (dim=-1)
-        raw_vocal_est = (
-            (vocal_filters * neighbors.unsqueeze(1))
-            .sum(dim=(2, -1))
-            .unsqueeze(1)
-        )
+        vocal_mask = self(mixture_c64)
+        raw_vocal_est = (vocal_mask * mixture_c64).unsqueeze(1)
         mix_ref = mixture_c64[:, None]
         if mask_deadzone > 0.0:
             mix_mag = mix_ref.abs()
@@ -1514,6 +1407,91 @@ def power_compress_complex(
     """
     power = spec.real.square() + spec.imag.square() + eps
     return spec * power.pow(0.5 * (exp - 1.0))
+
+
+def _complex_stft_loss_terms(
+    pred_spec: torch.Tensor,
+    target_spec: torch.Tensor,
+    compress_exp: float = 0.6,
+    w_l1: float = 0.12,
+    w_comp: float = 0.18,
+) -> torch.Tensor:
+    """Phase-consistent complex RMSE + complex L1 + per-stem power-compressed
+    L/R & Mid/Side complex RMSE without any extra STFT computations.
+    """
+    w_rmse = 1.0 - w_l1 - w_comp
+    target_sq = target_spec.real.square() + target_spec.imag.square()
+    target_mag = (target_sq + 1e-16).sqrt()
+    item_dims = tuple(range(1, target_mag.ndim))
+
+    # 1. Parseval-consistent complex RMSE & L1 anchored to mixture scale
+    diff_c = pred_spec - target_spec
+    diff_sq = diff_c.real.square() + diff_c.imag.square()
+    rms_scale = target_sq.mean(dim=item_dims).add(1e-10).sqrt().detach().clamp_min(1e-3)
+    l1_scale = target_mag.mean(dim=item_dims).detach().clamp_min(1e-3)
+    complex_rmse = (
+        diff_sq.mean(dim=item_dims).add(1e-10).sqrt() / rms_scale
+    ).mean()
+    complex_l1 = ((diff_sq + 1e-12).sqrt().mean(dim=item_dims) / l1_scale).mean()
+
+    # 2. Per-stem power-compressed complex RMSE (plus stereo Mid/Side compressed complex RMSE)
+    pred_comp = power_compress_complex(pred_spec, compress_exp)
+    targ_comp = power_compress_complex(target_spec, compress_exp)
+    comp_diff = pred_comp - targ_comp
+    comp_sq = comp_diff.real.square() + comp_diff.imag.square()
+
+    if target_spec.ndim >= 4:
+        stem_reduce = tuple(range(2, target_spec.ndim))
+        stem_comp_scale = (
+            (target_mag + 1e-5)
+            .pow(compress_exp)
+            .mean(dim=stem_reduce)
+            .detach()
+        )
+        mix_comp_scale = stem_comp_scale.amax(dim=1, keepdim=True).clamp_min(1e-3)
+        stem_comp_denom = torch.maximum(stem_comp_scale, 0.25 * mix_comp_scale)
+        lr_comp_rmse = (
+            comp_sq.mean(dim=stem_reduce).add(1e-10).sqrt() / stem_comp_denom
+        ).mean()
+    else:
+        comp_scale = (
+            (target_mag + 1e-5)
+            .pow(compress_exp)
+            .mean(dim=item_dims)
+            .detach()
+            .clamp_min(1e-3)
+        )
+        lr_comp_rmse = (
+            comp_sq.mean(dim=item_dims).add(1e-10).sqrt() / comp_scale
+        ).mean()
+
+    if target_spec.ndim == 5 and target_spec.shape[2] == 2:
+        pred_ms = torch.stack(
+            (
+                0.5 * (pred_spec[:, :, 0] + pred_spec[:, :, 1]),
+                0.5 * (pred_spec[:, :, 0] - pred_spec[:, :, 1]),
+            ),
+            dim=2,
+        )
+        targ_ms = torch.stack(
+            (
+                0.5 * (target_spec[:, :, 0] + target_spec[:, :, 1]),
+                0.5 * (target_spec[:, :, 0] - target_spec[:, :, 1]),
+            ),
+            dim=2,
+        )
+        ms_diff = power_compress_complex(pred_ms, compress_exp) - power_compress_complex(
+            targ_ms, compress_exp
+        )
+        ms_sq = ms_diff.real.square() + ms_diff.imag.square()
+        ms_comp_rmse = (
+            ms_sq.mean(dim=(2, 3, 4)).add(1e-10).sqrt() / stem_comp_denom
+        ).mean()
+        comp_complex_rmse = 0.75 * lr_comp_rmse + 0.25 * ms_comp_rmse
+    else:
+        comp_complex_rmse = lr_comp_rmse
+
+    return w_rmse * complex_rmse + w_l1 * complex_l1 + w_comp * comp_complex_rmse
 
 
 class MultiResolutionSTFTLoss(nn.Module):
@@ -1542,11 +1520,7 @@ class MultiResolutionSTFTLoss(nn.Module):
         prediction: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
-        w_l1 = 0.12
-        w_comp = 0.18
-        w_rmse = 1.0 - w_l1 - w_comp
-
-        batch = prediction.shape[0] if prediction.ndim >= 2 else 1
+        lead_shape = prediction.shape[:-1] if prediction.ndim >= 2 else (1,)
         pred_flat = prediction.reshape(-1, prediction.shape[-1]).float()
         target_flat = target.reshape(-1, target.shape[-1]).float()
         both_flat = torch.cat((pred_flat, target_flat), dim=0)
@@ -1566,42 +1540,11 @@ class MultiResolutionSTFTLoss(nn.Module):
             ) / win_norm
             pred_spec, target_spec = both_spec.chunk(2, dim=0)
             spec_f, spec_t = pred_spec.shape[-2], pred_spec.shape[-1]
-            pred_spec_b = pred_spec.reshape(batch, -1, spec_f, spec_t)
-            target_spec_b = target_spec.reshape(batch, -1, spec_f, spec_t)
-            target_mag_b = target_spec_b.abs()
+            pred_spec_b = pred_spec.reshape(*lead_shape, spec_f, spec_t)
+            target_spec_b = target_spec.reshape(*lead_shape, spec_f, spec_t)
 
-            # 1. Dominant Parseval/SDR-exact mixture-anchored complex RMSE (+ L1)
-            diff_c = pred_spec_b - target_spec_b
-            diff_sq = diff_c.real.square() + diff_c.imag.square()
-            complex_scale = target_mag_b.mean(dim=(1, 2, 3)).detach().clamp_min(1e-3)
-            complex_rmse = (
-                diff_sq.mean(dim=(1, 2, 3)).add(1e-10).sqrt() / complex_scale
-            ).mean()
-            complex_l1 = (
-                (diff_sq + 1e-12).sqrt().mean(dim=(1, 2, 3)) / complex_scale
-            ).mean()
-
-            # 2. Phase-preserving power-compressed complex RMSE (no phase-blind mag penalty)
-            pred_comp = power_compress_complex(pred_spec_b, self.compress_exp)
-            targ_comp = power_compress_complex(target_spec_b, self.compress_exp)
-            comp_diff = pred_comp - targ_comp
-            comp_sq = comp_diff.real.square() + comp_diff.imag.square()
-            comp_scale = (
-                (target_mag_b + 1e-5)
-                .pow(self.compress_exp)
-                .mean(dim=(1, 2, 3))
-                .detach()
-                .clamp_min(1e-3)
-            )
-            comp_complex_rmse = (
-                comp_sq.mean(dim=(1, 2, 3)).add(1e-10).sqrt() / comp_scale
-            ).mean()
-
-            total = (
-                total
-                + w_rmse * complex_rmse
-                + w_l1 * complex_l1
-                + w_comp * comp_complex_rmse
+            total = total + _complex_stft_loss_terms(
+                pred_spec_b, target_spec_b, compress_exp=self.compress_exp
             )
 
         return total / len(self.resolutions)
@@ -1768,12 +1711,15 @@ class SeparationLoss(nn.Module):
             win_length=self.model_config.win_length,
             window=self.window,
         )
-        target_specs = make_stft(
-            target_audio,
+        vocal_target_spec = make_stft(
+            target_audio[:, 0],
             n_fft=self.model_config.n_fft,
             hop_length=self.model_config.hop_length,
             win_length=self.model_config.win_length,
             window=self.window,
+        )
+        target_specs = torch.stack(
+            (vocal_target_spec, mixture_spec - vocal_target_spec), dim=1
         )
 
         wave_loss = loudness_anchored_wave_loss(pred_audio, target_audio)
@@ -1782,39 +1728,8 @@ class SeparationLoss(nn.Module):
         win_norm = (0.5 * self.window.square().sum()).sqrt().clamp_min(1e-8)
         est_normed = estimates / win_norm
         targ_normed = target_specs / win_norm
-        target_mag = targ_normed.abs()
-
-        item_dims = tuple(range(1, target_mag.ndim))
-        spec_scale = target_mag.mean(dim=item_dims).detach().clamp_min(1e-3)
-        diff_c = est_normed - targ_normed
-        diff_sq = diff_c.real.square() + diff_c.imag.square()
-        main_rmse = (
-            diff_sq.mean(dim=item_dims).add(1e-10).sqrt() / spec_scale
-        ).mean()
-        main_l1 = (
-            (diff_sq + 1e-12).sqrt().mean(dim=item_dims) / spec_scale
-        ).mean()
-
-        est_comp = power_compress_complex(est_normed, exp=0.6)
-        targ_comp = power_compress_complex(targ_normed, exp=0.6)
-        comp_diff = est_comp - targ_comp
-        comp_sq = comp_diff.real.square() + comp_diff.imag.square()
-        comp_scale = (
-            (target_mag + 1e-5)
-            .pow(0.6)
-            .mean(dim=item_dims)
-            .detach()
-            .clamp_min(1e-3)
-        )
-        main_comp_complex = (
-            comp_sq.mean(dim=item_dims).add(1e-10).sqrt() / comp_scale
-        ).mean()
-
-        w_l1 = 0.12
-        w_comp = 0.18
-        w_rmse = 1.0 - w_l1 - w_comp
-        main_stft_loss = (
-            w_rmse * main_rmse + w_l1 * main_l1 + w_comp * main_comp_complex
+        main_stft_loss = _complex_stft_loss_terms(
+            est_normed, targ_normed, compress_exp=0.6
         )
 
         sdr_loss = tamed_sdr_loss(pred_audio, target_audio)
@@ -1841,12 +1756,23 @@ class SeparationLoss(nn.Module):
         mixture_stem = (
             mixture_audio if mixture_audio is not None else target_audio.sum(dim=1)
         )
-        silence_frame_weight = vocal_silence_weight(
+        raw_silence_weight = vocal_silence_weight(
             _stem_frame_power(target_audio[:, 0]),
             _stem_frame_power(mixture_stem),
             cfg.silence_floor_db,
             cfg.silence_active_db,
         )
+        # Erode silence mask by 1 frame (23 ms) at vocal boundaries so 4096-sample
+        # STFT window overlap into adjacent vocal attacks/releases is never penalized.
+        if raw_silence_weight.shape[-1] >= 3:
+            silence_frame_weight = -F.max_pool1d(
+                -raw_silence_weight.unsqueeze(1),
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ).squeeze(1)
+        else:
+            silence_frame_weight = raw_silence_weight
 
         sample_weight = torch.repeat_interleave(
             silence_frame_weight, SILENCE_FRAME, dim=-1
@@ -1867,7 +1793,7 @@ class SeparationLoss(nn.Module):
 
         # Mixture-normalized spectral vocal residue during vocal-silent frames:
         # algebraically equivalent to energy-weighted mask residue (|M|*|X|/E[|X|] = |V_est|/E[|X|]),
-        # free of 1/|X_c| division spikes on hard-panned stereo or multi-tap deep filters.
+        # free of 1/|X_c| division spikes on hard-panned stereo bins.
         pred_vocal_mag = estimates[:, 0].abs().mean(dim=1)
         true_vocal_mag = target_specs[:, 0].abs().mean(dim=1)
         spec_silence_scale = (
@@ -2081,9 +2007,16 @@ def random_spectral_eq(
     """Symmetric zero-phase parametric EQ (low-shelf, bell, high-shelf) without
     any asymmetric vocal high-pass cutoff that would bias <100 Hz fundamentals.
     """
-    n = audio.shape[-1]
-    if n < 64:
+    orig_n = audio.shape[-1]
+    if orig_n < 64:
         return audio
+    pad = min(2048, orig_n - 1)
+    padded = (
+        F.pad(audio.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+        if pad > 0
+        else audio
+    )
+    n = padded.shape[-1]
     freqs = torch.fft.rfftfreq(n, 1.0 / sample_rate).clamp_min(1.0)
     log_f = torch.log(freqs)
     response = torch.ones_like(freqs)
@@ -2154,7 +2087,7 @@ def random_spectral_eq(
                 random.uniform(-3.0, 3.0),
             )
 
-    spec = torch.fft.rfft(audio, n, dim=-1)
+    spec = torch.fft.rfft(padded, n, dim=-1)
     filtered_spec = spec * response.to(spec.dtype)
     mid_mask = (freqs >= 200.0) & (freqs <= 8_000.0)
     if mid_mask.any():
@@ -2166,6 +2099,8 @@ def random_spectral_eq(
     else:
         gain = 1.0
     filtered = torch.fft.irfft(filtered_spec, n, dim=-1)
+    if pad > 0:
+        filtered = filtered[..., pad : pad + orig_n].contiguous()
     return filtered * gain
 
 
@@ -2236,6 +2171,7 @@ def _frame_rms(audio: torch.Tensor, frame: int = 512) -> torch.Tensor:
 def apply_bus_compression(targets: torch.Tensor, frame: int = 512) -> torch.Tensor:
     """Shared time-varying master-bus gain compression preserving exact mixture
     additivity: compress(vocal) + compress(other) == compress(vocal + other).
+    Uses asymmetric attack/release smoothing to prevent frame-rate gain chatter.
     """
     mixture = targets.sum(dim=0)
     env = _frame_rms(mixture, frame)
@@ -2244,12 +2180,18 @@ def apply_bus_compression(targets: torch.Tensor, frame: int = 512) -> torch.Tens
     ratio = random.uniform(1.5, 3.5)
     mix = random.uniform(0.25, 0.65)
     gain_db = torch.clamp((threshold_db - env_db) * (1.0 - 1.0 / ratio), max=0.0)
-    alpha = random.uniform(0.35, 0.65)
-    one_minus_alpha = 1.0 - alpha
+    alpha_attack = random.uniform(0.20, 0.50)
+    alpha_release = random.uniform(0.78, 0.94)
+    one_minus_attack = 1.0 - alpha_attack
+    one_minus_release = 1.0 - alpha_release
     gain_list = gain_db.tolist()
     acc = gain_list[0]
     for i in range(len(gain_list)):
-        acc = alpha * acc + one_minus_alpha * gain_list[i]
+        target_g = gain_list[i]
+        if target_g < acc:
+            acc = alpha_attack * acc + one_minus_attack * target_g
+        else:
+            acc = alpha_release * acc + one_minus_release * target_g
         gain_list[i] = acc
     smoothed = torch.tensor(gain_list, dtype=gain_db.dtype, device=gain_db.device)
     gain = torch.pow(10.0, (mix * smoothed) / 20.0)
@@ -2431,7 +2373,11 @@ class StemDataset(Dataset):
             if random.random() < 0.15:
                 h_shift = remix_shift
                 harmony = self._sample_active_vocal(h_shift)
-                h_gain = db_to_gain(random.uniform(-12.0, -3.5))
+                lead_rms = float(vocal_crop.square().mean().sqrt())
+                harm_rms = float(harmony.square().mean().sqrt())
+                rel_gain = db_to_gain(random.uniform(-12.0, -3.5))
+                if harm_rms > 1e-5 and lead_rms > 1e-5:
+                    rel_gain = min(rel_gain, (lead_rms / harm_rms) * rel_gain)
                 h_pan = random.uniform(-0.35, 0.35)
                 harmony = torch.stack(
                     (
@@ -2440,7 +2386,7 @@ class StemDataset(Dataset):
                     ),
                     dim=0,
                 )
-                vocal_crop = vocal_crop + h_gain * harmony
+                vocal_crop = vocal_crop + rel_gain * harmony
 
             o_shift = remix_shift
             orig_f, new_f, needed_samples = pitch_shift_plan(
@@ -2492,10 +2438,16 @@ class StemDataset(Dataset):
             start = random.uniform(
                 0.0, max(0.0, common_duration - needed_sec)
             )
+            jitter_coherent_other = random.random() < 0.5
             raw_pair = torch.stack(
                 [
                     self._load_target(
-                        track[stem], start, num_samples=needed_samples
+                        track[stem],
+                        start,
+                        num_samples=needed_samples,
+                        jitter_components=(
+                            stem == "other" and jitter_coherent_other
+                        ),
                     )
                     for stem in STEMS
                 ]
@@ -3031,38 +2983,36 @@ def crossfade_window(
     fade_out: bool,
     device: torch.device,
     dtype: torch.dtype,
+    fade_in_length: int | None = None,
+    fade_out_length: int | None = None,
 ) -> torch.Tensor:
     window = torch.ones(length, device=device, dtype=dtype)
-    fade_length = min(overlap, length)
-    if fade_length <= 0:
-        return window
-    phase = torch.linspace(0.0, math.pi / 2.0, fade_length, device=device, dtype=dtype)
-    fade = torch.sin(phase).square()
-    if fade_in:
-        window[:fade_length] *= fade
-    if fade_out:
-        window[-fade_length:] *= fade.flip(0)
+    in_len = min(overlap if fade_in_length is None else fade_in_length, length)
+    out_len = min(overlap if fade_out_length is None else fade_out_length, length)
+    if fade_in and in_len > 0:
+        phase = torch.linspace(0.0, math.pi / 2.0, in_len, device=device, dtype=dtype)
+        window[:in_len] *= torch.sin(phase).square()
+    if fade_out and out_len > 0:
+        phase = torch.linspace(0.0, math.pi / 2.0, out_len, device=device, dtype=dtype)
+        window[-out_len:] *= torch.sin(phase).square().flip(0)
     return window
 
 
 def chunk_starts(total_length: int, chunk_size: int, overlap: int) -> list[int]:
     if total_length <= chunk_size:
         return [0]
-    step = chunk_size - overlap
-    if step <= 0:
+    max_step = chunk_size - overlap
+    if max_step <= 0:
         raise ValueError("Overlap must be smaller than chunk size.")
-    # Uniform step so every adjacent chunk pair overlaps by exactly `overlap`
-    # samples; stop as soon as the current chunk reaches total_length so no
-    # trailing sliver with usable < overlap is emitted (a short final chunk
-    # uses the reflect-padding path in separate_tensor).
-    starts: list[int] = []
-    start = 0
-    while True:
-        starts.append(start)
-        if start + chunk_size >= total_length:
-            break
-        start += step
-    return starts
+    # Distribute starts evenly from 0 to (total_length - chunk_size) so every
+    # chunk on a full track has length == chunk_size (100% real audio, zero
+    # backwards reflect-padding on the final chunk) with overlap >= `overlap`.
+    span = total_length - chunk_size
+    num_intervals = int(math.ceil(span / max_step))
+    return [
+        int(round(index * span / num_intervals))
+        for index in range(num_intervals + 1)
+    ]
 
 
 def autocast_context(device: torch.device, precision: str):
@@ -3096,12 +3046,12 @@ def separate_tensor(
     orig_length = mixture.shape[-1]
 
     # Align Chunk 0 with the first active sample (matching training crops, which
-    # always start on active audio at frame 0) and avoid reflect-padding 1.2s of
-    # time-reversed vocals before the track onset.
-    active_mask = mixture.abs().amax(dim=0) > 1e-4
+    # always start on active audio) while keeping a full STFT window of guard
+    # margin and a -100 dBFS floor so quiet fade-ins/outros are never clipped.
+    active_mask = mixture.abs().amax(dim=0) > 1e-5
     if active_mask.any():
         active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
-        guard = model.config.hop_length
+        guard = model.config.win_length
         trim_start = max(0, int(active_indices[0].item()) - guard)
         trim_end = min(orig_length, int(active_indices[-1].item()) + 1 + guard)
     else:
@@ -3121,11 +3071,12 @@ def separate_tensor(
     weight_sum = torch.zeros(total_length, device=device, dtype=torch.float32)
     stft_window = torch.hann_window(model.config.win_length, device=device)
 
-    iterator: Iterable[int] = starts
+    indices: Iterable[int] = range(len(starts))
     if show_progress:
-        iterator = tqdm(starts, desc="Separating", leave=False)
+        indices = tqdm(indices, total=len(starts), desc="Separating", leave=False)
 
-    for start in iterator:
+    for chunk_idx in indices:
+        start = starts[chunk_idx]
         usable = min(chunk_size, total_length - start)
         chunk = active_mix[:, start : start + usable]
         if usable < chunk_size:
@@ -3159,16 +3110,28 @@ def separate_tensor(
             window=stft_window,
         ).squeeze(0)
 
-        is_first = start == 0
-        is_last = start + chunk_size >= total_length
+        is_first = chunk_idx == 0
+        is_last = chunk_idx == len(starts) - 1
+        fade_in_len = (
+            (starts[chunk_idx - 1] + chunk_size) - start
+            if not is_first
+            else overlap
+        )
+        fade_out_len = (
+            (start + usable) - starts[chunk_idx + 1]
+            if not is_last
+            else overlap
+        )
         window = crossfade_window(
-            chunk_size,
+            usable,
             overlap,
             fade_in=not is_first,
             fade_out=not is_last,
             device=device,
             dtype=estimated.dtype,
-        )[:usable]
+            fade_in_length=fade_in_len,
+            fade_out_length=fade_out_len,
+        )
         active_output[..., start : start + usable] += estimated[..., :usable] * window
         weight_sum[start : start + usable] += window
 
@@ -3535,10 +3498,10 @@ def train(
         model.encoder.compile_layers(mode="default")
         print(
             f"Compiled SubRoFormer PreBlock, {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
-            f"coarse-rate (patch={model.config.patch_size}) Gated-RoPE axial blocks, GEGLUFusion, and PostBlock."
+            "fine-rate (unpatched) Gated-RoPE axial blocks, GEGLUFusion, and PostBlock."
         )
 
-    stft_window = torch.hann_window(model.config.win_length, device=device)
+    stft_window = loss_module.window
     optimizer.zero_grad(set_to_none=True)
     progress = tqdm(
         initial=step,
@@ -3829,8 +3792,7 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         depth=args.depth,
         num_heads=args.num_heads,
         ffn_mult=args.ffn_mult,
-        patch_size=args.patch_size,
-        filter_taps=args.filter_taps,
+        patch_size=1,
         dropout=args.dropout,
         drop_path=args.drop_path,
         use_checkpoint=args.ckpt,
@@ -3901,7 +3863,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="124-band Residual SubRoFormer + 2x2 MIMO 3-Tap Deep-Filter MVSEP Separator"
+        description="124-band Residual SubRoFormer MVSEP Separator"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -3938,17 +3900,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Attention heads (default: model_dim // 32 for 32-d FlashAttention heads).",
     )
     parser.add_argument("--ffn_mult", type=float, default=3.0)
-    parser.add_argument(
-        "--patch_size",
-        type=int,
-        default=2,
-        choices=(1, 2, 4),
-        help=(
-            "SubRoFormer temporal patch factor for the central axial RoFormer stack "
-            "(1 = unpatched, 2 = 2x coarse temporal patching, 4 = 4x coarse temporal patching)."
-        ),
-    )
-    parser.add_argument("--filter_taps", type=int, default=3, choices=(1, 3, 5))
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--drop_path", type=float, default=0.08)
     parser.add_argument(
@@ -4017,8 +3968,6 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--drop_path must be in [0, 1).")
     if args.ffn_mult <= 0.0:
         raise ValueError("--ffn_mult must be positive.")
-    if args.patch_size not in (1, 2, 4):
-        raise ValueError("--patch_size must be one of {1, 2, 4}.")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad_clip must be positive.")
     if args.weight_decay < 0.0:
@@ -4127,9 +4076,8 @@ def main() -> None:
         parameter.numel() for parameter in model.mask_head.parameters()
     )
     print(
-        f"124-band Residual SubRoFormer (1 pre + {config.depth}x coarse[patch={config.patch_size}] + 1 post) "
-        f"+ 2x2 MIMO {config.filter_taps}-tap DeepFilter parameters: "
-        f"{parameter_count / 1e6:.2f}M (encoder: {encoder_count / 1e6:.2f}M, "
+        f"124-band Residual SubRoFormer (1 pre + {config.depth}x axial[unpatched] + 1 post) "
+        f"parameters: {parameter_count / 1e6:.2f}M (encoder: {encoder_count / 1e6:.2f}M, "
         f"mask head: {mask_count / 1e6:.2f}M)"
     )
 
