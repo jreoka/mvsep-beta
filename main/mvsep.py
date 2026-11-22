@@ -344,23 +344,14 @@ class RotaryEmbedding(nn.Module):
         self,
         q: torch.Tensor,
         k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # QKVO-RoPE forward rotation R_i on q, k, v of shape [B, H, L, head_dim]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Standard RoPE rotation R_i on q, k of shape [B, H, L, head_dim]
         cos, sin = self._get_cos_sin(q.shape[2], q.device, q.dtype)
         q1, q2 = q.chunk(2, dim=-1)
         k1, k2 = k.chunk(2, dim=-1)
-        v1, v2 = v.chunk(2, dim=-1)
         q_rot = torch.cat((q1 * cos - q2 * sin, q2 * cos + q1 * sin), dim=-1)
         k_rot = torch.cat((k1 * cos - k2 * sin, k2 * cos + k1 * sin), dim=-1)
-        v_rot = torch.cat((v1 * cos - v2 * sin, v2 * cos + v1 * sin), dim=-1)
-        return q_rot, k_rot, v_rot
-
-    def rotate_inverse(self, attn: torch.Tensor) -> torch.Tensor:
-        # QKVO-RoPE inverse rotation R_i^T (= R_{-i}) on attention output [B, H, L, head_dim]
-        cos, sin = self._get_cos_sin(attn.shape[2], attn.device, attn.dtype)
-        a1, a2 = attn.chunk(2, dim=-1)
-        return torch.cat((a1 * cos + a2 * sin, a2 * cos - a1 * sin), dim=-1)
+        return q_rot, k_rot
 
 
 class GatedRoPEBlock(nn.Module):
@@ -416,24 +407,15 @@ class GatedRoPEBlock(nn.Module):
         v = v.reshape(batch_eff, seq_len, self.num_heads, self.head_dim).transpose(
             1, 2
         )
-        q, k, v_rot = self.rope(q, k, v)
+        q, k = self.rope(q, k)
 
         attn_p = self.dropout if self.training else 0.0
         attn = F.scaled_dot_product_attention(
             q,
             k,
-            v_rot,
+            v,
             dropout_p=attn_p,
         )
-        # QKVO-RoPE output inverse rotation R_i^T: maps sum_j a_{i,j} R_j v_j -> sum_j a_{i,j} R_{j-i} v_j
-        attn = self.rope.rotate_inverse(attn)
-        # Exclusive Self Attention (XSA, arXiv:2603.09078): orthogonalize relative-rotated
-        # attention output against each token's own unrotated value vector v in fp32.
-        v_dir = F.normalize(v.float(), dim=-1, eps=1e-6)
-        attn_f = attn.float()
-        attn = (
-            attn_f - (attn_f * v_dir).sum(dim=-1, keepdim=True) * v_dir
-        ).to(dtype=attn.dtype)
         attn = attn.transpose(1, 2).reshape(batch_eff, seq_len, dim)
         attn = attn * torch.sigmoid(attn_gate)
         x = x + self.drop(self.attn_out(attn))
