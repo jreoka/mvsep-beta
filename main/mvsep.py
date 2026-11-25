@@ -25,7 +25,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 1
 RUNTIME_CONFIG_FIELDS = frozenset({"use_checkpoint", "dropout", "drop_path"})
 
 
