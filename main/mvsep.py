@@ -25,7 +25,7 @@ from tqdm import tqdm
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
 VALIDATION_METRIC = "mean_full_track_sdr_v1"
-CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FORMAT_VERSION = 2
 RUNTIME_CONFIG_FIELDS = frozenset({"use_checkpoint", "dropout", "drop_path"})
 
 
@@ -89,7 +89,7 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     waveform_weight: float = 1.0
-    sdr_weight: float = 0.20
+    sdr_weight: float = 0.04
     main_stft_weight: float = 0.80
     mrstft_weight: float = 0.60
     midside_weight: float = 0.15
@@ -1106,8 +1106,9 @@ class BandMaskGroup(nn.Module):
     ):
         super().__init__()
         self.audio_channels = config.audio_channels
+        self.matrix_channels = self.audio_channels * self.audio_channels
         self.band_width = band_width
-        feature_width = band_width * self.audio_channels * 2
+        feature_width = band_width * self.matrix_channels * 2
         self.num_group_bands = len(band_ids)
 
         self.register_buffer(
@@ -1235,13 +1236,13 @@ class BandMaskGroup(nn.Module):
             frames,
             self.num_group_bands,
             self.band_width,
-            self.audio_channels,
+            self.matrix_channels,
             2,
         )
-        # -> [B, C, T, N_group * band_width, 2]
+        # -> [B, C*C, T, N_group * band_width, 2]
         source = raw.permute(0, 4, 1, 2, 3, 5).reshape(
             batch,
-            self.audio_channels,
+            self.matrix_channels,
             frames,
             self.num_group_bands * self.band_width,
             2,
@@ -1259,8 +1260,9 @@ class MaskHead(nn.Module):
         self.dim = config.dim
         self.num_bands = len(bands)
         self.audio_channels = config.audio_channels
+        self.matrix_channels = self.audio_channels * self.audio_channels
         self.freq_bins = config.n_fft // 2 + 1
-        self.mask_channels = self.audio_channels * 2
+        self.mask_channels = self.matrix_channels * 2
 
         self.band_context_norm = nn.RMSNorm(config.dim)
         self.band_context_dw = nn.Conv1d(
@@ -1299,8 +1301,17 @@ class MaskHead(nn.Module):
         if not torch.all(coverage == 1):
             raise ValueError("Every frequency bin must be covered by exactly one BS band.")
 
-        mask_bias = torch.zeros(1, 1, 1, 1, 2, dtype=torch.float32)
-        mask_bias[..., 0] = 0.5
+        mask_bias = torch.zeros(
+            1,
+            self.audio_channels,
+            self.audio_channels,
+            1,
+            1,
+            2,
+            dtype=torch.float32,
+        )
+        for ch in range(self.audio_channels):
+            mask_bias[:, ch, ch, :, :, 0] = 0.5
         self.register_buffer("mask_bias", mask_bias, persistent=False)
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
@@ -1316,7 +1327,7 @@ class MaskHead(nn.Module):
         first_src, first_idx = self.groups[0](x.index_select(2, self.groups[0].band_ids))
         output = first_src.new_zeros(
             batch,
-            self.audio_channels,
+            self.matrix_channels,
             frames,
             self.freq_bins,
             2,
@@ -1344,9 +1355,10 @@ class MaskHead(nn.Module):
                 batch,
                 frames,
                 self.audio_channels,
+                self.audio_channels,
                 2,
                 self.freq_bins,
-            ).permute(0, 2, 4, 1, 3).contiguous()
+            ).permute(0, 2, 3, 5, 1, 4).contiguous()
             return refined + self.mask_bias
 
 
@@ -1377,7 +1389,7 @@ class StemSeparator(nn.Module):
         self,
         mixture_spec: torch.Tensor,
     ) -> torch.Tensor:
-        """Returns complex vocal mask [B, C, F, T]."""
+        """Returns 2x2 complex stereo vocal mask [B, C_out, C_in, F, T]."""
         mixture_spec_c64 = mixture_spec.to(torch.complex64)
         mixture_real_imag = torch.view_as_real(mixture_spec_c64)
         vocal_mask_ri = self.forward_masks_real(mixture_real_imag)
@@ -1390,7 +1402,7 @@ class StemSeparator(nn.Module):
     ) -> torch.Tensor:
         mixture_c64 = mixture_spec.to(torch.complex64)
         vocal_mask = self(mixture_c64)
-        raw_vocal_est = (vocal_mask * mixture_c64).unsqueeze(1)
+        raw_vocal_est = (vocal_mask * mixture_c64.unsqueeze(1)).sum(dim=2).unsqueeze(1)
         mix_ref = mixture_c64[:, None]
         if mask_deadzone > 0.0:
             mix_mag = mix_ref.abs()
@@ -3949,7 +3961,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--silence_margin", type=float, default=1.5)
     parser.add_argument("--silence_floor_db", type=float, default=-65.0)
     parser.add_argument("--silence_active_db", type=float, default=-54.0)
-    parser.add_argument("--sdr_weight", type=float, default=0.20)
+    parser.add_argument("--sdr_weight", type=float, default=0.04)
     parser.add_argument("--seed", type=int, default=1337)
     return parser
 
